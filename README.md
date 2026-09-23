@@ -557,6 +557,23 @@ option count) on held-out data moves mean ECE **0.466 -> 0.081** (`laya`) and
 **0.314 -> 0.106** (`laya-multilingual`). `laya-multilingual` ships with no fitted
 temperatures at all, so fit them before relying on its probabilities.
 
+Fit temperatures on your own calibration data:
+
+```python
+import laya
+
+agent = laya.load("convaiinnovations/laya", subfolder="multilingual")
+result = agent.fit_temperatures(
+    states=[{"body": "..."}, ...],         # your calibration states
+    questions=[{"q": {"type": "choice", ...}}, ...],  # matching questions
+    targets=["billing", ...],              # correct answers (label/index/bool)
+)
+print(result["ece"])   # per-bucket ECE at the optimum
+```
+
+The method updates `agent.temperature` and `agent.temperature_by_options` in place and
+returns the fitted values plus per-bucket ECE.
+
 At checkpoint load, numeric temperature entries are clamped to `[0.5, 5.0]`; invalid or
 non-finite entries use the neutral fallback `1.0`. A runtime warning reports the affected
 entries and applied values. Bucket-specific temperatures still take precedence over per-type

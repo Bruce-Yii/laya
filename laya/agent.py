@@ -17,6 +17,7 @@ from .common import (
     clamp_temperature,
     collate_items,
     confidence_from_probs,
+    ece_score,
     render_options,
     temp_bucket,
 )
@@ -427,6 +428,100 @@ class Agent:
             "model": "laya-rl-agent",
             "answers": answers,
             "usage": {"input_tokens": n_tokens, "output_tokens": 0},
+        }
+
+    def _raw_logits(self, state, questions):
+        """Compute raw option logits (before temperature scaling) per question."""
+        ids = list(questions.keys())
+        items = []
+        max_len = self.cfg.get("max_len", 512)
+        head_max_len = self.cfg.get("head_max_len", 192)
+        for qid in ids:
+            q = self._to_internal(questions[qid])
+            seq, markers = build_sequence(self.tok, state, q, max_len, head_max_len)
+            items.append({"ids": seq, "markers": markers, "qtype": QTYPES[q["t"]]})
+        b = collate_items([items], self.tok.pad_token_id)
+        use_amp = self.device.type == "cuda"
+        with torch.autocast(device_type=self.device.type, dtype=self.dtype, enabled=use_amp):
+            logits, act = self.model(
+                b["input_ids"].to(self.device),
+                b["attention_mask"].to(self.device),
+                b["marker_pos"].to(self.device),
+                b["marker_mask"].to(self.device),
+                b["qtype"].to(self.device),
+            )
+        logits = logits.float().cpu().numpy()
+        out = []
+        for r, qid in enumerate(ids):
+            q = self._to_internal(questions[qid])
+            k = len(items[r]["markers"])
+            qt = QTYPES[q["t"]]
+            out.append((qid, qt, k, logits[r, :k].copy()))
+        return out
+
+    def fit_temperatures(self, states, questions, targets, t_range=(0.5, 5.0), n_steps=100):
+        """Fit calibration temperatures on user data."""
+        if not (len(states) == len(questions) == len(targets)):
+            raise ValueError("states, questions, and targets must have the same length")
+
+        def _softmax(x):
+            e = np.exp(x - x.max(axis=-1, keepdims=True))
+            return e / e.sum(axis=-1, keepdims=True)
+
+        buckets = {}
+        for idx, (state, qs, tgt) in enumerate(zip(states, questions, targets)):
+            raw = self._raw_logits(state, qs)
+            for qid, qt, k, logits in raw:
+                bucket = temp_bucket(qt, k)
+                if bucket not in buckets:
+                    buckets[bucket] = []
+                buckets[bucket].append((logits, tgt, qt, k, idx))
+
+        new_temperature = list(self.temperature)
+        new_temperature_by_options = dict(self.temperature_by_options)
+        ece_report = {}
+
+        for bucket, samples in buckets.items():
+            qtype = samples[0][2]
+            k = samples[0][3]
+            logits = np.stack([s[0] for s in samples])
+            correct = np.zeros(len(samples), dtype=float)
+
+            for i, (lg, tgt, qt, kk, idx) in enumerate(samples):
+                if qt == QTYPES["choice"]:
+                    crit_keys = list(questions[idx]["criteria"].keys()) if "criteria" in questions[idx] else []
+                    tgt_idx = crit_keys.index(tgt) if tgt in crit_keys else 0
+                    pred_idx = int(lg.argmax())
+                    correct[i] = 1.0 if pred_idx == tgt_idx else 0.0
+                elif qt == QTYPES["score"]:
+                    pred_idx = int((np.arange(kk) * _softmax(lg)).sum())
+                    correct[i] = 1.0 if pred_idx == int(tgt) else 0.0
+                else:
+                    p = _softmax(lg)
+                    pred_true = p[1] > 0.5
+                    correct[i] = 1.0 if pred_true == bool(tgt) else 0.0
+
+            best_t, best_ece = 1.0, float("inf")
+            for t in np.linspace(t_range[0], t_range[1], n_steps):
+                z = logits / t
+                p = _softmax(z)
+                conf = p.max(axis=1)
+                e = ece_score(conf, correct)
+                if e < best_ece:
+                    best_ece = e
+                    best_t = float(t)
+
+            best_t = clamp_temperature(best_t)
+            new_temperature_by_options[bucket] = best_t
+            ece_report[bucket] = {"temperature": round(best_t, 4), "ece": round(best_ece, 4)}
+
+        self.temperature = [clamp_temperature(t) for t in new_temperature]
+        self.temperature_by_options = {k: clamp_temperature(v) for k, v in new_temperature_by_options.items()}
+
+        return {
+            "temperature": list(self.temperature),
+            "temperature_by_options": dict(self.temperature_by_options),
+            "ece": ece_report,
         }
 
     def __enter__(self):
