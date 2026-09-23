@@ -441,47 +441,6 @@ triage = agent.predict({"message": "My payment failed twice"}, laya.triage_quest
 
 ---
 
-## Known limitation: boolean-word labels bias `noul`
-
-The shipped Laya checkpoints can anchor on literal boolean option labels and select
-the negative answer **regardless of the input state**. With default `noul`
-(e.g. phishing, spam, churn), a positive statement like "I love this product" can
-return `P(true)=0.0000` with `confidence=1.0000`. The model is answering from the
-label word, not the state.
-
-This is a **trust-breaking failure**: the model is most confident precisely when it
-is most wrong.
-
-### How to detect it
-
-```python
-from laya.noul_diag import check_noul_bias, format_report
-
-agent = laya.load("convaiinnovations/laya")
-report = check_noul_bias(agent)
-print(format_report(report))
-```
-
-### How to fix it
-
-Use the `labels` parameter to give `noul` neutral model-facing text while keeping
-the returned value as `P(true)`:
-
-```python
-question = {
-    "type": "noul",
-    "instructions": "Is this review positive?",
-    "criteria": {"true": "the review is positive", "false": "the review is negative"},
-    "labels": {"false": "A", "true": "B"},  # any non-boolean distinct strings work
-}
-answer = agent.predict(state, {"sentiment": question})["answers"]["sentiment"]
-# answer["noul"] is still P(true); answer["confidence"] is calibrated
-```
-
-The diagnostic ships in `laya.noul_diag` and is covered by `tests/test_criteria.py`.
-
----
-
 ## Benchmarks
 
 Community diagnostic: [Chinese workplace decisions (Feishu-style)](research/benchmarks/feishu_zh/README.md) · [中文说明](research/benchmarks/feishu_zh/README.zh-CN.md). Includes frozen synthetic cases, archived paired Laya/Jev responses, and an offline audit; separate from the benchmark suites below.
@@ -648,12 +607,14 @@ result["shortlist"]["intent"]["labels"]  # the top 20 labels sent to the model
 [Issue #102](https://github.com/NandhaKishorM/laya/issues/102) reports that a top-20 zero-shot shortlist moved a BANKING77 run from 54.3% to 60.8% on the reporter's setup. Those figures are the reporter's; this repository has not remeasured them.
 
 * Ordinal `score` questions are the weakest primitive (SST-5 0.372).
-* **`noul` can follow its option labels instead of the state, most strongly on `laya` (English).** `noul` renders its two options as `false:` / `true:`, and on the English checkpoint that label pair can dominate the answer, returning a confident "no" for clearly positive input (#156). Until a retrained checkpoint lands, check `noul` answers on your own data. If they look stuck, ask the same question as a two-option `choice` with neutral keys and your yes/no wording as the descriptions:
-
+* **`noul` can follow its option labels instead of the state, most strongly on `laya` (English).** `noul` renders its two options as `false:` / `true:`, and on the English checkpoint that label pair can dominate the answer, returning a confident "no" for clearly positive input (#156). Until a retrained checkpoint lands, check `noul` answers on your own data. The proper fix is the `labels` parameter, which sets neutral model-facing text while keeping the returned value as `P(true)`:
   ```python
-  {"type": "choice", "instructions": "Is this review positive?",
-   "criteria": {"A": "yes, the review is positive", "B": "no, the review is negative"}}
+  question = {"type": "noul", "instructions": "Is this review positive?",
+               "criteria": {"true": "the review is positive", "false": "the review is negative"},
+               "labels": {"false": "A", "true": "B"}}  # any non-boolean distinct strings
+  answer = agent.predict(state, {"sentiment": question})["answers"]["sentiment"]["noul"]  # still P(true)
   ```
+  A diagnostic tool is available at `tools/noul_diag.py`.
 * **`laya-multilingual` has a position bias on `score` questions** (#131): it rarely picks the first-listed level, in any language. For English score questions, route to `model="english"`, and for other languages validate score outputs on your own data before relying on them.
 * **`action.act_probability` carries no usable signal yet** (#185). It reads 1.0 for almost every input, and its raw logits run against correctness (AUROC 0.30 on 396 labelled decisions). Gate on `confidence` instead, which reaches an AUROC of 0.77 on the same items.
 * `laya` collapses outside English; `laya-multilingual` is weaker on English. Route, or pick

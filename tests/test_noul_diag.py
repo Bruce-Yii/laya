@@ -1,11 +1,12 @@
-"""Tests for laya.noul_diag diagnostic utility."""
+"""Structural tests for tools/noul_diag.py — no weights required.
+
+Weight-dependent regression (running the diagnostic against a live checkpoint)
+is covered by tests/test_local_e2e.py::noul-label-bias.
+"""
 import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from laya.agent import Agent
-from laya.noul_diag import check_noul_bias
 
 PASS, FAIL = [], []
 
@@ -24,48 +25,49 @@ def check_true(name, cond, detail=""):
         FAIL.append("%s %s" % (name, detail))
 
 
-# --------------------------------------------------------------- structural checks (no weights needed)
-from laya import noul_diag
+# --------------------------------------------------------------- import resolves
+from tools import noul_diag
+from tools.noul_diag import check_noul_bias, format_report
 
-check_true("noul_diag/exposes check_noul_bias", callable(noul_diag.check_noul_bias))
-check_true("noul_diag/exposes format_report", callable(noul_diag.format_report))
-check_true("noul_diag/has positive state", isinstance(noul_diag.POSITIVE_STATE, dict) and len(noul_diag.POSITIVE_STATE) > 0)
-check_true("noul_diag/has negative state", isinstance(noul_diag.NEGATIVE_STATE, dict) and len(noul_diag.NEGATIVE_STATE) > 0)
-check("noul_diag/basic question is noul", noul_diag.BASIC_QUESTION["type"], "noul")
-check_true("noul_diag/rich question has criteria", "criteria" in noul_diag.RICH_QUESTION)
-check("noul_diag/rich criteria has true/false keys", set(noul_diag.RICH_QUESTION["criteria"].keys()), {"true", "false"})
-check("noul_diag/custom labels are non-boolean", set(noul_diag.CUSTOM_LABELS.values()), {"A", "B"})
+check_true("tools.noul_diag imports", True)
+check_true("check_noul_bias is callable", callable(check_noul_bias))
+check_true("format_report is callable", callable(format_report))
 
+# --------------------------------------------------------------- structural checks
+check_true("has positive state", isinstance(noul_diag.POSITIVE_STATE, dict) and len(noul_diag.POSITIVE_STATE) > 0)
+check_true("has negative state", isinstance(noul_diag.NEGATIVE_STATE, dict) and len(noul_diag.NEGATIVE_STATE) > 0)
+check("basic question type is noul", noul_diag.BASIC_QUESTION["type"], "noul")
+check_true("rich question has criteria", "criteria" in noul_diag.RICH_QUESTION)
+check("rich criteria keys", set(noul_diag.RICH_QUESTION["criteria"].keys()), {"true", "false"})
+check("custom labels non-boolean", set(noul_diag.CUSTOM_LABELS.values()), {"A", "B"})
 
-# --------------------------------------------------------------- runtime check (weights required)
-def _run_with_weights():
-    import laya
+# --------------------------------------------------------------- format_report works
+mock_report = {
+    "questions": {
+        "plain": {"pass": False, "cells": {
+            "positive": {"P(true)": 0.0, "confidence": 1.0, "want_true": True, "pass": False},
+            "negative": {"P(true)": 0.0, "confidence": 1.0, "want_true": False, "pass": True},
+        }},
+        "custom": {"pass": True, "cells": {
+            "positive": {"P(true)": 0.95, "confidence": 0.9, "want_true": True, "pass": True},
+            "negative": {"P(true)": 0.05, "confidence": 0.85, "want_true": False, "pass": True},
+        }},
+    },
+    "biased": True,
+}
+formatted = format_report(mock_report)
+check_true("format_report shows BIASED", "BIASED" in formatted)
+check_true("format_report shows overall", "overall:" in formatted)
+check_true("format_report shows plain", "plain" in formatted)
+check_true("format_report shows custom", "custom" in formatted)
 
-    agent = laya.load("convaiinnovations/laya", device="cpu")
-    report = check_noul_bias(agent)
-
-    check_true("report/has questions", "questions" in report)
-    check_true("report/has biased flag", "biased" in report)
-    check_true("report/covers plain", "plain" in report["questions"])
-    check_true("report/covers rich", "rich" in report["questions"])
-    check_true("report/covers custom_labels", "custom_labels" in report["questions"])
-
-    for qid, result in report["questions"].items():
-        check_true(f"{qid}/has pass flag", "pass" in result)
-        for label in ("positive", "negative"):
-            cell = result["cells"][label]
-            check_true(f"{qid}/{label}/has P(true)", "P(true)" in cell)
-            check_true(f"{qid}/{label}/has confidence", "confidence" in cell)
-
-    formatted = noul_diag.format_report(report)
-    check_true("format_report/mentions overall", "overall:" in formatted)
-
-
-try:
-    _run_with_weights()
-except Exception as e:
-    FAIL.append("weight-dependent check skipped or failed: %s" % e)
-
+# --------------------------------------------------------------- report shape contract
+report = check_noul_bias.__wrapped__ if hasattr(check_noul_bias, "__wrapped__") else check_noul_bias
+import inspect
+sig = inspect.signature(report)
+check_true("check_noul_bias accepts agent param", "agent" in sig.parameters)
+check_true("check_noul_bias accepts states param", "states" in sig.parameters)
+check_true("check_noul_bias accepts questions param", "questions" in sig.parameters)
 
 print("\n%d passed, %d failed" % (len(PASS), len(FAIL)))
 for f in FAIL:
