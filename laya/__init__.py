@@ -22,7 +22,6 @@ from .presets import (
 )
 from .router import DEFAULT_MODELS, RouteDecision, Router
 from .shortlist import embed_fn_from_agent, predict_shortlist, shortlist_choice
-from . import noul_diag
 
 __version__ = "0.3.7"
 __all__ = [
