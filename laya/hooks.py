@@ -7,6 +7,7 @@ Everything here is pure Python: importing `laya` must not start pulling torch.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import inspect
 import threading
 import time
@@ -217,6 +218,21 @@ def compose_hooks(installed, hooks=None, on_predict_start=None, on_predict_end=N
     return default_hooks() + list(installed) + normalise_hooks(hooks, on_predict_start, on_predict_end)
 
 
+def validate_timeout(value: Optional[float]) -> Optional[float]:
+    """Return *value* as a positive float, or ``None`` for no limit.
+
+    A non-positive timeout is rejected here rather than left to
+    ``thread.join``: ``join(0)`` and ``join(-1)`` return before the hook has
+    started, so the outcome of a fast hook with such a value is a race.
+    """
+    if value is None:
+        return None
+    timeout = float(value)
+    if timeout <= 0:
+        raise ValueError("hooks_timeout must be a positive number or None; got %r" % (value,))
+    return timeout
+
+
 _BACKGROUND_LOOP: Optional[asyncio.AbstractEventLoop] = None
 _BACKGROUND_LOOP_LOCK = threading.Lock()
 
@@ -239,10 +255,24 @@ def run_coroutine_sync(coro: Awaitable[Any], loop: Optional[asyncio.AbstractEven
     Uses `asyncio.run` when the calling thread has no running loop. When it does (a caller
     inside an async function, or a framework that already runs a loop), the coroutine is run on
     a dedicated background loop so the calling thread can block on it without deadlocking. Pass
-    `loop` to use a specific loop instead of the background one; it must not be running in the
-    calling thread.
+    `loop` to use a specific loop instead of the background one.
+
+    A supplied `loop` must be running somewhere, and must not be the calling thread's own
+    loop. Both are checked: the first would otherwise block forever with no coroutine ever
+    scheduled, and the second would block the only thread that could run the coroutine.
     """
     if loop is not None:
+        if not loop.is_running():
+            raise ValueError("run_coroutine_sync: the loop passed is not running")
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if loop is running:
+            raise ValueError(
+                "run_coroutine_sync: the loop passed is running in the calling thread; "
+                "blocking on it would deadlock"
+            )
         return asyncio.run_coroutine_threadsafe(coro, loop).result()
     try:
         asyncio.get_running_loop()
@@ -275,6 +305,11 @@ class AsyncHook:
     def __init__(self, hook: Any, loop: Optional[asyncio.AbstractEventLoop] = None):
         if isinstance(hook, type):
             raise TypeError("AsyncHook wraps an instance, not a class; got %s" % hook.__name__)
+        if not any(hasattr(hook, event) for event in HOOK_EVENTS):
+            raise TypeError(
+                "AsyncHook wraps an object implementing at least one of %s; got %s"
+                % (", ".join(HOOK_EVENTS), type(hook).__name__)
+            )
         self.hook = hook
         self.loop = loop
 
@@ -378,6 +413,8 @@ def _hook_name(method: Any) -> str:
 
 def _call_hook(method: Any, ctx: PredictContext, timeout: Optional[float]) -> None:
     """Call one hook method, running its result if it is awaitable, under an optional timeout."""
+    timeout = validate_timeout(timeout)
+
     def invoke():
         result = method(ctx)
         if inspect.isawaitable(result):
@@ -389,9 +426,14 @@ def _call_hook(method: Any, ctx: PredictContext, timeout: Optional[float]) -> No
 
     box: List[BaseException] = []
 
+    # Run the hook in a copy of the caller's context, so a `contextvars` value (a request id,
+    # a tracing span) set by the caller is visible to the hook even though it runs on another
+    # thread. The no-timeout path runs inline and inherits the context already.
+    context = contextvars.copy_context()
+
     def runner():
         try:
-            invoke()
+            context.run(invoke)
         except BaseException as exc:  # noqa: BLE001 -- re-raised on the caller thread
             box.append(exc)
 

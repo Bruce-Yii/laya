@@ -1064,6 +1064,59 @@ res = f.predict_batch(["s0"], QUESTIONS, on_predict_end=lambda ctx: None, hooks_
 check("timeout/fast hook unaffected", len(res), 1)
 
 
+# --------------------------------------------------------------- input validation and context
+import contextvars  # noqa: E402
+
+from laya.hooks import validate_timeout  # noqa: E402
+
+check_raises("timeout/zero is rejected", ValueError, lambda: validate_timeout(0))
+check_raises("timeout/negative is rejected", ValueError, lambda: validate_timeout(-0.5))
+check("timeout/positive passes through", validate_timeout(1.5), 1.5)
+check("timeout/None means no limit", validate_timeout(None), None)
+
+f = make_fake()
+check_raises("timeout/zero per call is rejected", ValueError,
+             lambda: f.predict_batch(["s0"], QUESTIONS, hooks_timeout=0))
+
+not_running = asyncio.new_event_loop()
+try:
+    check_raises("async/a non-running loop is rejected", ValueError,
+                 lambda: run_coroutine_sync(_seven(), loop=not_running))
+finally:
+    not_running.close()
+
+
+async def _own_loop():
+    own = asyncio.get_running_loop()
+    try:
+        run_coroutine_sync(_seven(), loop=own)
+    except ValueError:
+        return "raised"
+    return "no"
+
+
+check("async/the calling thread's own loop is rejected", asyncio.run(_own_loop()), "raised")
+check_raises("async/AsyncHook rejects an object with no events", TypeError,
+             lambda: AsyncHook(object()))
+
+_cv_seen = contextvars.ContextVar("cv_seen", default=None)
+_cv_calls = []
+
+
+class CvHook:
+    def on_predict_start(self, ctx):
+        _cv_calls.append(_cv_seen.get())
+
+
+f = make_fake()
+_token = _cv_seen.set("request-1")
+try:
+    f.predict_batch(["s0"], QUESTIONS, hooks=[CvHook()], hooks_timeout=1.0)
+finally:
+    _cv_seen.reset(_token)
+check("timeout/a timed hook sees the caller's contextvars", _cv_calls, ["request-1"])
+
+
 # --------------------------------------------------------------- report
 print("\n%d passed, %d failed" % (len(PASS), len(FAIL)))
 for f_ in FAIL:

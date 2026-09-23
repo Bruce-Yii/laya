@@ -188,7 +188,9 @@ Where the coroutine runs:
 - If the calling thread has no running loop, it is run with `asyncio.run`.
 - If it already has one (a caller inside an async function), it runs on a dedicated background
   loop, so the calling thread can block without deadlocking. Pass `AsyncHook(hook, loop=...)` to
-  funnel onto a specific loop; it must not be running in the calling thread.
+  funnel onto a specific loop; it must be running, and must not be the calling thread's own loop.
+  Both are checked: a stopped loop and the caller's own loop each raise `ValueError` instead of
+  blocking forever.
 
 A hook with no `async` methods is unaffected.
 
