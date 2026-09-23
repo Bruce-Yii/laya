@@ -624,6 +624,8 @@ result["shortlist"]["intent"]["labels"]  # the top 20 labels sent to the model
 
 * **[omp-laya-judge](https://github.com/F0Rextasy/omp-laya-judge)**: an [oh-my-pi](https://github.com/can1357/oh-my-pi) plugin with a local System-1 judge MCP server and skill (`choice`/`bool`/`score`, 0 tokens, about 0.3 s on CPU), confidence-gated escalation, and reproducible quiz and Snake demos.
 * [laya-adk-toolkit](https://github.com/Ashfaqbs/laya-adk-toolkit) — [Google ADK](https://google.github.io/adk-docs/) tools that let an agent call Laya's `classify`/`score`/`detect` typed decisions directly as tools, instead of asking an LLM to guess at structured output.
+* **[laya-elixir](https://github.com/ChristianAlexander/laya_ex)** (v0.1.0, [Hex](https://hex.pm/packages/laya)): a native [Elixir](https://elixir-lang.org/) runtime built on [Nx](https://hexdocs.pm/nx/Nx.html) and [Bumblebee](https://hexdocs.pm/bumblebee/Bumblebee.html), downloading the official checkpoint on first load and answering typed `choice` and `noul` questions in-process — no Python or external services needed.
+* **[laya-mlx](https://github.com/mizorewww/laya-mlx)**: a native [MLX](https://github.com/ml-explore/mlx) port for Apple Silicon (M-series), rewriting the inference engine in Apple's unified-memory framework — drops the PyTorch dependency entirely. Benchmarks on M3 Max: 7–14 ms per decision (75 moves/sec with compilation), FP32/FP16 validated, zero active memory growth over 100 repeated calls. Includes a Core ML variant tapping the Neural Engine (up to 64% power reduction).
 
 ---
 
