@@ -341,11 +341,16 @@ class Agent:
         items = []
         max_len = self.cfg.get("max_len", 512)
         head_max_len = self.cfg.get("head_max_len", 192)
+        # A chronological conversation list is serialized newest-last, so the default
+        # right-truncation (st[:room]) would silently drop the newest turn. Truncate
+        # from the left for lists so the most recent intent is preserved.
+        truncate_left = isinstance(state, list)
 
         for qid in ids:
             self._check_question(qid, questions[qid])
             q = self._to_internal(questions[qid])
-            seq, markers = build_sequence(self.tok, state, q, max_len, head_max_len)
+            seq, markers = build_sequence(self.tok, state, q, max_len, head_max_len,
+                                          truncate_left=truncate_left)
             if len(markers) != len(render_options(q)):
                 raise ValueError("question %r options exceed head_max_len=%d" % (qid, head_max_len))
             items.append({"ids": seq, "markers": markers, "qtype": QTYPES[q["t"]]})
