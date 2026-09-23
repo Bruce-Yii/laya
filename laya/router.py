@@ -436,9 +436,14 @@ class Router(HookRegistry):
                                  detection=None, workflow=workflow)
 
         if lang is not None:
-            key = "english" if _english_from_code(lang) else "multilingual"
-            return RouteDecision(model=key, repo=_repo_str(self.models[key]), reason="explicit lang=%r" % lang,
-                                 detection=None, workflow=workflow)
+            # An explicit `lang` is decisive only when the code names a language. Blank or
+            # whitespace resolves to no usable hint, so it falls through to lang_guess/detection
+            # exactly as an abstaining hint does; real English/non-English codes still route now.
+            resolved = _english_from_code(lang)
+            if resolved is not None:
+                key = "english" if resolved else "multilingual"
+                return RouteDecision(model=key, repo=_repo_str(self.models[key]), reason="explicit lang=%r" % lang,
+                                     detection=None, workflow=workflow)
 
         # Caller-supplied hint, per-call first then the one installed on the Router. Only a hint
         # that actually answers the question routes here; anything else falls through.
