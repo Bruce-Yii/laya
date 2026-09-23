@@ -263,15 +263,18 @@ class Agent:
         return {"t": t, "ins": ins, "crit": crit}
 
     @torch.no_grad()
-    def system_one(self, state: Union[str, dict, list], questions: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    def system_one(self, state: Union[str, dict, list], questions: Dict[str, Dict[str, Any]],
+                   return_raw_logits: bool = False) -> Dict[str, Any]:
         """Evaluate typed questions across state in a single, parallel forward pass.
 
         Args:
             state: Text string, JSON dict, or conversation turn list.
             questions: Dictionary mapping question_id -> question definition.
                 - choice: {"type": "choice", "instructions": "...", "criteria": {"optA": "...", ...}}
-                - score:  {"type": "score",  "instructions": "...", "criteria": ["lvl0", "lvl1", ...]}
+                - score:  {"type": "score",  "instructions": "...",  "criteria": ["lvl0", "lvl1", ...]}
                 - noul:   {"type": "noul",   "instructions": "..."}
+            return_raw_logits: If True, include the raw option logits (before temperature
+                scaling) in ``usage["_raw_logits"]``. Used by calibration tools.
 
         Returns:
             Dictionary with answers, probabilities, calibrated confidence, and token usage.
@@ -361,10 +364,13 @@ class Agent:
                     "action": ext,
                 }
 
+        usage = {"input_tokens": n_tokens, "output_tokens": 0}
+        if return_raw_logits:
+            usage["_raw_logits"] = logits
         return {
             "model": "laya-rl-agent",
             "answers": answers,
-            "usage": {"input_tokens": n_tokens, "output_tokens": 0},
+            "usage": usage,
         }
 
     predict = system_one

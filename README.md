@@ -357,6 +357,22 @@ option count) on held-out data moves mean ECE **0.466 -> 0.081** (`laya`) and
 **0.314 -> 0.106** (`laya-multilingual`). `laya-multilingual` ships with no fitted
 temperatures at all, so fit them before relying on its probabilities.
 
+Fit temperatures on your own calibration data::
+
+    from tools.calibration import fit_temperatures
+
+    result = fit_temperatures(
+        agent,
+        states=[{"body": "..."}, ...],
+        questions=[{"q": {"type": "choice", ...}}, ...],
+        targets=[0, 1, ...],  # index of the correct answer (label / level / bool)
+    )
+    agent.temperature = result["temperature"]
+    agent.temperature_by_options = result["temperature_by_options"]
+
+The method returns per-bucket ECE at the optimum. Callers apply the fitted values
+by assigning ``agent.temperature`` and ``agent.temperature_by_options``.
+
 ### Honest limits
 
 * **The base checkpoints are near chance on typed-decisions zero-shot** -- 0.362 and 0.352
