@@ -199,6 +199,7 @@ class Agent(HookRegistry):
     # hand-built instance (`Agent.__new__` in tests) working and make an unset hook a no-op.
     hooks_raise = True
     hooks_concurrent = True
+    hooks_timeout = None
     _hooks_lock = None
     model_id = None
     # Autocast is chosen per device in __init__; this default covers instances built
@@ -222,6 +223,7 @@ class Agent(HookRegistry):
         on_predict_end=None,
         hooks_raise: bool = True,
         hooks_concurrent: bool = True,
+        hooks_timeout: Optional[float] = None,
     ):
         """Load a Laya checkpoint.
 
@@ -233,12 +235,14 @@ class Agent(HookRegistry):
         downloaded, so bundling does not cost every user the whole family.
 
         `hooks` / `on_predict_start` / `on_predict_end` observe or shape every prediction; see
-        `laya.hooks`. `hooks_raise=False` warns and continues when a hook fails, and
-        `hooks_concurrent=False` serialises hooks that are not safe to run in parallel.
+        `laya.hooks`. `hooks_raise=False` warns and continues when a hook fails,
+        `hooks_concurrent=False` serialises hooks that are not safe to run in parallel, and
+        `hooks_timeout` bounds each hook call in seconds (None means no limit).
         """
         self.hooks = normalise_hooks(hooks, on_predict_start, on_predict_end)
         self.hooks_raise = bool(hooks_raise)
         self.hooks_concurrent = bool(hooks_concurrent)
+        self.hooks_timeout = None if hooks_timeout is None else float(hooks_timeout)
         self._hooks_lock = threading.RLock() if not hooks_concurrent else None
         self._hooks_mutex = threading.Lock()
         self.model_id = model_id_or_path
@@ -713,6 +717,7 @@ class Agent(HookRegistry):
                       hooks=None,
                       on_predict_start=None, on_predict_end=None,
                       hooks_raise: Optional[bool] = None,
+                      hooks_timeout: Optional[float] = None,
                       max_len: Optional[int] = None,
                       head_max_len: Optional[int] = None,
                       sort_by_length: bool = False) -> List[Dict[str, Any]]:
@@ -734,6 +739,7 @@ class Agent(HookRegistry):
                     `ctx.skip(...)` to short-circuit inference; `on_predict_end` may rewrite the
                     results. See `laya.hooks`.
             hooks_raise: Override the Agent's `hooks_raise` for this call.
+            hooks_timeout: Override the Agent's `hooks_timeout` for this call.
             max_len, head_max_len: Override the agent config for this call. A start hook may also
                     set `ctx.max_len` / `ctx.head_max_len` to shape the token budget.
             sort_by_length: Group similarly sized encoded states within windows of eight batches
@@ -748,10 +754,11 @@ class Agent(HookRegistry):
         """
         active = compose_hooks(self.hooks, hooks, on_predict_start, on_predict_end)
         raise_errors = self.hooks_raise if hooks_raise is None else bool(hooks_raise)
+        timeout = self.hooks_timeout if hooks_timeout is None else float(hooks_timeout)
         ctx = PredictContext(states=states, questions=questions, model=self.model_id, agent=self,
                              max_len=max_len, head_max_len=head_max_len)
         try:
-            dispatch(active, "on_predict_start", ctx, raise_errors=raise_errors, lock=self._hooks_lock)
+            dispatch(active, "on_predict_start", ctx, raise_errors=raise_errors, lock=self._hooks_lock, timeout=timeout)
             states, questions = ctx.states, ctx.questions
             if ctx.results is None:
                 # A start hook may have normalised a bare string/dict into a list; only the value
@@ -822,7 +829,7 @@ class Agent(HookRegistry):
         except BaseException as exc:
             ctx.error = exc
             try:
-                dispatch(active, "on_error", ctx, raise_errors=raise_errors, lock=self._hooks_lock)
+                dispatch(active, "on_error", ctx, raise_errors=raise_errors, lock=self._hooks_lock, timeout=timeout)
             except BaseException as hook_exc:
                 # A failing on_error hook must not hide the failure that triggered it.
                 exc.__context__ = hook_exc
@@ -832,7 +839,7 @@ class Agent(HookRegistry):
             if ctx.results is not None:
                 ctx.usage = aggregate_usage(ctx.results)
             try:
-                dispatch(active, "on_predict_end", ctx, raise_errors=raise_errors, lock=self._hooks_lock)
+                dispatch(active, "on_predict_end", ctx, raise_errors=raise_errors, lock=self._hooks_lock, timeout=timeout)
             except BaseException as hook_exc:
                 # End hooks run on the failure path too; do not let one mask the real error.
                 if ctx.error is not None:
@@ -845,6 +852,7 @@ class Agent(HookRegistry):
     def system_one(self, state: Union[str, dict, list], questions: Dict[str, Dict[str, Any]], lang: Optional[str] = None,
                    hooks=None, on_predict_start=None, on_predict_end=None,
                    hooks_raise: Optional[bool] = None,
+                   hooks_timeout: Optional[float] = None,
                    max_len: Optional[int] = None,
                    head_max_len: Optional[int] = None) -> Dict[str, Any]:
         """Evaluate typed questions across state in a single, parallel forward pass.
@@ -872,6 +880,7 @@ class Agent(HookRegistry):
         return self.predict_batch([state], questions, lang=lang, hooks=hooks,
                                   on_predict_start=on_predict_start,
                                   on_predict_end=on_predict_end, hooks_raise=hooks_raise,
+                                  hooks_timeout=hooks_timeout,
                                   max_len=max_len, head_max_len=head_max_len)[0]
 
     def __enter__(self):
@@ -913,7 +922,8 @@ def load(model_id_or_path: str = "convaiinnovations/laya", device: Optional[str]
          token: Optional[str] = None, subfolder: Optional[str] = None, fast: bool = False,
          lang_temperatures: Optional[Dict[str, Dict[str, Any]]] = None,
          hooks=None, on_predict_start=None, on_predict_end=None,
-         hooks_raise: bool = True, hooks_concurrent: bool = True) -> Agent:
+         hooks_raise: bool = True, hooks_concurrent: bool = True,
+         hooks_timeout: Optional[float] = None) -> Agent:
     """Load a Laya agent.
 
     `subfolder` picks one checkpoint out of a repo that bundles several:
@@ -928,4 +938,5 @@ def load(model_id_or_path: str = "convaiinnovations/laya", device: Optional[str]
     return Agent(model_id_or_path, device=device, token=token, subfolder=subfolder, fast=fast,
                  lang_temperatures=lang_temperatures,
                  hooks=hooks, on_predict_start=on_predict_start, on_predict_end=on_predict_end,
-                 hooks_raise=hooks_raise, hooks_concurrent=hooks_concurrent)
+                 hooks_raise=hooks_raise, hooks_concurrent=hooks_concurrent,
+                 hooks_timeout=hooks_timeout)
