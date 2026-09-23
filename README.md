@@ -441,6 +441,47 @@ triage = agent.predict({"message": "My payment failed twice"}, laya.triage_quest
 
 ---
 
+## Known limitation: boolean-word labels bias `noul`
+
+The shipped Laya checkpoints can anchor on literal boolean option labels and select
+the negative answer **regardless of the input state**. With default `noul`
+(e.g. phishing, spam, churn), a positive statement like "I love this product" can
+return `P(true)=0.0000` with `confidence=1.0000`. The model is answering from the
+label word, not the state.
+
+This is a **trust-breaking failure**: the model is most confident precisely when it
+is most wrong.
+
+### How to detect it
+
+```python
+from laya.noul_diag import check_noul_bias, format_report
+
+agent = laya.load("convaiinnovations/laya")
+report = check_noul_bias(agent)
+print(format_report(report))
+```
+
+### How to fix it
+
+Use the `labels` parameter to give `noul` neutral model-facing text while keeping
+the returned value as `P(true)`:
+
+```python
+question = {
+    "type": "noul",
+    "instructions": "Is this review positive?",
+    "criteria": {"true": "the review is positive", "false": "the review is negative"},
+    "labels": {"false": "A", "true": "B"},  # any non-boolean distinct strings work
+}
+answer = agent.predict(state, {"sentiment": question})["answers"]["sentiment"]
+# answer["noul"] is still P(true); answer["confidence"] is calibrated
+```
+
+The diagnostic ships in `laya.noul_diag` and is covered by `tests/test_criteria.py`.
+
+---
+
 ## Benchmarks
 
 Community diagnostic: [Chinese workplace decisions (Feishu-style)](research/benchmarks/feishu_zh/README.md) · [中文说明](research/benchmarks/feishu_zh/README.zh-CN.md). Includes frozen synthetic cases, archived paired Laya/Jev responses, and an offline audit; separate from the benchmark suites below.
