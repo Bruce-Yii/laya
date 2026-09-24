@@ -45,7 +45,13 @@ const DEVICE_FOOTER = new RegExp(
   "i",
 );
 const DISCLAIMER = new RegExp(
-  "(confidential|intended (solely )?for the (use of the )?(named )?(addressee|recipient)|" +
+  // Keep Python parity: the bare word "confidential" is user content too
+  // ("Confidential: I need a refund.", "Is this confidential?"). Match English
+  // boilerplate only when a disclaimer noun/tail makes the intent unambiguous.
+  "(\\b(e-?mail|message|information|communication|transmission|contents?)\\b[^.]{0,60}" +
+    "\\bconfidential\\b[^.]{0,60}\\b(intended|solely|addressee|recipient|privileged|" +
+    "disclos|unauthori[sz]ed)|" +
+    "\\bconfidential\\b[^.]{0,60}\\b(and (may|is) (also )?privileged)|" +
     "if you (have )?received this (e-?mail|message) in error|" +
     "\\b(esta|este) (mensagem|e-?mail|mensaje|correo)\\b[^.]{0,80}(confidencia|sigilos|privilegiad)|" +
     "\\b(uso exclusivo|exclusivamente|únicamente|unicamente)\\b[^.]{0,30}" +

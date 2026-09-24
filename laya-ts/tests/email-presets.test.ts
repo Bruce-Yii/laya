@@ -35,6 +35,25 @@ describe("email+presets", () => {
     const out = cleanEmailBody("Please review the draft when you can.\nIt is two pages.\nThanks in advance,\nPriya Nair");
     expect(out).toBe("Please review the draft when you can.\nIt is two pages.");
   });
+  it("keeps user text that merely says confidential (Python parity)", () => {
+    expect(cleanEmailBody("Is this confidential?")).toBe("Is this confidential?");
+    expect(cleanEmailBody("Confidential: I need a refund.")).toBe("Confidential: I need a refund.");
+    expect(cleanEmailBody("Please keep this confidential but process my refund.")).toBe(
+      "Please keep this confidential but process my refund.",
+    );
+  });
+  it("still removes a real English confidentiality footer", () => {
+    expect(
+      cleanEmailBody("This email is confidential and intended solely for the named addressee."),
+    ).toBe("");
+  });
+  it("keeps the request when a real footer shares its paragraph (Python parity)", () => {
+    const body =
+      "My account is locked.\n" +
+      "This email is confidential and intended solely for the named addressee.\n" +
+      "Please unlock it.";
+    expect(cleanEmailBody(body)).toBe("My account is locked. Please unlock it.");
+  });
   it("bounds input to 4x maxChars before regex work (Python parity)", () => {
     const out = cleanEmailBody("word ".repeat(3000) + "\nOn Mon, Bob wrote:\nold text");
     expect(out.length).toBe(3000);
