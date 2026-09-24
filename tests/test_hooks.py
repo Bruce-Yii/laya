@@ -555,6 +555,63 @@ r.predict("hello", QUESTIONS, hooks=[pcr])
 check("router/per-call hooks apply to on_route", len(pcr.decisions), 1)
 
 
+# Route/load failures happen before on_predict_start, but still belong to the prediction
+# lifecycle: observability hooks must see on_error and on_predict_end for those failures.
+class PredictFailureTrace:
+    def __init__(self):
+        self.events = []
+
+    def on_predict_start(self, ctx):
+        self.events.append(("start", ctx))
+
+    def on_error(self, ctx):
+        self.events.append(("error", ctx))
+
+    def on_predict_end(self, ctx):
+        self.events.append(("end", ctx))
+
+
+class RaiseOnRoute(PredictFailureTrace):
+    def on_route(self, ctx):
+        raise RuntimeError("route failed")
+
+
+route_fail = RaiseOnRoute()
+r = Router(hooks=[route_fail])
+raised = None
+try:
+    r.predict("hello", QUESTIONS)
+except RuntimeError as exc:
+    raised = exc
+check("router/route failure propagates original", str(raised), "route failed")
+check("router/route failure lifecycle", [event for event, _ in route_fail.events], ["error", "end"])
+check_true("router/route failure end sees original error",
+           route_fail.events[-1][1].error is raised)
+check("router/route failure has no decision yet", route_fail.events[-1][1].decision, None)
+check("router/route failure has no agent yet", route_fail.events[-1][1].agent, None)
+
+
+class LoadFailRouter(Router):
+    def load(self, model):
+        raise RuntimeError("load failed")
+
+
+load_fail = PredictFailureTrace()
+r = LoadFailRouter(hooks=[load_fail])
+raised = None
+try:
+    r.predict("hello", QUESTIONS, model="english")
+except RuntimeError as exc:
+    raised = exc
+check("router/load failure propagates original", str(raised), "load failed")
+check("router/load failure lifecycle", [event for event, _ in load_fail.events], ["error", "end"])
+check_true("router/load failure end sees original error",
+           load_fail.events[-1][1].error is raised)
+check("router/load failure keeps routed model", load_fail.events[-1][1].model, "english")
+check("router/load failure keeps decision", load_fail.events[-1][1].decision["model"], "english")
+check("router/load failure has no agent yet", load_fail.events[-1][1].agent, None)
+
+
 # --------------------------------------------------------------- Router.predict_batch
 # `predict_batch` promises each result is what `predict` returns for that request, so Router-level
 # predict hooks must run per request there too. It used to skip them: a redaction hook never ran,

@@ -525,18 +525,26 @@ class Router(HookRegistry):
         active = compose_hooks(self.hooks, hooks, on_predict_start, on_predict_end)
         raise_errors = self.hooks_raise if hooks_raise is None else bool(hooks_raise)
 
-        # Per-call hooks apply to the whole call, including on_route inside route().
-        decision = self.route(state, questions, model=model, task=task, lang=lang,
-                              lang_guess=lang_guess, hooks=hooks, hooks_raise=hooks_raise)
-        agent = self.load(decision["model"])
-        effective_lang = lang
-        if effective_lang is None and decision.get("detection") and decision["detection"].get("language"):
-            effective_lang = decision["detection"]["language"]
-
-        ctx = PredictContext(states=[state], questions=questions, decision=dict(decision),
-                             model=decision["model"], agent=agent, router=self,
+        # Build the context before routing/loading so failures in those steps are visible to
+        # the same on_error/on_predict_end lifecycle as inference failures. Successful calls keep
+        # the existing contract: on_predict_start runs only after routing and loading complete,
+        # with decision/model/agent populated.
+        ctx = PredictContext(states=[state], questions=questions, router=self,
                              max_len=max_len, head_max_len=head_max_len)
         try:
+            # Per-call hooks apply to the whole call, including on_route inside route().
+            decision = self.route(state, questions, model=model, task=task, lang=lang,
+                                  lang_guess=lang_guess, hooks=hooks, hooks_raise=hooks_raise)
+            ctx.decision = dict(decision)
+            ctx.model = decision["model"]
+
+            agent = self.load(decision["model"])
+            ctx.agent = agent
+
+            effective_lang = lang
+            if effective_lang is None and decision.get("detection") and decision["detection"].get("language"):
+                effective_lang = decision["detection"]["language"]
+
             dispatch(active, "on_predict_start", ctx, raise_errors=raise_errors, lock=self._hooks_lock)
             if ctx.results is None:
                 # Pass token-budget overrides only when set, so any Agent-like object that does
