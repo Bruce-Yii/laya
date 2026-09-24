@@ -555,6 +555,68 @@ r.predict("hello", QUESTIONS, hooks=[pcr])
 check("router/per-call hooks apply to on_route", len(pcr.decisions), 1)
 
 
+class PredictFailureTrace:
+    def __init__(self):
+        self.events = []
+        self.contexts = {}
+
+    def on_predict_start(self, ctx):
+        self.events.append("start")
+
+    def on_error(self, ctx):
+        self.events.append("error")
+        self.contexts["error"] = ctx
+
+    def on_predict_end(self, ctx):
+        self.events.append("end")
+        self.contexts["end"] = ctx
+
+
+class RaiseOnRoute(PredictFailureTrace):
+    def on_route(self, ctx):
+        raise RuntimeError("route failed")
+
+
+route_trace = RaiseOnRoute()
+route_error = None
+try:
+    Router(hooks=[route_trace]).predict("hello", QUESTIONS)
+except RuntimeError as exc:
+    route_error = exc
+check_true("router/route failure propagates", isinstance(route_error, RuntimeError))
+check("router/route failure lifecycle", route_trace.events, ["error", "end"])
+check_true("router/route failure has no start", "start" not in route_trace.events)
+route_ctx = route_trace.contexts.get("error")
+check_true("router/route failure records the original error",
+           getattr(route_ctx, "error", None) is route_error)
+check("router/route failure has no decision", getattr(route_ctx, "decision", "missing"), None)
+check("router/route failure has no model", getattr(route_ctx, "model", "missing"), None)
+check("router/route failure has no agent", getattr(route_ctx, "agent", "missing"), None)
+
+
+class LoadFailRouter(Router):
+    def load(self, model):
+        raise RuntimeError("load failed")
+
+
+load_trace = PredictFailureTrace()
+load_error = None
+try:
+    LoadFailRouter(hooks=[load_trace]).predict("hello", QUESTIONS)
+except RuntimeError as exc:
+    load_error = exc
+check_true("router/load failure propagates", isinstance(load_error, RuntimeError))
+check("router/load failure lifecycle", load_trace.events, ["error", "end"])
+check_true("router/load failure has no start", "start" not in load_trace.events)
+load_ctx = load_trace.contexts.get("error")
+check_true("router/load failure records the original error",
+           getattr(load_ctx, "error", None) is load_error)
+check("router/load failure retains the routed decision",
+      (getattr(load_ctx, "decision", None) or {}).get("model"), "english")
+check("router/load failure exposes the routed model", getattr(load_ctx, "model", "missing"), "english")
+check("router/load failure has no agent", getattr(load_ctx, "agent", "missing"), None)
+
+
 # --------------------------------------------------------------- Router.predict_batch
 # `predict_batch` promises each result is what `predict` returns for that request, so Router-level
 # predict hooks must run per request there too. It used to skip them: a redaction hook never ran,

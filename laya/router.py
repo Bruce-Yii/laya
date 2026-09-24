@@ -535,19 +535,25 @@ class Router(HookRegistry):
         raise_errors = self.hooks_raise if hooks_raise is None else bool(hooks_raise)
         timeout = self.hooks_timeout if hooks_timeout is None else validate_timeout(hooks_timeout)
 
-        # Per-call hooks apply to the whole call, including on_route inside route().
-        decision = self.route(state, questions, model=model, task=task, lang=lang,
-                              lang_guess=lang_guess, hooks=hooks, hooks_raise=hooks_raise,
-                              hooks_timeout=hooks_timeout)
-        agent = self.load(decision["model"])
-        effective_lang = lang
-        if effective_lang is None and decision.get("detection") and decision["detection"].get("language"):
-            effective_lang = decision["detection"]["language"]
-
-        ctx = PredictContext(states=[state], questions=questions, decision=dict(decision),
-                             model=decision["model"], agent=agent, router=self,
-                             max_len=max_len, head_max_len=head_max_len)
+        decision = None
+        agent = None
+        ctx = None
+        route_started_at = time.perf_counter()
         try:
+            # Per-call hooks apply to the whole call, including on_route inside route().
+            decision = self.route(state, questions, model=model, task=task, lang=lang,
+                                  lang_guess=lang_guess, hooks=hooks, hooks_raise=hooks_raise,
+                                  hooks_timeout=hooks_timeout)
+            agent = self.load(decision["model"])
+            effective_lang = lang
+            if effective_lang is None and decision.get("detection") and decision["detection"].get("language"):
+                effective_lang = decision["detection"]["language"]
+
+            # Keep the successful-path context creation after route/load. Its started_at and
+            # elapsed_ms must continue to measure prediction, not route/model-load work.
+            ctx = PredictContext(states=[state], questions=questions, decision=dict(decision),
+                                 model=decision["model"], agent=agent, router=self,
+                                 max_len=max_len, head_max_len=head_max_len)
             dispatch(active, "on_predict_start", ctx, raise_errors=raise_errors, lock=self._hooks_lock, timeout=timeout)
             if ctx.results is None:
                 # Pass token-budget overrides only when set, so any Agent-like object that does
@@ -574,6 +580,18 @@ class Router(HookRegistry):
                     if isinstance(result, dict):
                         result.setdefault("routing", dict(decision))
         except BaseException as exc:
+            if ctx is None:
+                ctx = PredictContext(
+                    states=[state],
+                    questions=questions,
+                    decision=dict(decision) if decision is not None else None,
+                    model=decision["model"] if decision is not None else None,
+                    agent=agent,
+                    router=self,
+                    max_len=max_len,
+                    head_max_len=head_max_len,
+                    started_at=route_started_at,
+                )
             ctx.error = exc
             try:
                 dispatch(active, "on_error", ctx, raise_errors=raise_errors, lock=self._hooks_lock, timeout=timeout)
@@ -581,16 +599,17 @@ class Router(HookRegistry):
                 exc.__context__ = hook_exc
             raise
         finally:
-            ctx.elapsed_ms = (time.perf_counter() - ctx.started_at) * 1000.0
-            if ctx.results is not None:
-                ctx.usage = aggregate_usage(ctx.results)
-            try:
-                dispatch(active, "on_predict_end", ctx, raise_errors=raise_errors, lock=self._hooks_lock, timeout=timeout)
-            except BaseException as hook_exc:
-                if ctx.error is not None:
-                    ctx.error.__context__ = hook_exc
-                else:
-                    raise
+            if ctx is not None:
+                ctx.elapsed_ms = (time.perf_counter() - ctx.started_at) * 1000.0
+                if ctx.results is not None:
+                    ctx.usage = aggregate_usage(ctx.results)
+                try:
+                    dispatch(active, "on_predict_end", ctx, raise_errors=raise_errors, lock=self._hooks_lock, timeout=timeout)
+                except BaseException as hook_exc:
+                    if ctx.error is not None:
+                        ctx.error.__context__ = hook_exc
+                    else:
+                        raise
         return ctx.results[0]
 
     def decide(self, state: Union[str, dict, list], schema: Any = None, *,
