@@ -67,16 +67,26 @@ def _extract_from_message_or_value(val: Any) -> Any:
     return val
 
 
+def _message_role(message: Any) -> Any:
+    if isinstance(message, dict):
+        return message.get("type") or message.get("role")
+    return getattr(message, "type", None) or getattr(message, "role", None)
+
+
+def _message_content(message: Any) -> str:
+    if isinstance(message, dict):
+        return str(message.get("content", message))
+    return str(getattr(message, "content", message))
+
+
 def _extract_from_messages_list(msgs: Sequence[Any]) -> str:
     if not msgs:
         return ""
-    # Search backwards for the most recent human/user message
+    # Search backwards for the most recent human/user message.
     for m in reversed(msgs):
-        role = getattr(m, "type", None) or getattr(m, "role", None)
-        if role in ("human", "user"):
-            return str(getattr(m, "content", m))
-    last = msgs[-1]
-    return str(getattr(last, "content", last))
+        if _message_role(m) in ("human", "user"):
+            return _message_content(m)
+    return _message_content(msgs[-1])
 
 
 class _SameOriginRedirectHandler(urllib.request.HTTPRedirectHandler):

@@ -66,6 +66,37 @@ msgs = [
 check("extract/messages_list", _extract_text(msgs), "second human message")
 check("extract/dict_with_messages", _extract_text({"messages": msgs}), "second human message")
 
+# LangChain also accepts role/content dictionaries as message representations.
+dict_msgs = [
+    {"role": "user", "content": "first dict user"},
+    {"role": "assistant", "content": "assistant reply"},
+    {"role": "user", "content": "second dict user"},
+    {"role": "assistant", "content": "final assistant reply"},
+]
+check("extract/dict_messages_list", _extract_text(dict_msgs), "second dict user")
+check("extract/state_with_dict_messages", _extract_text({"messages": dict_msgs}), "second dict user")
+check(
+    "extract/dict_no_user_falls_back_to_last_content",
+    _extract_text([
+        {"role": "assistant", "content": "first assistant"},
+        {"role": "assistant", "content": "last assistant"},
+    ]),
+    "last assistant",
+)
+check(
+    "extract/dict_type_human",
+    _extract_text([{"type": "human", "content": "human via type key"}]),
+    "human via type key",
+)
+mixed_msgs = [
+    DummyMessage("human", "object user"),
+    {"role": "assistant", "content": "dict assistant"},
+    {"role": "user", "content": "dict user"},
+    DummyMessage("ai", "final object assistant"),
+]
+check("extract/mixed_object_dict_messages", _extract_text(mixed_msgs), "dict user")
+check("extract/empty_messages_list", _extract_text([]), "")
+
 # Custom callable extractor
 check("extract/custom_callable", _extract_text({"custom": "special"}, lambda x: x["custom"].upper()), "SPECIAL")
 
