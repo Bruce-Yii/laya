@@ -532,6 +532,51 @@ check("router/predict start sees the decision", predict_seen["decision"]["model"
 check("router/predict end sees results", len(predict_seen["results"]), 1)
 check("router/predict keeps routing", out["routing"]["model"], "english")
 
+
+class PredictSuccessTrace:
+    def __init__(self):
+        self.events = []
+        self.contexts = []
+
+    def on_predict_start(self, ctx):
+        self.events.append("start")
+        self.contexts.append(ctx)
+
+    def on_predict_end(self, ctx):
+        self.events.append("end")
+        self.contexts.append(ctx)
+
+
+success_trace = PredictSuccessTrace()
+r = Router(hooks=[success_trace])
+r.attach("english", FakeAgent())
+success_out = r.predict("hello", QUESTIONS)
+check("router/predict success lifecycle", success_trace.events, ["start", "end"])
+check_true("router/predict success shares one context", success_trace.contexts[0] is success_trace.contexts[1])
+check("router/predict success shares one run_id", success_trace.contexts[0].run_id,
+      success_trace.contexts[1].run_id)
+check("router/predict success keeps the normal result", success_out["routing"]["model"], "english")
+
+
+class TimedAgent:
+    def system_one(self, state, questions, **kwargs):
+        return {"model": "timed", "answers": {}, "usage": {"input_tokens": 0, "output_tokens": 0}}
+
+
+class TimedRouter(Router):
+    def load(self, model):
+        time.sleep(0.001)
+        self.load_finished = time.perf_counter()
+        return TimedAgent()
+
+
+timed_trace = PredictSuccessTrace()
+timed_router = TimedRouter(hooks=[timed_trace])
+timed_router.predict("hello", QUESTIONS)
+timed_ctx = timed_trace.contexts[0]
+check_true("router/success elapsed starts after load", timed_ctx.started_at >= timed_router.load_finished)
+
+
 cached = [{"model": "cached", "answers": {}, "usage": {"input_tokens": 0, "output_tokens": 0}}]
 r = Router()
 r.attach("english", FakeAgent())
