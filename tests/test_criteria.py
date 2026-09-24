@@ -270,6 +270,8 @@ for label, qdef in [
                                        "criteria": ("billing", "tech")}),
     ("score without criteria", {"type": "score", "instructions": "How urgent?"}),
     ("score with an empty list", {"type": "score", "instructions": "How urgent?", "criteria": []}),
+    ("score with a null level", {"type": "score", "instructions": "How urgent?",
+                                 "criteria": ["low", None, "blocking"]}),
     ("score with a dict of levels", {"type": "score", "instructions": "How urgent?",
                                      "criteria": {"low": "no pressure", "high": "blocking"}}),
     ("choice with labels", {"type": "choice", "instructions": "Which team?",
