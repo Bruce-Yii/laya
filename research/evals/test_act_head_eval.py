@@ -180,6 +180,56 @@ junk = analyse_cases([None, "nope", 5, case(0.9, True, 0.8)])
 check("analyse/junk_counted", junk["skipped"]["malformed_case"], 3)
 check("analyse/junk_paired", junk["paired"], 1)
 
+# ------------------------------------------------------------------ non-finite evidence
+# `json.load` accepts the non-standard NaN / Infinity / -Infinity tokens by default, so a
+# malformed report can carry them into the harness. They are not measurements: ranking
+# them produced a confident-looking 0.5 for NaN and +Inf and 0.0 for -Inf, where 0.0 reads
+# as "the signal is perfectly anti-correlated" rather than "the input was garbage".
+NAN, INF, NEG_INF = float("nan"), float("inf"), float("-inf")
+
+for label, value in (("nan", NAN), ("posinf", INF), ("neginf", NEG_INF)):
+    nonfinite_act = analyse_cases([
+        case(0.9, True, 0.8),
+        case(value, False, 0.3),
+        case(0.1, False, 0.2),
+    ])
+    check("analyse/nonfinite_act_counted_%s" % label,
+          nonfinite_act["skipped"]["missing_act_probability"], 1)
+    check("analyse/nonfinite_act_paired_%s" % label, nonfinite_act["paired"], 2)
+    check("analyse/nonfinite_act_no_fake_auc_%s" % label, nonfinite_act["act_auc"], 1.0)
+    check("analyse/nonfinite_act_excluded_from_spread_%s" % label,
+          (nonfinite_act["act_min"], nonfinite_act["act_max"]), (0.1, 0.9))
+
+    nonfinite_conf = analyse_cases([
+        case(0.9, True, 0.8),
+        case(0.2, False, value),
+        case(0.1, False, 0.2),
+    ])
+    check("analyse/nonfinite_confidence_counted_%s" % label,
+          nonfinite_conf["skipped"]["missing_confidence"], 1)
+    check("analyse/nonfinite_confidence_paired_%s" % label, nonfinite_conf["paired"], 2)
+    # The dropped case is the middle one; the two survivors still separate cleanly, and
+    # the act AUC must be computed on exactly that reduced set.
+    check("analyse/nonfinite_confidence_auc_%s" % label, nonfinite_conf["act_auc"], 1.0)
+
+# `roc_auc` is independently callable, so it rejects non-finite scores itself rather than
+# relying on the caller having filtered them.
+for label, value in (("nan", NAN), ("posinf", INF), ("neginf", NEG_INF)):
+    try:
+        roc_auc([value, 0.5, 0.9], [True, False, True])
+        FAIL.append("roc_auc should reject a %s score" % label)
+    except ValueError as exc:
+        check_true("roc_auc/rejects_%s" % label, "finite" in str(exc).lower(), str(exc))
+
+# A report that is entirely non-finite leaves nothing to score, which is a clean null
+# state rather than a fabricated number.
+all_bad = analyse_cases([case(NAN, True, 0.8), case(0.5, False, INF)])
+check("analyse/all_nonfinite_paired", all_bad["paired"], 0)
+check("analyse/all_nonfinite_auc", all_bad["act_auc"], None)
+check("analyse/all_nonfinite_reason", all_bad["auc_null_reason"], "no scorable cases")
+check("analyse/all_nonfinite_counted",
+      all_bad["skipped"]["missing_confidence"] + all_bad["skipped"]["missing_act_probability"], 2)
+
 # ------------------------------------------------------------------ report plumbing
 REPORT = {
     "config": {"model": "english"},

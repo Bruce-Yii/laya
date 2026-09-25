@@ -29,8 +29,8 @@ denominator:
 |---|---|
 | `paired` | usable for both AUCs |
 | `no_binary_correctness` | `correct` is not a bool -- a `score` answer, where correctness is not unambiguous |
-| `missing_act_probability` | `action.act_probability` absent or not a real number |
-| `missing_confidence` | `correct` and `act_probability` fine, but no numeric `confidence` |
+| `missing_act_probability` | `action.act_probability` absent, not a number, or not finite |
+| `missing_confidence` | `correct` and `act_probability` fine, but `confidence` absent, not a number, or not finite |
 | `malformed_case` | the entry is not a case object at all |
 
 The `paired` set is used for **both** the `act_probability` AUC and the `confidence`
@@ -57,12 +57,20 @@ ROC-AUC is undefined when one class is absent, and this harness reports `null` w
 maximum and unique-value count plus a `saturated` flag: a signal pinned at one value is a
 failed diagnostic, not a 0.5 result to be averaged away.
 
+A number is only accepted when it is finite. `json.load` reads the non-standard `NaN` /
+`Infinity` / `-Infinity` tokens by default, so a malformed report can carry them in, and
+ranking one returns a confident-looking number that means nothing -- 0.5 for `NaN` and
+`+inf`, 0.0 for `-inf`, where 0.0 is easily misread as a real anti-correlated signal. They
+are bucketed as missing evidence instead, `roc_auc` raises `ValueError` if called directly
+with one, and the JSON writer sets `allow_nan=False` so none can leave this tool.
+
     python research/evals/act_head_eval.py report.json [--json out.json] [--markdown out.md]
 """
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -79,8 +87,16 @@ _NO_CASES = "no scorable cases"
 
 
 def _is_number(value: Any) -> bool:
-    """True for a real number. `bool` is an `int` subclass, and is not a measurement."""
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
+    """True for a finite real number.
+
+    ``bool`` is an ``int`` subclass and is not a measurement. NaN and the infinities are
+    excluded too: ``json.load`` accepts the non-standard ``NaN`` / ``Infinity`` /
+    ``-Infinity`` tokens, so a malformed report can carry them in, and they are not
+    evidence of anything.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    return math.isfinite(float(value))
 
 
 def roc_auc(scores: Sequence[float], labels: Sequence[bool]) -> Optional[float]:
@@ -88,11 +104,19 @@ def roc_auc(scores: Sequence[float], labels: Sequence[bool]) -> Optional[float]:
 
     None when either class is absent, or when there is nothing to score: ROC-AUC needs
     both a positive and a negative case to be defined at all.
+
+    Raises ValueError on a non-finite score. This function is callable on its own, and
+    ranking NaN or an infinity yields a confident-looking number -- 0.5 for NaN and for
+    ``+inf``, 0.0 for ``-inf`` -- where 0.0 reads as "the signal is perfectly
+    anti-correlated" rather than "the input was not a measurement". Refusing is the only
+    honest answer.
     """
     y = np.asarray(labels, dtype=bool)
     s = np.asarray(scores, dtype=float)
     if y.shape != s.shape:
         raise ValueError("scores and labels must be the same length")
+    if not np.all(np.isfinite(s)):
+        raise ValueError("scores must all be finite numbers")
     n_pos = int(y.sum())
     n_neg = int(y.shape[0] - n_pos)
     if n_pos == 0 or n_neg == 0:
@@ -274,7 +298,10 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.json_out:
         with open(args.json_out, "w", encoding="utf-8") as handle:
-            json.dump(result, handle, indent=2, sort_keys=True)
+            # allow_nan=False: this diagnostic refuses non-finite evidence on the way in,
+            # so a NaN reaching the output would be a bug worth failing on, not a value
+            # to write out as non-standard JSON.
+            json.dump(result, handle, indent=2, sort_keys=True, allow_nan=False)
             handle.write("\n")
     if args.md_out:
         with open(args.md_out, "w", encoding="utf-8") as handle:
