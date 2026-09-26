@@ -46,7 +46,18 @@ def _check_noul_labels(name: str, labels: Any) -> None:
             f"questions[{name}].labels must map exactly 'false' and 'true' to distinct "
             f"non-empty strings",
         )
-    texts = [str(labels[k]).strip() for k in ("false", "true")]
+    values = [labels["false"], labels["true"]]
+    # The agent requires a str here, and it is checked before the text is used: a number or a
+    # bool is not a label, it is a type mistake. Stringifying first would quietly accept what
+    # the agent rejects, and the rejection would then arrive too late to be reported as a
+    # caller error.
+    if not all(isinstance(value, str) for value in values):
+        raise ToolError(
+            "invalid_questions",
+            f"questions[{name}].labels must give 'false' and 'true' string values, got "
+            f"{[type(v).__name__ for v in values]}",
+        )
+    texts = [value.strip() for value in values]
     if not texts[0] or not texts[1] or texts[0] == texts[1]:
         raise ToolError(
             "invalid_questions",

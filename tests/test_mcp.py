@@ -557,6 +557,21 @@ def test_question_validation_matches_the_agent():
          {"type": "noul", "instructions": "is true?", "labels": {"false": "", "true": "yes"}}),
         ("noul_labels_not_object",
          {"type": "noul", "instructions": "is true?", "labels": ["yes", "no"]}),
+        # A label is text, not a value. The agent checks the type before using it, so these
+        # have to be refused here too -- stringifying them would accept exactly what the agent
+        # rejects, and the failure would surface as an internal_error instead.
+        ("noul_labels_numeric",
+         {"type": "noul", "instructions": "is true?", "labels": {"false": 0, "true": 1}}),
+        ("noul_labels_mixed_types",
+         {"type": "noul", "instructions": "is true?", "labels": {"false": "no", "true": 1}}),
+        ("noul_labels_bool",
+         {"type": "noul", "instructions": "is true?", "labels": {"false": False, "true": True}}),
+        ("noul_labels_null",
+         {"type": "noul", "instructions": "is true?", "labels": {"false": None, "true": "yes"}}),
+        ("noul_labels_list",
+         {"type": "noul", "instructions": "is true?", "labels": {"false": ["no"], "true": "yes"}}),
+        ("noul_labels_whitespace_equal",
+         {"type": "noul", "instructions": "is true?", "labels": {"false": " same ", "true": "same"}}),
         ("score_level_null",
          {"type": "score", "instructions": "how bad", "criteria": ["fine", None]}),
         ("score_level_null_first",
@@ -616,6 +631,10 @@ def test_a_bad_question_is_a_caller_error_not_a_server_fault():
                                    "criteria": {"yes": "affirmative", "no": "negative"}}),
         ("noul_labels_wrong_names", {"type": "noul", "instructions": "is true?",
                                      "labels": {"A": "yes", "B": "no"}}),
+        ("noul_labels_numeric", {"type": "noul", "instructions": "is true?",
+                                 "labels": {"false": 0, "true": 1}}),
+        ("noul_labels_mixed_types", {"type": "noul", "instructions": "is true?",
+                                     "labels": {"false": "no", "true": 1}}),
         ("score_level_null", {"type": "score", "instructions": "how bad",
                               "criteria": ["fine", None]}),
     ):
