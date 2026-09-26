@@ -195,6 +195,45 @@ def main():
     ok("the page and health endpoints are unaffected",
        client.get("/").status_code == 200 and client.get("/health").status_code == 200)
 
+    # --- the two surfaces must reach the same verdict on the same numbers ---------
+    # The demo reads `Question` instances where serve reads plain dicts, so the counting
+    # lives behind a shape branch that could drift from serve's. Pin the verdicts against
+    # each other rather than restating either one: serve's validator is called with the
+    # plain dicts it actually receives, the demo through HTTP with the models it actually
+    # receives, and the two have to agree.
+    import laya.serve as _serve_mod  # noqa: E402
+
+    def serve_verdict(state, questions):
+        try:
+            _serve_mod._check_request_limits(state, questions)
+        except Exception:  # noqa: BLE001 -- HTTPException carries the 413
+            return "refused"
+        return "accepted"
+
+    def demo_verdict(state, questions):
+        return "refused" if client.post("/predict", json={"state": state,
+                                                          "questions": questions}).status_code == 413 else "accepted"
+
+    noul_crit = {"type": "noul", "instructions": "True?",
+                 "criteria": {"false": "no", "true": "yes"}}
+    parity_cases = [
+        ("101 choice options", "hi", choice(MAX_CHOICE_OPTIONS + 1)),
+        ("33 score levels", "hi", score(MAX_SCORE_LEVELS + 1)),
+        ("600 options total", "hi",
+         dict(("q%d" % i, choice(20, "q%d" % i)["q%d" % i]) for i in range(30))),
+        ("exactly 100 choice options", "hi", choice(MAX_CHOICE_OPTIONS)),
+        ("exactly 32 score levels", "hi", score(MAX_SCORE_LEVELS)),
+        ("noul criteria only, near the total", "hi",
+         dict([("c%d" % i, choice(MAX_CHOICE_OPTIONS, "c%d" % i)["c%d" % i]) for i in range(5)]
+               + [("last", choice(12, "last")["last"])]
+               + [("n%d" % i, noul_crit) for i in range(30)])),
+        ("noul only", "hi", {"n%d" % i: noul_crit for i in range(10)}),
+        ("an ordinary request", {"body": "billed twice"}, one),
+    ]
+    for label, st, qs in parity_cases:
+        s, d = serve_verdict(st, qs), demo_verdict(st, qs)
+        ok("parity with laya.serve: %s" % label, s == d, "serve=%s demo=%s" % (s, d))
+
     print("\n%d passed, %d failed" % (len(PASS), len(FAIL)))
     for f in FAIL:
         print("  FAIL " + f)
