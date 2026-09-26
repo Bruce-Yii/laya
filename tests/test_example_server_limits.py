@@ -134,6 +134,20 @@ def main():
     # A noul question contributes no options, so it cannot move the total either way.
     ok("a noul flood is still bounded by the question count, not the option total",
        code(json={"state": "hi", "questions": questions(MAX_QUESTIONS)}) == 503)
+    # ...including when it carries the ordinary false/true criteria, which are option
+    # *texts* but not answer options. laya.serve adds them nowhere; a total that counted
+    # them would refuse a request serve accepts, which is the drift this file exists to
+    # catch -- in the direction of refusing something legal.
+    counted = 5 * MAX_CHOICE_OPTIONS + 12  # exactly MAX_TOTAL_OPTIONS by laya.serve's count
+    mixed = {"q%d" % i: choice(MAX_CHOICE_OPTIONS, "q%d" % i)["q%d" % i] for i in range(5)}
+    mixed["last"] = choice(12, "last")["last"]
+    for i in range(30):  # 30 noul questions, 2 criteria each, 60 if wrongly counted
+        mixed["n%d" % i] = {"type": "noul", "instructions": "True?",
+                            "criteria": {"false": "no", "true": "yes"}}
+    ok("noul criteria do not count toward the shared option total",
+       len(mixed) <= MAX_QUESTIONS and counted == MAX_TOTAL_OPTIONS
+       and code(json={"state": "hi", "questions": mixed}) == 503,
+       "%d questions, %d options by laya.serve's count" % (len(mixed), counted))
 
 
     # --- the refusal must not echo the rejected payload back ----------------

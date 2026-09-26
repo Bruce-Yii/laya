@@ -267,9 +267,11 @@ def _check_request_limits(state: Any, questions: Dict[str, Any]) -> None:
             status_code=413,
             detail="state too large (%d > %d chars)" % (size, MAX_STATE_CHARS),
         )
-    # Counted exactly as laya.serve counts them, and refused for the same reason: a `noul`
-    # question contributes no options, so the total is a sum over `choice` and `score`
-    # criteria only, while the state above is still encoded once per question.
+    # Counted exactly as laya.serve counts them, and refused for the same reason. The
+    # increment belongs inside the two branches, as it does there: a `noul` question carries
+    # false/true criteria, which are option *texts* rather than answer options, so a total
+    # that added them would refuse a request laya.serve accepts. The state above is still
+    # encoded once per question, which is what the question-count bound is for.
     total_options = 0
     for qid, qdef in questions.items():
         # This demo's request model hands these over as `Question` instances where
@@ -282,6 +284,7 @@ def _check_request_limits(state: Any, questions: Dict[str, Any]) -> None:
             qtype, crit = getattr(qdef, "type", None), getattr(qdef, "criteria", None)
         if qtype == "choice" and isinstance(crit, (dict, list)):
             count = len(crit)
+            total_options += count
             if count > MAX_CHOICE_OPTIONS:
                 raise HTTPException(
                     status_code=413,
@@ -289,13 +292,12 @@ def _check_request_limits(state: Any, questions: Dict[str, Any]) -> None:
                 )
         elif qtype == "score" and isinstance(crit, list):
             count = len(crit)
+            total_options += count
             if count > MAX_SCORE_LEVELS:
                 raise HTTPException(
                     status_code=413,
                     detail="too many score levels for %r (%d > %d)" % (qid, count, MAX_SCORE_LEVELS),
                 )
-        if isinstance(crit, (dict, list)):
-            total_options += len(crit)
     if total_options > MAX_TOTAL_OPTIONS:
         raise HTTPException(
             status_code=413,
