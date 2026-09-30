@@ -234,25 +234,35 @@ Exit status: `0` every check passed, `1` a check failed, `2` the harness disagre
 `Agent.system_one` by more than `1e-3` (nothing else is trusted then). CPU is the
 default device: fp32 and deterministic, which is what the thresholds were set on.
 
-### The two checks
+### The checks
 
 | check | input | metric | gate |
 |---|---|---|---|
 | `score_slot0_identical` | one `score` question whose K levels all carry the same text; texts `moderate` and `a request`, K = 3, 4, 5 | raw slot-0 marker logit minus the mean over the K slots, averaged over 10 states × 6 configurations | `>= -0.20` |
 | `score_first_slot_permuted` | `Not urgent` / `Soon` / `Work is blocked` in all 6 orders, per state | share of the 60 decisions whose argmax is the first slot | `>= 0.15` |
+| `choice_slot0_identical` | one `choice` question whose K options all carry the same description under numbered keys; same texts and K | raw slot-0 option logit minus the mean over the K options, averaged over 10 states × 6 configurations | `>= -0.20` |
 
 `score_slot0_identical` is the identical-option control from @AlKor13 in #131. With
 identical texts the rendered options differ only by position and by the `level N:`
 prefix that `render_options` always emits, so a checkpoint without a slot prior has
 no reason to prefer or avoid any slot.
 
+`choice_slot0_identical` is the same control on the `choice` head (#602). A choice
+option renders as `key: description` and dict keys have to be unique, so the option
+list cannot be literally identical; numbered keys with one shared description
+(`1: a request`, `2: a request`, ...) are the closest counterpart to the `level N:`
+prefix, and the rendered options then differ only by position. The metric and the
+gate are `score_slot0_identical`'s, read per option instead of per level. It has not
+been run against a checkpoint yet, so there is no measured row for it below.
+
 `score_first_slot_permuted` presents every order of the three levels, so each level
 sits in each slot exactly twice per state. A checkpoint whose answer does not depend
 on the order picks the first slot in exactly 1/3 of the decisions, whatever the states
 say; the rate moves only through order dependence.
 
-Both read raw marker logits (before temperature) through `laya_eval.score_cases`,
-and the script first compares that path with `Agent.system_one` on every state.
+All three read raw per-option logits (before temperature) through
+`laya_eval.score_cases`, and the script first compares that path with
+`Agent.system_one` on every state.
 
 ### Measured on the shipped checkpoints
 
@@ -287,7 +297,7 @@ An order-invariant checkpoint sits at exactly 0.333 on that check.
 
 ### Other languages
 
-`--lang` runs both checks on fixed states in Japanese, Korean, Hindi or Turkish (#602).
+`--lang` runs the checks on fixed states in Japanese, Korean, Hindi or Turkish (#602).
 Each set translates the ten English states one for one, with the level texts in the
 same language. Every state routes to `multilingual` under `Router`: Japanese, Korean
 and Hindi by script, Turkish by its non-English letters. The run prints the checkpoint
@@ -324,15 +334,16 @@ language.
 place of a checkpoint:
 
 ```bash
-python research/eval/test_presentation_checks.py     # 154 passed, 0 failed
+python research/eval/test_presentation_checks.py     # 208 passed, 0 failed
 ```
 
 It pins the fixed inputs and both gates. It checks that the identical-option
-questions render as `level i: <same text>`, and that every level sits in every slot
+questions render as `level i: <same text>`, that the choice ones render as
+`i: <same text>` under numbered keys, and that every level sits in every slot
 exactly twice. It also checks the metric arithmetic by hand, the leave-one-out
 bounds, the one-sided gates, and the exit codes. A scripted slot-0 hole fails both
-checks, and an order-invariant model scores exactly 1/3. For each language it
-pins ten distinct states, three levels in every slot twice, and routing to
+identical-option controls, and an order-invariant model scores exactly 1/3. For each
+language it pins ten distinct states, three levels in every slot twice, and routing to
 `multilingual`. It also checks the `--lang` parsing. The default run gives the same
 report as `lang="en"`.
 
