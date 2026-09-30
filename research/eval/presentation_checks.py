@@ -5,7 +5,7 @@ Why this exists
 ``laya-multilingual``'s ``score`` head has a learned prior against the first-listed
 level (#131). The fix is a position-balanced retrain, and this is the check that says
 whether a retrained checkpoint removed the prior. It needs no labelled data: every
-input is fixed in this file, and both checks compare the checkpoint against itself
+input is fixed in this file, and every check compares the checkpoint against itself
 under different presentations of the same question.
 
 Checks
@@ -24,6 +24,15 @@ Checks
     depend on the order picks the first slot in exactly 1/3 of the decisions. The
     metric is the observed first-slot rate.
 
+``choice_slot0_identical``
+    The same identical-option control on the ``choice`` head (#602). A choice option
+    renders as ``key: description`` and dict keys have to be unique, so the options
+    cannot be literally identical; numbered keys with one shared description
+    (``1: a request``, ``2: a request``, ...) are the closest counterpart to the
+    ``level N:`` prefix, and the rendered options then differ only by position. The
+    metric and the gate are ``score_slot0_identical``'s, read per option instead of
+    per level.
+
 Both metrics read raw marker logits (before temperature) through
 ``laya_eval.score_cases``, the same forward pass ``research/scripts/bench_local.py``
 uses. ``parity`` checks that path against ``Agent.system_one`` before anything is
@@ -31,7 +40,7 @@ reported.
 
 Languages
 ---------
-``--lang`` runs the same two checks on fixed states in Japanese, Korean, Hindi or
+``--lang`` runs the same checks on fixed states in Japanese, Korean, Hindi or
 Turkish (#602): translations of the English states, with the level texts in the same
 language. Every one of them routes to ``multilingual`` under ``Router``, so they test
 the checkpoint #131 is about on the scripts it serves. The gates are the English ones.
@@ -183,6 +192,18 @@ def identical_question(text: str, k: int, instructions: str = INSTRUCTIONS) -> D
     return {"type": "score", "instructions": instructions, "criteria": [text] * k}
 
 
+def identical_choice_question(text: str, k: int, instructions: str = INSTRUCTIONS) -> Dict[str, Any]:
+    """The `choice` counterpart of `identical_question` (#602).
+
+    A choice option renders as `key: description` and a dict's keys have to be unique, so the
+    option list cannot be literally identical the way `[text] * k` is. Numbered keys are the
+    closest counterpart to the `level N:` prefix `render_options` always emits for `score`: the
+    rendered options then differ only by position, which is the whole point of the control.
+    """
+    return {"type": "choice", "instructions": instructions,
+            "criteria": {str(i + 1): text for i in range(k)}}
+
+
 def permuted_questions(levels: Sequence[str] = LEVELS,
                        instructions: str = INSTRUCTIONS) -> List[Tuple[Tuple[int, ...], Dict[str, Any]]]:
     """Every order of `levels`, as (order, question); order[slot] indexes `levels`."""
@@ -213,6 +234,50 @@ def check_score_slot0_identical(score_fn: ScoreFn, states: Optional[Sequence[str
     states = spec["states"] if states is None else states
     configs = [(text, k) for text in spec["identical_texts"] for k in IDENTICAL_KS]
     questions = [identical_question(text, k, spec["instructions"]) for text, k in configs]
+    per_state: List[float] = []
+    per_config: Dict[str, List[float]] = {"%s/K=%d" % c: [] for c in configs}
+    per_slot: Dict[str, List[float]] = {"%s/K=%d" % (t, k): [0.0] * k for t, k in configs}
+    for state in states:
+        slot0 = []
+        for (text, k), z in zip(configs, score_fn(state, questions)):
+            name = "%s/K=%d" % (text, k)
+            z = [float(v) for v in z]  # numpy float32 would survive into the JSON report
+            centred = [v - mean(z) for v in z]
+            slot0.append(centred[0])
+            per_config[name].append(centred[0])
+            per_slot[name] = [a + b / len(states) for a, b in zip(per_slot[name], centred)]
+        per_state.append(mean(slot0))
+    metric = mean(per_state)
+    lo, hi = leave_one_out(per_state)
+    return {
+        "metric": round(metric, 4),
+        "threshold": SLOT0_MIN,
+        "passed": passes(metric, SLOT0_MIN),
+        "leave_one_out": [round(lo, 4), round(hi, 4)],
+        "per_state": [round(x, 4) for x in per_state],
+        "per_config": {name: round(mean(v), 4) for name, v in per_config.items()},
+        "per_slot_centred": {name: [round(x, 4) for x in v] for name, v in per_slot.items()},
+    }
+
+
+def check_choice_slot0_identical(score_fn: ScoreFn, states: Optional[Sequence[str]] = None,
+                                 lang: str = "en") -> Dict[str, Any]:
+    """The `choice` counterpart of `check_score_slot0_identical` (#602).
+
+    Same question shape, same metric, read on the choice head instead of the score head: a
+    `choice` question whose K options all carry one shared description under numbered keys, so
+    the rendered options differ only by position. The metric is the raw per-option logit of slot
+    0 minus the mean over the K slots, averaged over every state and every (text, K)
+    configuration, and the gate is the same one-sided `SLOT0_MIN`.
+
+    `score_cases` returns one logit per rendered option for either type, so no change was needed
+    to the scoring path: for `choice` the markers are the option positions and the logits are the
+    decision head's.
+    """
+    spec = LANGUAGES[lang]
+    states = spec["states"] if states is None else states
+    configs = [(text, k) for text in spec["identical_texts"] for k in IDENTICAL_KS]
+    questions = [identical_choice_question(text, k, spec["instructions"]) for text, k in configs]
     per_state: List[float] = []
     per_config: Dict[str, List[float]] = {"%s/K=%d" % c: [] for c in configs}
     per_slot: Dict[str, List[float]] = {"%s/K=%d" % (t, k): [0.0] * k for t, k in configs}
@@ -277,6 +342,7 @@ def check_score_first_slot_permuted(score_fn: ScoreFn, states: Optional[Sequence
 CHECKS: Dict[str, Callable[..., Dict[str, Any]]] = {
     "score_slot0_identical": check_score_slot0_identical,
     "score_first_slot_permuted": check_score_first_slot_permuted,
+    "choice_slot0_identical": check_choice_slot0_identical,
 }
 
 

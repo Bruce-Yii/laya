@@ -14,8 +14,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 from laya.common import render_options  # noqa: E402
 from research.eval.presentation_checks import (  # noqa: E402
     CHECKS, FIRST_SLOT_MIN, IDENTICAL_KS, IDENTICAL_TEXTS, INSTRUCTIONS, LANGUAGES, LEVELS, PARITY_TOL,
-    SLOT0_MIN, STATES, check_score_first_slot_permuted, check_score_slot0_identical, exit_code,
-    identical_question, leave_one_out, main, parse_langs, passes, permuted_questions, routes, run_checks,
+    SLOT0_MIN, STATES, check_choice_slot0_identical, check_score_first_slot_permuted,
+    check_score_slot0_identical, exit_code, identical_choice_question, identical_question, leave_one_out,
+    main, parse_langs, passes, permuted_questions, routes, run_checks,
 )
 
 PASS, FAIL = [], []
@@ -62,7 +63,7 @@ check("const/levels", LEVELS, ("Not urgent", "Soon", "Work is blocked"))
 check("const/slot-0 gate", SLOT0_MIN, -0.20)
 check("const/first-slot gate", FIRST_SLOT_MIN, 0.15)
 check("const/parity tolerance", PARITY_TOL, 1e-3)
-check("const/registered checks", sorted(CHECKS), ["score_first_slot_permuted", "score_slot0_identical"])
+check("const/registered checks", sorted(CHECKS), ["choice_slot0_identical", "score_first_slot_permuted", "score_slot0_identical"])
 
 
 # ------------------------------------------- identical options differ by position only
@@ -151,7 +152,7 @@ def counting(state, questions):
 
 
 run_checks(counting)
-check("run/one forward per state per check", len(calls), 2 * len(STATES))
+check("run/one forward per state per check", len(calls), len(CHECKS) * len(STATES))
 check("run/passes only when every check does", run_checks(BY_LABEL)["passed"], True)
 check("run/one failing check fails the run", run_checks(NO_SLOT0)["passed"], False)
 check("run/subset by name", sorted(run_checks(FLAT, ["score_slot0_identical"])["checks"]),
@@ -200,7 +201,8 @@ for lang, spec in LANGUAGES.items():
         return FLAT(state, questions)
 
     run_checks(lang_counting, lang=lang)
-    check("lang/%s one forward per state per check, on its own states" % lang, len(lang_calls), 20)
+    check("lang/%s one forward per state per check, on its own states" % lang, len(lang_calls),
+          len(CHECKS) * len(spec["states"]))
     by_label = scripted([0.0] * 5, dict(zip(spec["levels"], (0.0, 1.0, 2.0))))
     r = check_score_first_slot_permuted(by_label, lang=lang)
     check("lang/%s order-invariant model scores exactly 1/3" % lang, r["metric"], round(1 / 3, 4))
@@ -215,6 +217,61 @@ for lang, spec in LANGUAGES.items():
     check("route/%s" % lang, routes(spec["states"]),
           {"english": 10} if lang == "en" else {"multilingual": 10})
 
+
+# ------------------------------------------------ identical choice options (#602)
+# The control the issue asked for, in the rendering the maintainer chose for it: numbered keys
+# with one shared description. `scripted` reads `q["criteria"]` with `enumerate`, so for a choice
+# question it walks the numbered keys and every logit is pure position bias -- which is what a
+# control needs, since no option is distinguishable from any other.
+CHOICE_SLOT0 = scripted([-2.0, 0.5, 0.5, 0.5, 0.5])   # a slot-0 hole
+CHOICE_FLAT = scripted([0.0] * 5)                      # no positional prior at all
+
+for text in IDENTICAL_TEXTS:
+    for k in IDENTICAL_KS:
+        q = identical_choice_question(text, k)
+        rendered = render_options({"t": q["type"], "ins": q["instructions"], "crit": q["criteria"]})
+        check("choice/%s K=%d renders numbered" % (text, k),
+              rendered, ["%d: %s" % (i + 1, text) for i in range(k)])
+        check("choice/%s K=%d one text after the number" % (text, k),
+              sorted({r.split(": ", 1)[1] for r in rendered}), [text])
+        check("choice/%s K=%d keys are 1..K" % (text, k),
+              sorted(q["criteria"]), [str(i + 1) for i in range(k)])
+        check("choice/%s K=%d one description for every key" % (text, k),
+              sorted(set(q["criteria"].values())), [text])
+        check("choice/%s K=%d is a choice question" % (text, k), q["type"], "choice")
+        check("choice/%s K=%d carries the instructions" % (text, k), q["instructions"], INSTRUCTIONS)
+
+# The gate and the report shape are the score check's, read per option.
+report = check_choice_slot0_identical(CHOICE_FLAT)
+check("choice/no positional prior scores 0", report["metric"], 0.0)
+check_true("choice/no positional prior passes", report["passed"])
+check("choice/gate is the score slot-0 gate", report["threshold"], SLOT0_MIN)
+check("choice/report has what print_report reads", sorted(report),
+      ["leave_one_out", "metric", "passed", "per_config", "per_slot_centred", "per_state", "threshold"])
+check("choice/every (text, K) configuration is reported", sorted(report["per_config"]),
+      sorted("%s/K=%d" % c for c in [(t, k) for t in IDENTICAL_TEXTS for k in IDENTICAL_KS]))
+check("choice/per-state mean of six configurations", len(report["per_state"]), len(STATES))
+check("choice/centred slots are reported per option",
+      len(report["per_slot_centred"]["a request/K=3"]), 3)
+
+# The metric is the score check's, unchanged: same states, same (text, K) grid, same bias.
+check("choice/same metric as the score control",
+      check_choice_slot0_identical(CHOICE_SLOT0)["metric"],
+      check_score_slot0_identical(CHOICE_SLOT0)["metric"])
+check("choice/slot-0 hole by hand", check_choice_slot0_identical(CHOICE_SLOT0)["metric"],
+      round((-5 / 3 - 1.875 - 2.0) / 3, 4))
+check_true("choice/a slot-0 hole fails the control", not check_choice_slot0_identical(CHOICE_SLOT0)["passed"])
+# The scripted function ignores the state, so every state scores the same and the leave-one-out
+# range cannot widen: a control whose bound moves with the sample is not measuring a prior.
+check("choice/constant per state leaves the range closed", check_choice_slot0_identical(CHOICE_SLOT0)["leave_one_out"],
+      [round(check_choice_slot0_identical(CHOICE_SLOT0)["metric"], 4)] * 2)
+# One-sided, like the score gate: exactly at the threshold passes, a hair under does not.
+check_true("choice/at the gate passes", passes(SLOT0_MIN, SLOT0_MIN))
+check_true("choice/a hair under the gate fails", not passes(SLOT0_MIN - 0.001, SLOT0_MIN))
+# Every language's fixed states drive it, on that language's texts and instructions.
+for lang, spec in sorted(LANGUAGES.items()):
+    langed = check_choice_slot0_identical(CHOICE_SLOT0, lang=lang)
+    check("choice/%s runs on its own fixed states" % lang, len(langed["per_state"]), len(spec["states"]))
 
 # --------------------------------------------------- the default run is unchanged
 for fn in (FLAT, NO_SLOT0, EARLY, BY_LABEL):
