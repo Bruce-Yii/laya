@@ -36,6 +36,24 @@ from laya.train import TrainConfig
 # so delegating the loop does not silently change the checkpoint it produces.
 PERSISTED = {"max_tokens_per_batch": 4096, "max_len": 1024, "head_max_len": 256}
 
+# The temperature this script persisted for a question type the calibration set never contained.
+# It started from [1.2, 1.2, 1.2] and only replaced an entry once it had samples to fit, so a
+# wholly absent type kept 1.2; `fit_temperature_map` starts from 1.0 instead.
+ABSENT_QTYPE_TEMPERATURE = 1.2
+
+
+def restore_absent_qtypes(cfg, n_by_bucket):
+    """Reinstate 1.2 for every question type absent from the calibration set.
+
+    `n_by_bucket` keys are `common.temp_bucket` names, so the part before the colon names the
+    question type. A type that is present but under `MIN_TYPE_N` is not absent and keeps the
+    fitted 1.0, which is what this script wrote for 1-9 samples as well.
+    """
+    present = {key.split(":", 1)[0] for key in n_by_bucket}
+    cfg["temperature"] = [ABSENT_QTYPE_TEMPERATURE if name not in present else value
+                          for name, value in zip(("choice", "score", "noul"), cfg["temperature"])]
+    return cfg
+
 
 def default_model_dir():
     """The multilingual checkpoint, which is the point of this script: one device, any model."""
@@ -55,16 +73,18 @@ def resolve_device(requested):
     return "cuda" if torch.cuda.is_available() else "cpu"
 
 
-def finalize_config(output_dir, gradient_checkpointing):
+def finalize_config(output_dir, gradient_checkpointing, n_by_bucket):
     """Write the output config this entry point has always produced.
 
     Per-type temperatures only: the bucket map `fit_temperature_map` also fits is dropped rather
-    than persisted, as before. `laya.load` reads the per-type scalars.
+    than persisted, as before, and a question type the calibration set never contained goes back to
+    1.2. `laya.load` reads the per-type scalars.
     """
     path = os.path.join(output_dir, "rl_agent_config.json")
     with open(path, encoding="utf-8") as f:
         cfg = json.load(f)
     cfg.pop("temperature_by_options", None)
+    cfg = restore_absent_qtypes(cfg, n_by_bucket)
     cfg["gradient_checkpointing"] = gradient_checkpointing
     cfg.update(PERSISTED)
     with open(path, "w", encoding="utf-8") as f:
@@ -109,7 +129,7 @@ def main():
                            max_len=PERSISTED["max_len"], head_max_len=PERSISTED["head_max_len"]),
         device=device,
     )
-    cfg = finalize_config(args.output_dir, use_amp)
+    cfg = finalize_config(args.output_dir, use_amp, summary["n_by_bucket"])
     print("Train items: {} ({} held out for calibration) | skipped: {}"
           .format(summary["train_items"], summary["calibration_items"], summary["skipped"]))
     print("Fitted temperatures (choice, score, noul):",

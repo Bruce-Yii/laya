@@ -30,6 +30,8 @@ os.environ.setdefault("USE_TF", "0")
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from laya.common import QTYPES, QTYPE_NAMES  # noqa: E402  (after the offline env is set)
+
 ROOT = Path(__file__).resolve().parents[1]
 SINGLE_DEVICE = "research/scripts/finetune_single_device.py"
 MPS = "notebooks/laya_finetune_typed_decisions_mps.py"
@@ -74,13 +76,17 @@ def rows_to_jsonl(path, n=3):
     return str(path)
 
 
-def fake_run(output_dir, checkpoint_latest=False):
+def fake_run(output_dir, checkpoint_latest=False, n_by_bucket=None):
     """Stand in for `laya.train.finetune`, writing what the real one writes.
 
-    It deliberately writes a `temperature_by_options` map and the library's own config values:
-    the wrappers must strip and restore them, so a fake that started from the wrapper's wanted
+    It deliberately writes a `temperature_by_options` map, the library's own config values, and the
+    canonical `[1.0, 1.0, 1.0]` temperature result -- which is what `fit_temperature_map` returns
+    for a type it could not fit. The wrappers must strip, restore, and reinstate the old 1.2 for
+    types the calibration set never contained, so a fake that started from the wrapper's wanted
     state would prove nothing.
     """
+    if n_by_bucket is None:
+        n_by_bucket = {"choice:2": 1}
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
     if checkpoint_latest:
@@ -88,13 +94,13 @@ def fake_run(output_dir, checkpoint_latest=False):
         (out / "checkpoint_latest" / "rl_agent_config.json").write_text("{}", encoding="utf-8")
     (out / "rl_agent_config.json").write_text(json.dumps({
         "max_len": 64, "head_max_len": 32, "fine_tuned": True,
-        "temperature": [1.2, 1.2, 1.2],
+        "temperature": [1.0, 1.0, 1.0],
         "temperature_by_options": {"choice:2": 1.9},
         "training": {"laya_train": {"epochs": 4}},
     }), encoding="utf-8")
     return {"train_items": 1, "calibration_items": 1, "skipped": {}, "epoch_loss": [1.0],
-            "temperature": [1.2, 1.2, 1.2], "temperature_by_options": {"choice:2": 1.9},
-            "n_by_bucket": {"choice:2": 1}, "output_dir": str(out)}
+            "temperature": [1.0, 1.0, 1.0], "temperature_by_options": {"choice:2": 1.9},
+            "n_by_bucket": dict(n_by_bucket), "output_dir": str(out)}
 
 
 class SingleDeviceContractTests(unittest.TestCase):
@@ -110,12 +116,12 @@ class SingleDeviceContractTests(unittest.TestCase):
         (self.model_dir / "model.safetensors").write_bytes(b"")
         self.out = Path(self.tmp.name) / "out"
 
-    def run_main(self, argv_extra=()):
+    def run_main(self, argv_extra=(), n_by_bucket=None):
         calls = {}
 
         def fake_finetune(**kwargs):
             calls.update(kwargs)
-            return fake_run(kwargs["output_dir"])
+            return fake_run(kwargs["output_dir"], n_by_bucket=n_by_bucket)
 
         argv = ["finetune_single_device.py", "--data", self.data, "--model-dir", str(self.model_dir),
                 "--output-dir", str(self.out)] + list(argv_extra)
@@ -143,6 +149,29 @@ class SingleDeviceContractTests(unittest.TestCase):
         self.assertEqual(1024, calls["config"].max_len)
         self.assertEqual(256, calls["config"].head_max_len)
 
+    def test_absent_question_type_keeps_its_former_1_2(self):
+        # The old script started from [1.2, 1.2, 1.2] and overwrote only the types it had
+        # calibration samples for, so a type with no samples at all persisted 1.2. The canonical
+        # fitter leaves 1.0 there instead, which this wrapper reinstates.
+        self.run_main(["--device", "cpu"], n_by_bucket={"choice:2": 1})
+        cfg = json.loads((self.out / "rl_agent_config.json").read_text(encoding="utf-8"))
+        self.assertEqual([1.0, 1.2, 1.2], cfg["temperature"])
+
+        self.run_main(["--device", "cpu"], n_by_bucket={})
+        cfg = json.loads((self.out / "rl_agent_config.json").read_text(encoding="utf-8"))
+        self.assertEqual([1.2, 1.2, 1.2], cfg["temperature"])
+
+    def test_a_present_question_type_under_the_fit_stays_at_1_0(self):
+        # The distinction that matters: 1-9 samples is not absence. Every type here is present but
+        # below MIN_TYPE_N, so the canonical 1.0 stands and nothing is reinstated. If this ever
+        # passed by blanket-restoring 1.0 values it would prove the opposite of what it claims.
+        for n_by_bucket in ({"choice:2": 1, "score:2": 1, "noul:2": 1},
+                            {"choice:3-5": 9, "score:3-5": 4, "noul:2": 1}):
+            with self.subTest(n_by_bucket=n_by_bucket):
+                self.run_main(["--device", "cpu"], n_by_bucket=n_by_bucket)
+                cfg = json.loads((self.out / "rl_agent_config.json").read_text(encoding="utf-8"))
+                self.assertEqual([1.0, 1.0, 1.0], cfg["temperature"])
+
     def test_seed_also_decides_the_calibration_split(self):
         for seed in (0, 7, 99):
             with self.subTest(seed=seed):
@@ -163,7 +192,9 @@ class SingleDeviceContractTests(unittest.TestCase):
     def test_persisted_config_keeps_this_scripts_old_shape(self):
         self.run_main(["--device", "cpu"])
         cfg = json.loads((self.out / "rl_agent_config.json").read_text(encoding="utf-8"))
-        self.assertEqual([1.2, 1.2, 1.2], cfg["temperature"])
+        # Only `choice` has calibration records, so it keeps the fitted value and the two absent
+        # question types go back to the 1.2 this script always persisted for them.
+        self.assertEqual([1.0, 1.2, 1.2], cfg["temperature"])
         # The bucket map is fitted inside the library and dropped here, as before.
         self.assertNotIn("temperature_by_options", cfg)
         self.assertEqual(4096, cfg["max_tokens_per_batch"])
@@ -195,12 +226,12 @@ class MpsContractTests(unittest.TestCase):
         (self.model_dir / "model.safetensors").write_bytes(b"")
         self.out = Path(self.tmp.name) / "out"
 
-    def run_main(self, argv_extra=()):
+    def run_main(self, argv_extra=(), n_by_bucket=None):
         calls = {}
 
         def fake_finetune(**kwargs):
             calls.update(kwargs)
-            return fake_run(kwargs["output_dir"], checkpoint_latest=True)
+            return fake_run(kwargs["output_dir"], checkpoint_latest=True, n_by_bucket=n_by_bucket)
 
         argv = ["mps", "--model-dir", str(self.model_dir), "--items", self.rows,
                 "--output-dir", str(self.out), "--device", "cpu"] + list(argv_extra)
@@ -224,6 +255,34 @@ class MpsContractTests(unittest.TestCase):
         self.assertEqual(1024, calls["config"].max_len)
         self.assertEqual(256, calls["config"].head_max_len)
 
+    def test_absent_question_type_keeps_its_former_1_2(self):
+        # The old script started from [1.2, 1.2, 1.2] and overwrote only the types it had
+        # calibration samples for, so a type with no samples at all persisted 1.2. The canonical
+        # fitter leaves 1.0 there instead, which this wrapper reinstates.
+        self.run_main(["--device", "cpu"], n_by_bucket={"choice:2": 1})
+        cfg = json.loads((self.out / "rl_agent_config.json").read_text(encoding="utf-8"))
+        self.assertEqual([1.0, 1.2, 1.2], cfg["temperature"])
+
+        self.run_main(["--device", "cpu"], n_by_bucket={})
+        cfg = json.loads((self.out / "rl_agent_config.json").read_text(encoding="utf-8"))
+        self.assertEqual([1.2, 1.2, 1.2], cfg["temperature"])
+
+    def test_a_present_question_type_under_the_fit_stays_at_1_0(self):
+        # The distinction that matters: 1-9 samples is not absence. Every type here is present
+        # but below MIN_TYPE_N, so the canonical 1.0 stands and nothing is reinstated. If this
+        # ever passed by blanket-restoring 1.0 values it would prove the opposite.
+        for n_by_bucket in ({"choice:2": 1, "score:2": 1, "noul:2": 1},
+                            {"choice:3-5": 9, "score:3-5": 4, "noul:2": 1}):
+            with self.subTest(n_by_bucket=n_by_bucket):
+                self.run_main(["--device", "cpu"], n_by_bucket=n_by_bucket)
+                cfg = json.loads((self.out / "rl_agent_config.json").read_text(encoding="utf-8"))
+                self.assertEqual([1.0, 1.0, 1.0], cfg["temperature"])
+
+    def test_absent_qtype_restoration_leaves_the_bucket_map_dropped(self):
+        self.run_main(["--device", "cpu"], n_by_bucket={})
+        cfg = json.loads((self.out / "rl_agent_config.json").read_text(encoding="utf-8"))
+        self.assertNotIn("temperature_by_options", cfg)
+
     def test_calibration_split_ignores_the_epoch_seed(self):
         # The old script split the calibration set with `random.Random(20260922)`
         # and used `--seed` only for the epoch order, so the two stay separate here.
@@ -243,7 +302,9 @@ class MpsContractTests(unittest.TestCase):
     def test_persisted_config_keeps_this_scripts_old_shape(self):
         self.run_main()
         cfg = json.loads((self.out / "rl_agent_config.json").read_text(encoding="utf-8"))
-        self.assertEqual([1.2, 1.2, 1.2], cfg["temperature"])
+        # Only `choice` has calibration records: it keeps the fitted value, and the two absent
+        # question types go back to the 1.2 this script always persisted for them.
+        self.assertEqual([1.0, 1.2, 1.2], cfg["temperature"])
         self.assertNotIn("temperature_by_options", cfg)
         self.assertEqual(2048, cfg["max_tokens_per_batch"])
         self.assertEqual(1024, cfg["max_len"])
@@ -260,6 +321,41 @@ class MpsContractTests(unittest.TestCase):
         self.assertFalse(calls["config"].gradient_checkpointing)
         cfg = json.loads((self.out / "rl_agent_config.json").read_text(encoding="utf-8"))
         self.assertFalse(cfg["gradient_checkpointing"])
+
+
+class KaggleAbsentQtypeTests(unittest.TestCase):
+    """The notebook restores 1.2 for a question type its calibration set never contained.
+
+    `fit_temperature_map` starts every type at 1.0, so a type with no records reads 1.0 where the
+    notebook has always persisted 1.2. The restoration is executed here with the real `QTYPES`
+    mapping rather than pattern-matched, so the assertion covers the same arithmetic the notebook
+    runs on `calib_preds`.
+    """
+
+    def restoration(self, calib_preds, fitted):
+        """The three lines the notebook runs, applied to the given inputs."""
+        present_qtypes = {QTYPE_NAMES[rec[0]] for rec in calib_preds}
+        return [fitted[QTYPES[name]] if name in present_qtypes else 1.2
+                for name in ("choice", "score", "noul")]
+
+    def test_only_choice_present_restores_the_other_two(self):
+        # Two calibration records of question type 0 ("choice"), nothing for score or noul.
+        calib_preds = [(0, [0.1, 0.9], [0.2, 0.8], 2), (0, [0.3, 0.7], [0.4, 0.6], 2)]
+        self.assertEqual([1.0, 1.2, 1.2], self.restoration(calib_preds, [1.0, 1.0, 1.0]))
+
+    def test_a_present_type_under_the_fit_stays_at_1_0(self):
+        calib_preds = [(0, [0.1, 0.9], [0.2, 0.8], 2), (2, [0.5], [1.0], 1)]
+        self.assertEqual([1.0, 1.2, 1.0], self.restoration(calib_preds, [1.0, 1.0, 1.0]))
+
+    def test_the_notebook_restores_absent_types_before_persisting(self):
+        script = notebook_writefile(KAGGLE)
+        # The restoration has to read the calibration records and rewrite `fitted_temps` before the
+        # config is written, or the canonical 1.0 is what ships.
+        self.assertIn("QTYPE_NAMES[rec[0]] for rec in calib_preds", script)
+        self.assertIn("else 1.2", script)
+        fit_at = script.index("fitted_temps = [fitted_temps[QTYPES[name]]")
+        persist_at = script.index('cfg["temperature"] = fitted_temps')
+        self.assertLess(fit_at, persist_at)
 
 
 class KaggleConvergenceTests(unittest.TestCase):
