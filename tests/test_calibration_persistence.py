@@ -26,7 +26,7 @@ from tokenizers.models import WordLevel  # noqa: E402
 from transformers import BertConfig, BertModel, PreTrainedTokenizerFast  # noqa: E402
 
 from laya import load  # noqa: E402
-from laya.calibrate import records_from_labeled  # noqa: E402
+from laya.calibrate import fit_temperature_map, records_from_labeled  # noqa: E402
 from laya.common import DecisionModel, QTYPES, TEMP_MIN, TEMP_MAX  # noqa: E402
 
 
@@ -68,8 +68,9 @@ def _temperature_fitters():
 
     Walks the tree rather than listing the known entry points, so a fourth script that
     copies the pattern is held by the same check. Matches on the clamp of an `.exp()`
-    because that is the one shape all three of these share; a fit that stops clamping is
-    reported by the count assertion in the test rather than passing unnoticed.
+    because that is the one shape these share. After the entry points moved to `laya.train`
+    the expected count is zero: the fit lives in `laya.calibrate.fit_temperature_map`, and a
+    copy coming back is exactly what this walk exists to fail on.
     """
     found = []
     for base in ("notebooks", "research/scripts"):
@@ -214,33 +215,31 @@ class CalibrationPersistenceTests(unittest.TestCase):
         self.assertEqual(logits.shape, (2,))
         self.assertEqual(target.tolist(), [0.0, 1.0])
 
-    def test_every_fine_tuning_fit_clamps_to_common_bounds(self):
-        # #642 fixed this for the Kaggle notebook. The Apple Silicon script and
-        # research/scripts/finetune_single_device.py kept `torch.clamp(..., 0.1, 10.0)`, so a
-        # fit either of them persisted could land outside `[TEMP_MIN, TEMP_MAX]` and be
-        # re-clamped when the checkpoint is loaded -- the calibration measured during training
-        # is then not the one that gets served. Derived from the tree rather than listed, so a
-        # script that copies the pattern is held too.
+    def test_fine_tuning_entry_points_do_not_carry_their_own_temperature_fitter(self):
+        # #642 fixed the clamping for the Kaggle notebook; the Apple Silicon script and
+        # research/scripts/finetune_single_device.py kept `torch.clamp(..., 0.1, 10.0)`, so a fit
+        # either of them persisted could land outside `[TEMP_MIN, TEMP_MAX]` and be re-clamped
+        # when the checkpoint is loaded -- the calibration measured during training is then not
+        # the one that gets served. The three scripts now call `laya.train`, which fits through
+        # `laya.calibrate.fit_temperature_map`, so the invariant is that no entry point may
+        # carry a fitter at all: a fourth copy fails this check, and the behaviour it was
+        # protecting is asserted on the canonical fitter below instead.
         fitters = _temperature_fitters()
-        # Non-vacuity: a sweep that matched nothing would pass every assertion below for free.
-        self.assertGreaterEqual(len(fitters), 3, [rel for rel, _, _ in fitters])
+        self.assertEqual([], [rel for rel, _, _ in fitters])
 
-        # These two drive the LBFGS solution past TEMP_MAX and below TEMP_MIN respectively,
-        # so a range wider than the runtime's is caught in both directions.
-        peaked = [([10.0, 0.0], [0.5, 0.5]) for _ in range(20)]
-        dipped = [([0.0, 4.0], [0.0, 1.0]) for _ in range(20)]
-
-        for rel, name, body in fitters:
-            with self.subTest(source=rel, function=name):
-                scope = {"torch": torch, "TEMP_MIN": TEMP_MIN, "TEMP_MAX": TEMP_MAX}
-                exec(compile(ast.parse(textwrap.dedent(body)), rel, "exec"), scope)
-                fit = scope[name]
-                for label, sel in (("peaked", peaked), ("dipped", dipped)):
-                    fitted = fit(sel)
-                    self.assertGreaterEqual(
-                        fitted, TEMP_MIN, "%s: %s(%s) fitted %.4g" % (rel, name, label, fitted))
-                    self.assertLessEqual(
-                        fitted, TEMP_MAX, "%s: %s(%s) fitted %.4g" % (rel, name, label, fitted))
+        # These two drive the fit past TEMP_MAX and below TEMP_MIN respectively, so a range
+        # wider than the runtime's is caught in both directions.
+        peaked = [(QTYPES["choice"], [10.0, 0.0], [0.5, 0.5], 2) for _ in range(20)]
+        dipped = [(QTYPES["choice"], [0.0, 4.0], [0.0, 1.0], 2) for _ in range(20)]
+        for label, records in (("peaked", peaked), ("dipped", dipped)):
+            with self.subTest(records=label):
+                fitted = fit_temperature_map(records)
+                self.assertGreaterEqual(
+                    fitted["temperature"][QTYPES["choice"]], TEMP_MIN,
+                    "canonical fit(%s) escaped the runtime bounds: %r" % (label, fitted["temperature"]))
+                self.assertLessEqual(
+                    fitted["temperature"][QTYPES["choice"]], TEMP_MAX,
+                    "canonical fit(%s) escaped the runtime bounds: %r" % (label, fitted["temperature"]))
 
 
 if __name__ == "__main__":
