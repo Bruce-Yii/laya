@@ -40,6 +40,11 @@ DEFAULT_OUTPUT_DIR = "./laya_finetuned_typed_decisions"
 PERSISTED = {"max_tokens_per_batch": 2048, "max_len": 1024, "head_max_len": 256,
              "model_name": "laya-typed-decisions"}
 
+# This script always held the calibration split still: the old code shuffled the case order with
+# `random.Random(20260922)` regardless of `--seed`, and `--seed` only ordered the epochs. Passed
+# explicitly rather than inherited, so the split cannot drift with the loop's default.
+CALIB_SPLIT_SEED = 20260922
+
 
 def choose_device(requested):
     if requested == "auto":
@@ -142,6 +147,7 @@ def train(args, model_dir, items_path, device):
             head_max_len=PERSISTED["head_max_len"],
             gradient_checkpointing=not args.no_checkpointing,
             seed=args.seed,
+            calib_seed=CALIB_SPLIT_SEED,
         ),
         device=str(device),
     )

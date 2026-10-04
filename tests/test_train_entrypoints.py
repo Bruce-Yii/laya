@@ -224,6 +224,16 @@ class MpsContractTests(unittest.TestCase):
         self.assertEqual(1024, calls["config"].max_len)
         self.assertEqual(256, calls["config"].head_max_len)
 
+    def test_calibration_split_ignores_the_epoch_seed(self):
+        # The old script split the calibration set with `random.Random(20260922)`
+        # and used `--seed` only for the epoch order, so the two stay separate here.
+        calls = self.run_main(["--seed", "5"])
+        self.assertEqual(5, calls["config"].seed)
+        self.assertEqual(20260922, calls["config"].calib_seed)
+        # Pinned in this entry point rather than inherited from the loop's default, so a
+        # change to that default cannot silently move this script's calibration split.
+        self.assertEqual(20260922, self.module.CALIB_SPLIT_SEED)
+
     def test_epoch_order_keeps_its_former_base(self):
         # The old script shuffled each epoch with `random.Random(42 + epoch)`; the shared loop
         # uses `config.seed + epoch`, so the default has to stay 42 for the same order.

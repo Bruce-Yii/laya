@@ -1,8 +1,9 @@
 """Fine-tune a Laya checkpoint on a single device (CPU or GPU).
 
-Runs the same loop the Kaggle notebook runs, through the shipped `laya.train` module instead of
-carrying a private copy of it: preprocessing, training, calibration and export are all
-`laya.train.finetune`, so a fix to the loop lands here too.
+Delegates preprocessing, training, calibration and export to the shipped `laya.train.finetune`
+rather than carrying a private copy of the loop, so a fix to the loop reaches this entry point.
+The Kaggle notebook is not this script and keeps its own DDP orchestration; what it shares with
+this one is the building blocks, not the loop.
 
 Preprocesses a JSONL dataset into training items, trains with RLCD, fits temperatures through
 `laya.calibrate.fit_temperature_map` and saves a checkpoint that `laya.load` opens.
