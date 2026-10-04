@@ -7,8 +7,8 @@ This is a standalone replacement for the Kaggle 2xT4 notebook. It performs:
 4. temperature calibration
 5. checkpoint/model export
 
-Steps 2 to 5 are `laya.train`, the loop the notebook and
-`research/scripts/finetune_single_device.py` also use, so this script carries no copy of it.
+Steps 2 to 5 are `laya.train`, the loop `research/scripts/finetune_single_device.py` also uses,
+so this script carries no copy of it.
 
 Useful examples:
     python notebooks/laya_finetune_typed_decisions_mps.py --epochs 2 --micro-batch 1 --grad-accum 32
@@ -33,6 +33,12 @@ DATASET_ID = "LocalLLaMA/typed-decisions"
 DEFAULT_MODEL_DIR = "./laya_base"
 DEFAULT_ITEMS = "./train_items.jsonl"
 DEFAULT_OUTPUT_DIR = "./laya_finetuned_typed_decisions"
+
+# What this entry point has always persisted. `laya.train` writes the fitted temperatures and the
+# length budgets; the rest is the rest of the old output contract, restored here so delegating the
+# loop does not silently change the checkpoint it produces.
+PERSISTED = {"max_tokens_per_batch": 2048, "max_len": 1024, "head_max_len": 256,
+             "model_name": "laya-typed-decisions"}
 
 
 def choose_device(requested):
@@ -102,6 +108,25 @@ def prepare_rows(items_path, force=False):
     return n_cases
 
 
+def finalize_config(output_dir, gradient_checkpointing):
+    """Write the output config this entry point has always produced.
+
+    Per-type temperatures only: the bucket map `fit_temperature_map` also fits is dropped rather
+    than persisted, as before. The rolling `checkpoint_latest/rl_agent_config.json` gets the same
+    config, which is what a resumed or inspected checkpoint used to find there.
+    """
+    path = Path(output_dir) / "rl_agent_config.json"
+    cfg = json.loads(path.read_text(encoding="utf-8"))
+    cfg.pop("temperature_by_options", None)
+    cfg["gradient_checkpointing"] = gradient_checkpointing
+    cfg.update(PERSISTED)
+    path.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    latest = Path(output_dir) / "checkpoint_latest" / "rl_agent_config.json"
+    if latest.exists():
+        latest.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    return cfg
+
+
 def train(args, model_dir, items_path, device):
     summary = laya.train.finetune(
         data=str(items_path),
@@ -112,25 +137,20 @@ def train(args, model_dir, items_path, device):
             micro_batch=args.micro_batch,
             grad_accum=args.grad_accum,
             calib_max=args.calib_max,
-            # The budgets this script has always trained with, rather than the checkpoint's own.
-            max_len=1024,
-            head_max_len=256,
+            # The budgets and the epoch order this script has always used.
+            max_len=PERSISTED["max_len"],
+            head_max_len=PERSISTED["head_max_len"],
             gradient_checkpointing=not args.no_checkpointing,
             seed=args.seed,
         ),
         device=str(device),
     )
-    # `laya.train` writes the checkpoint config it trained with; this entry point has always
-    # named the result, and `laya.load` reports it.
-    config_path = Path(args.output_dir) / "rl_agent_config.json"
-    cfg = json.loads(config_path.read_text(encoding="utf-8"))
-    cfg["model_name"] = "laya-typed-decisions"
-    config_path.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    cfg = finalize_config(args.output_dir, not args.no_checkpointing)
     print("Train items: {} ({} held out for calibration) | skipped: {}"
           .format(summary["train_items"], summary["calibration_items"], summary["skipped"]))
-    print("Temperatures (choice, score, noul):", summary["temperature"])
+    print("Temperatures (choice, score, noul):", cfg["temperature"])
     if summary["temperature_by_options"]:
-        print("Per-bucket temperatures:", summary["temperature_by_options"])
+        print("Per-bucket temperatures were fitted but are not persisted here, as before.")
     print(f"Model saved to {args.output_dir}")
 
 
@@ -146,7 +166,7 @@ def main():
     parser.add_argument("--micro-batch", type=int, default=2)
     parser.add_argument("--grad-accum", type=int, default=16)
     parser.add_argument("--calib-max", type=int, default=400)
-    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=42, help="epoch shuffle base; 42 as this script has always used")
     parser.add_argument("--device", choices=["auto", "mps", "cpu"], default="auto")
     parser.add_argument("--force-preprocess", action="store_true")
     parser.add_argument("--no-checkpointing", action="store_true")

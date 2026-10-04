@@ -20,7 +20,7 @@ The other worked example — a browser-agent decision head on a single 16 GB GPU
 | 2 | Install | `laya`, `transformers`, `datasets` and the training dependencies |
 | 3 | Preprocess | the 1,200 training cases (6,000 typed decisions) are written to disk as `{state, questions, gold}` rows, then turned into tokenized items by `laya.train.items_from_rows` so both DDP ranks read the same items |
 | 4 | Train | `train_ddp.py` under `torchrun --nproc_per_node=2`, four epochs |
-| 5 | Calibrate | `laya.calibrate.fit_temperature_map` on a slice held out before training (inside the training script, after the last epoch); the notebook keeps writing the per-type scalars it has always written, and the two single-process entry points take the whole fitted map |
+| 5 | Calibrate | `laya.calibrate.fit_temperature_map` on a slice held out before training (inside the training script, after the last epoch); every entry point persists the per-type scalars it has always persisted, and the per-bucket map the fit also produces is left out |
 | 6 | Evaluate | the official `test` split answered by the fine-tuned checkpoint — 400 cases, 2,000 decisions — with per-case latency |
 | 7 | Metrics | accuracy, soft accuracy, Brier, ECE, score MAE, within-one-level, KL/TV and latency percentiles; a head-to-head table against Jev and the teacher ceiling |
 | 8 | Publish | (optional) a model card built from the run's own numbers, folder uploaded to the Hub |
