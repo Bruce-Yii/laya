@@ -21,6 +21,8 @@ dependencies are clean".
 import io
 import json
 import re
+import shutil
+import subprocess
 import sys
 import urllib.error
 import urllib.request
@@ -54,15 +56,37 @@ def coordinates(text):
 
 
 def query(pairs):
-    """OSV's batch endpoint, one query per coordinate, in the same order."""
-    payload = {"queries": [
+    """OSV's batch endpoint, one query per coordinate, in the same order.
+
+    Tries `urllib` first and falls back to `curl`. Not belt-and-braces: a sandboxed developer
+    environment can permit `curl` while Python's own socket layer cannot reach anything --
+    measured here, where `urllib` failed against both api.osv.dev and api.github.com while curl
+    returned 200 for the same request in under a second. A gate that depends on one HTTP client
+    stops running for reasons that have nothing to do with the dependencies it audits, and a gate
+    that stops running is the thing this file exists to prevent.
+    """
+    payload = json.dumps({"queries": [
         {"version": version, "package": {"name": name, "ecosystem": "Maven"}}
-        for name, version in pairs]}
-    request = urllib.request.Request(
-        OSV, data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(request, timeout=60) as response:
-        return json.loads(response.read().decode("utf-8"))
+        for name, version in pairs]}).encode("utf-8")
+
+    try:
+        request = urllib.request.Request(
+            OSV, data=payload, headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(request, timeout=60) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except (urllib.error.URLError, OSError, ValueError) as urllib_problem:
+        curl = shutil.which("curl")
+        if curl is None:
+            raise
+        done = subprocess.run(
+            [curl, "-sS", "--max-time", "60", "-X", "POST", OSV,
+             "-H", "Content-Type: application/json", "--data-binary", "@-"],
+            input=payload, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+        if done.returncode != 0:
+            raise OSError("urllib failed (%s) and curl failed (%s)"
+                          % (urllib_problem, done.stderr.decode("utf-8", "replace").strip()))
+        print("  (urllib could not reach OSV here, so this used curl: %s)" % urllib_problem)
+        return json.loads(done.stdout.decode("utf-8"))
 
 
 def main(argv):

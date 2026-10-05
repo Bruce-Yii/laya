@@ -1298,6 +1298,7 @@ public final class Router implements AutoCloseable, Predictor {
     }
 
     /** Route this state and answer its questions on whichever checkpoint wins. */
+    @Override
     public Prediction predict(Object state, Map<String, Question> questions) {
         return predict(state, questions, RouteOptions.none());
     }

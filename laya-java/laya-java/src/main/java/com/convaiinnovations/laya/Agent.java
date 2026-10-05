@@ -112,6 +112,7 @@ public final class Agent implements AutoCloseable, Predictor {
     }
 
     /** Asks every question about one state, with no language override. */
+    @Override
     public Prediction predict(Object state, Map<String, Question> questions) {
         return predict(state, questions, null);
     }
