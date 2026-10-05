@@ -149,7 +149,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        language: [python, java-kotlin]
+        # `javascript-typescript` needs no build step, so adding the TypeScript SDK costs one
+        # matrix cell and no build risk. `csharp` is NOT here: CodeQL would have to run
+        # `dotnet build` for it, and a build this change cannot verify locally would turn a
+        # scanner into a broken required check. laya-dotnet is covered by gitleaks only today;
+        # adding it needs whoever owns that build to confirm autobuild works.
+        language: [python, java-kotlin, javascript-typescript]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # Only the Java cell compiles anything, so only it needs a JDK -- and the wrapper jar it
