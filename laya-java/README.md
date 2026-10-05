@@ -301,6 +301,27 @@ String withSpecials = tok.decode(ids, false);     // ...kept
 AgentConfig cfg = AgentConfig.fromModelDirectory(Path.of("./checkpoint"));
 ```
 
+## A state longer than the context window
+
+```java
+LongPrediction scan = agent.predictLong(wholeDocument, questions);
+Answer intent = scan.answer("intent");
+scan.window("intent").ifPresent(w ->
+        System.out.printf("decided by window %d of %d, tokens [%d,%d)%n",
+                w.index(), w.count(), w.tokenStart(), w.tokenEnd()));
+```
+
+`predict` truncates a state that exceeds `max_len` to a single window and drops the rest without
+saying so. `predictLong` scans it instead: one tokenization, overlapping windows, shared graph
+calls, then one answer per question. A `noul` takes the **highest** P(true) across windows — the
+statement holds if any window supports it — while a choice or a score takes the **most confident**
+window, which stops a localized signal being out-voted by the neutral text that makes up most of a
+long document. Ties go to the earliest window.
+
+The probability on an answer is **the deciding window's**, not a calibrated number for the whole
+document, which is why `window(id)` exists: without it the number has no stated scope. The window
+is absent when the state fitted one window, because then nothing was decided between windows.
+
 `decode` follows the reference rather than tidying after it, and on the multilingual checkpoint
 that means it is **lossy**: `Metaspace` prepends its marker, so `decode(encode("Hello world"))` is
 `" Hello world"`. The English checkpoint happens to round-trip. Correcting the space would make

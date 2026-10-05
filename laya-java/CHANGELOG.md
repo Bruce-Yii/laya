@@ -20,6 +20,14 @@ see [Installing](README.md#installing).
   `confidence` alongside `answerConfidence`.
 - Python-compatible tokenization (BPE and Metaspace, added tokens, normalizers), sequence
   building, collation, answer decoding and calibration.
+- `Agent.predictLong` and `LongPrediction`: questions answered over a state longer than the
+  context window. `predict` truncates such a state to one window and drops the rest silently;
+  this tokenizes it once, scans it in overlapping windows, scores them in shared graph calls and
+  aggregates per question — P(true) is the **max** over windows for a `noul`, and a choice or a
+  score takes the single **most-confident** window, so a localized signal is not out-voted by the
+  neutral text a long document is mostly made of. Ties take the earliest window. Each answer
+  carries the `Window` that decided it, because the probability reported is that window's and not
+  a calibrated number for the document.
 - `sequence.WindowPlan`: how a scan over a state longer than one sequence is sized —
   `stateRoom`, `budget` and `batchCap`, ported from `laya.common`. The window is capped at the
   room the questions leave, and at the *smallest* room when several are asked, because a window

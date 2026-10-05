@@ -353,12 +353,16 @@ jobs:
         include:
           # Tokenizers and configs only -- no weights, nothing traced. The three families here
           # are the ones whose builders read a checkpoint but never a graph.
+          # `predict_long.json` is here and not in the `predict` cell on purpose: its generator
+          # STUBS inference, so it needs a tokenizer and an rl_agent_config and no traced graph.
+          # Putting it in the weight-bearing cell would make a 13-second check wait on a
+          # 40-minute export for nothing.
           - name: tokenizer
             checkpoints: english multilingual
             graph: false
             families: >-
               --only tokenizer_ids.json --only sequences.json --only decode.json
-              --only decode_text.json --only window_plan.json
+              --only decode_text.json --only window_plan.json --only predict_long.json
             tests: >-
               --tests com.convaiinnovations.laya.tokenizer.TokenizerParityTest
               --tests com.convaiinnovations.laya.sequence.SequenceParityTest
@@ -366,7 +370,8 @@ jobs:
               --tests com.convaiinnovations.laya.tokenizer.PreTokenizerTablesTest
               --tests com.convaiinnovations.laya.tokenizer.TokenDecoderTest
               --tests com.convaiinnovations.laya.sequence.WindowPlanTest
-            # Measured locally: 444. The margin is deliberately smaller than the 8 the 183/175
+              --tests com.convaiinnovations.laya.PredictLongTest
+            # Measured locally: 493. The margin is deliberately smaller than the 8 the 183/175
             # pair used, because the smallest class in this cell is PreTokenizerTablesTest at 5
             # tests and a margin of 8 let that whole class be dropped with the floor still green
             # (measured at the time: 369 of 374, exit 0). A floor below the total minus the
@@ -378,7 +383,7 @@ jobs:
             # slices into a single test, and a slice list that emptied would still register its
             # test. The slices are guarded inside the suite instead, by the `total >= 400`
             # assertion in TokenDecoderTest and the `cases.size() >= 23` corpus floor beside it.
-            min-tests: 440
+            min-tests: 489
             timeout: 25
           # The one cell that needs the traced graph, and the only checkpoint the end-to-end
           # golden was recorded from.

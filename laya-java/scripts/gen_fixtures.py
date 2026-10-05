@@ -2634,6 +2634,307 @@ def _window_batch_cap_cases(window_batch_cap):
             " caps from one that returns None every time")
     return cases
 
+#: Per-window answers crafted to decide the aggregation, per case. Real model output cannot pin
+#: these rules: the deciding window has to be chosen by values the case controls, ties have to be
+#: constructed, and a document long enough to produce them would take a forward pass per window.
+#:
+#: (case id, state recipe, questions, kwargs, per-window answers)
+PREDICT_LONG_CASES = [
+    # noul: the strongest window decides, carrying its own numbers so the fields stay consistent.
+    ("noul-max-wins", ("repeat", 90), {"holds": {"type": "noul",
+                                                  "instructions": "Does it hold?"}},
+     {}, {"holds": [("noul", 0.20, 0.55), ("noul", 0.90, 0.31),
+                    ("noul", 0.50, 0.77), ("noul", 0.10, 0.99)]}),
+    # A TIE on P(true). Python's `max` keeps the FIRST maximal index, which is a rule a port can
+    # silently get backwards and no realistic model output would expose.
+    ("noul-tie-takes-the-first", ("repeat", 90),
+     {"holds": {"type": "noul", "instructions": "Does it hold?"}},
+     {}, {"holds": [("noul", 0.30, 0.10), ("noul", 0.90, 0.20),
+                    ("noul", 0.90, 0.95), ("noul", 0.40, 0.30)]}),
+    # choice and score: the most-confident window wins, which is a DIFFERENT field from noul's.
+    ("choice-most-confident", ("repeat", 90),
+     {"intent": {"type": "choice", "instructions": "What should we do?",
+                 "criteria": {"refund": "money back", "replace": "new unit"}}},
+     {}, {"intent": [("choice", "refund", 0.40), ("choice", "replace", 0.55),
+                     ("choice", "refund", 0.90), ("choice", "replace", 0.50)]}),
+    ("choice-tie-takes-the-first", ("repeat", 90),
+     {"intent": {"type": "choice", "instructions": "What should we do?",
+                 "criteria": {"refund": "money back", "replace": "new unit"}}},
+     {}, {"intent": [("choice", "refund", 0.80), ("choice", "replace", 0.80)]}),
+    ("score-most-confident", ("repeat", 90),
+     {"grade": {"type": "score", "criteria": ["low", "mid", "high"],
+                "instructions": "How bad?"}},
+     {}, {"grade": [("score", 1.0, 0.30), ("score", 2.5, 0.88), ("score", 0.5, 0.40)]}),
+    # Two questions in one scan, decided by DIFFERENT windows -- the case that catches a port
+    # which picks one window for the whole document.
+    ("two-questions-two-windows", ("repeat", 90),
+     {"holds": {"type": "noul", "instructions": "Does it hold?"},
+      "intent": {"type": "choice", "instructions": "What should we do?",
+                 "criteria": {"refund": "money back", "replace": "new unit"}}},
+     {}, {"holds": [("noul", 0.15, 0.90), ("noul", 0.95, 0.20), ("noul", 0.40, 0.50)],
+          "intent": [("choice", "refund", 0.20), ("choice", "replace", 0.30),
+                     ("choice", "refund", 0.99)]}),
+    # The window span of the LAST window is clamped to the document, not start + budget.
+    ("span-clamped-at-the-end", ("repeat", 100),
+     {"holds": {"type": "noul", "instructions": "Does it hold?"}},
+     {}, {"holds": [("noul", 0.1, 0.1), ("noul", 0.2, 0.2), ("noul", 0.99, 0.99)]}),
+    # An explicit window and stride change the split, so the spans and the count move with them.
+    ("explicit-window-and-stride", ("repeat", 90),
+     {"holds": {"type": "noul", "instructions": "Does it hold?"}},
+     {"window": 120, "stride": 60}, "auto"),
+    ("explicit-stride-no-overlap", ("repeat", 90),
+     {"holds": {"type": "noul", "instructions": "Does it hold?"}},
+     {"window": 150, "stride": 150}, "auto"),
+    # Short enough for one window: the scan is skipped entirely and the single-call result is
+    # returned, with `windows` still written.
+    ("fits-one-window", ("repeat", 3),
+     {"holds": {"type": "noul", "instructions": "Does it hold?"}},
+     {}, "single"),
+    # A clamped window, so `batch_size=None` becomes a real cap -- recorded as the batch call
+    # received it.
+    ("clamped-window-caps-the-batch", ("repeat", 120),
+     {"intent": {"type": "choice", "instructions": "Pick one of many.",
+                 "criteria": {("opt%03d" % i): "criterion %d with several words" % i
+                              for i in range(100)}}},
+     {}, "auto"),
+    # An explicit batch size is passed through untouched.
+    ("explicit-batch-size", ("repeat", 90),
+     {"holds": {"type": "noul", "instructions": "Does it hold?"}},
+     {"batch_size": 2}, "auto"),
+]
+
+
+def _long_state(recipe):
+    """A deterministic document of a controlled length, in tokens-ish."""
+    kind, size = recipe
+    assert kind == "repeat", kind
+    words = []
+    for i in range(size):
+        words.append("clause%d states that item %d was billed on day %d" % (i, i % 37, i % 29))
+    return ". ".join(words) + "."
+
+
+def _answer(spec, index):
+    """One window's answer dict, in the shape `predict_batch` returns."""
+    kind = spec[0]
+    if kind == "noul":
+        _, noul, conf = spec
+        return {"type": "noul", "noul": float(noul), "confidence": float(conf),
+                "answer_confidence": float(conf), "action": {"act_probability": 0.5}}
+    if kind == "choice":
+        _, choice, conf = spec
+        other = "replace" if choice == "refund" else "refund"
+        # `confidence` deliberately DIFFERENT from `answer_confidence`, and ordered the other
+        # way. A choice is chosen on `answer_confidence`; setting the two equal made a port that
+        # read the wrong one indistinguishable from a correct one -- measured, a mutant swapping
+        # them survived all 49 cases.
+        return {"type": "choice", "choice": choice,
+                "probabilities": {choice: float(conf), other: 1.0 - float(conf)},
+                "confidence": round(1.0 - float(conf), 4),
+                "answer_confidence": float(conf),
+                "action": {"act_probability": 0.25}}
+    if kind == "score":
+        _, score, conf = spec
+        # Same here, and for the same reason.
+        return {"type": "score", "score": float(score),
+                "legend": {"0": "low", "1": "mid", "2": "high"},
+                "probabilities": {"0": 0.2, "1": 0.3, "2": 0.5},
+                "confidence": round(1.0 - float(conf), 4),
+                "answer_confidence": float(conf),
+                "action": {"act_probability": 0.75}}
+    raise AssertionError(kind)
+
+
+def predict_long_scan():
+    """`ONNXAgent.predict_long`'s windowing and aggregation, with inference stubbed out.
+
+    The model is not what this pins. The rules are:
+
+      * noul   -> P(true) is the MAX over windows (the statement holds if any window supports it)
+      * choice -> the answer from the single most-confident window, so a localized signal is not
+                  out-voted by the many neutral windows a long document is mostly made of
+      * score  -> the level from the most-confident window, likewise
+
+    and those are chosen by a DIFFERENT field per type (`noul` versus `answer_confidence`), with
+    ties resolved to the FIRST maximal window because that is what Python's `max` does. None of
+    that is observable from real model output: a tie has to be constructed, and a document long
+    enough to produce four windows would cost four forward passes to record.
+
+    So `predict_batch` and `system_one` are stubbed and the real `predict_long` is driven over
+    them. That also makes the fixture record what the batch call RECEIVED -- the window texts and
+    the batch cap -- which pins the state tokenization, the window offsets, the decode of every
+    window and `window_batch_cap`, in one place, against the reference's own splitting code.
+
+    Stubbing inference also means no hook chain is dispatched, so `evidence` stays empty and this
+    is exactly the no-hooks path: `answered` false, `rewritten` false, and the question types
+    resolved from `_to_internal`. That is the path the JVM port implements.
+    """
+    import io
+    import os
+
+    rig = os.environ.get("LAYA_FIXTURE_CHECKPOINTS", DEFAULT_CHECKPOINT_ROOT)
+    out = {"by": {}}
+    for name in ("english", "multilingual"):
+        root = os.path.join(rig, name)
+        directory = os.path.join(root, "tokenizer")
+        if not os.path.isfile(os.path.join(directory, "tokenizer.json")):
+            out["by"][name] = {"skipped": "no tokenizer/ under %s" % root}
+            continue
+        from transformers import AutoTokenizer
+
+        from laya.onnx_agent import ONNXAgent
+
+        tok = AutoTokenizer.from_pretrained(directory)
+        cfg = json.load(io.open(os.path.join(root, "rl_agent_config.json"), encoding="utf-8"))
+
+        cases, states, splits = [], {}, {}
+        for cid, recipe, questions, kwargs, per_window in PREDICT_LONG_CASES:
+            state = _long_state(recipe)
+            seen = {}
+
+            class Stub(object):
+                """Everything `predict_long` touches on `self`, and nothing else."""
+
+                def __init__(self):
+                    self.tok = tok
+                    self.cfg = cfg
+
+                _to_internal = staticmethod(ONNXAgent._to_internal)
+
+                def system_one(self, st, qs, lang=None, **kw):
+                    seen["system_one"] = {"state": st}
+                    answers = {}
+                    for qid, qdef in qs.items():
+                        kind = ONNXAgent._to_internal(qdef)["t"]
+                        answers[qid] = _answer(
+                            ("noul", 0.42, 0.61) if kind == "noul"
+                            else ("choice", "refund", 0.61) if kind == "choice"
+                            else ("score", 1.5, 0.61), 0)
+                    return {"model": "laya-rl-agent-onnx", "answers": answers,
+                            "usage": {"input_tokens": 11, "output_tokens": 3,
+                                      "state_tokens": 7, "state_tokens_dropped": 0,
+                                      "truncated": False, "truncated_questions": []}}
+
+                def predict_batch(self, states, qs, batch_size=None, lang=None, **kw):
+                    seen["windows"] = list(states)
+                    seen["batch_size"] = batch_size
+                    # The same arithmetic `predict_long` used to produce `states`, recorded so the
+                    # port can be handed the identical (starts, budget, state length) rather than
+                    # inferring them from the window texts.
+                    from laya.common import encode_text, serialize_state, window_budget
+                    internal = [ONNXAgent._to_internal(q) for q in qs.values()]
+                    budget, step, _ = window_budget(
+                        tok, internal, cfg.get("max_len", 512), cfg.get("head_max_len", 192),
+                        window=kwargs.get("window"), stride=kwargs.get("stride"))
+                    ids = encode_text(tok, serialize_state(state).replace(tok.mask_token, " "),
+                                      add_special_tokens=False)["input_ids"]
+                    starts, at = [], 0
+                    while at < len(ids):
+                        starts.append(at)
+                        if at + budget >= len(ids):
+                            break
+                        at += step
+                    seen["starts"] = starts
+                    seen["budget"] = budget
+                    seen["state_tokens"] = len(ids)
+                    results = []
+                    for j, _st in enumerate(states):
+                        answers = {}
+                        for qid, qdef in qs.items():
+                            kind = ONNXAgent._to_internal(qdef)["t"]
+                            if not isinstance(per_window, dict):
+                                # Values that rise with the index, so the LAST window decides and
+                                # the span of the final window is what gets reported.
+                                conf = 0.10 + 0.05 * j
+                                spec = (("noul", conf, conf) if kind == "noul"
+                                        else ("choice", "refund", conf) if kind == "choice"
+                                        else ("score", 1.0, conf))
+                            else:
+                                specs = per_window[qid]
+                                spec = specs[j % len(specs)]
+                            answers[qid] = _answer(spec, j)
+                        # Usage designed to exercise the merge: numerics SUM, `options` is a
+                        # per-question dict that must MERGE rather than be replaced, and
+                        # `backend` is non-numeric so the last window wins.
+                        usage = {"input_tokens": 100 + j, "output_tokens": 5,
+                                 "state_tokens": 10 + j, "state_tokens_dropped": j,
+                                 "truncated": bool(j % 2), "truncated_questions":
+                                 (["q%d" % j] if j % 2 else []),
+                                 "backend": "window-%d" % j}
+                        if j % 2 == 0:
+                            usage["options"] = {("q%d" % j): {"total": 3, "distinct": 2,
+                                                              "tokens_per_option": None}}
+                        results.append({"model": "laya-rl-agent-onnx", "answers": answers,
+                                        "usage": usage})
+                    seen["results"] = results
+                    return results
+
+            import warnings
+
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                result = ONNXAgent.predict_long(
+                    Stub(), state, questions,
+                    window=kwargs.get("window"), stride=kwargs.get("stride"),
+                    batch_size=kwargs.get("batch_size"))
+            state_key = "%s-%d" % recipe
+            states[state_key] = state
+            split_key = "%s|%s|%s" % (state_key, kwargs.get("window"), kwargs.get("stride"))
+            scanned = seen.get("windows")
+            if scanned is not None:
+                previous = splits.get(split_key)
+                assert previous is None or previous == scanned, (
+                    "two cases with the same state, window and stride were split differently,"
+                    " which means %s is not the key it claims to be" % split_key)
+                splits[split_key] = scanned
+            cases.append({
+                "case": cid,
+                # The state and the window split live in `states` and `splits`; a case names them.
+                "state_key": state_key,
+                "split_key": split_key if scanned is not None else None,
+                "questions": questions,
+                "window": kwargs.get("window"),
+                "stride": kwargs.get("stride"),
+                "batch_size": kwargs.get("batch_size"),
+                "batch_cap_used": seen.get("batch_size"),
+                # The per-window results the reference aggregated. Recorded because the
+                # aggregation is the thing under test and a model cannot be asked to produce a
+                # tie or a chosen deciding window on demand.
+                "per_window": seen.get("results"),
+                "starts": seen.get("starts"),
+                "budget": seen.get("budget"),
+                "state_tokens": seen.get("state_tokens"),
+                "single_call": "system_one" in seen,
+                "result": result,
+                "warnings": [str(w.message) for w in caught],
+            })
+
+        # `states` and `splits` are what the cases reference. The split is the reference's own
+        # window list -- the proof that the token split, the per-window decode and the batch cap
+        # all match, independent of the aggregation the cases assert on.
+        out["by"][name] = {"max_len": cfg.get("max_len", 512),
+                           "head_max_len": cfg.get("head_max_len", 192),
+                           "states": states, "splits": splits, "cases": cases}
+
+    # The rules have to be REACHED. A case list that stopped constructing ties, or stopped
+    # producing more than one window, would still compare clean case by case.
+    for name, entry in out["by"].items():
+        if "skipped" in entry:
+            continue
+        multi = sum(1 for c in entry["cases"] if not c["single_call"])
+        split_sizes = [len(entry["splits"][c["split_key"]])
+                       for c in entry["cases"] if c["split_key"]]
+        spans = sum(1 for c in entry["cases"]
+                    for a in c["result"]["answers"].values() if "window" in a)
+        capped = sum(1 for c in entry["cases"] if c["batch_cap_used"])
+        # ...and the scans have to produce several windows each, or the aggregation has nothing
+        # to choose between.
+        if multi < 8 or spans < 8 or capped < 1 or min(split_sizes or [0]) < 3:
+            raise AssertionError(
+                "the %s cases reach %d multi-window scans, %d window attributions and %d capped"
+                " batches; this family exists to pin those" % (name, multi, spans, capped))
+    return out
+
 def _decoder_shape(tokenizer_json):
     """The decoder section's type chain, flattened, so the fixture says what it was recorded on."""
     import io
@@ -2655,6 +2956,7 @@ def _decoder_shape(tokenizer_json):
 
 
 FAMILIES = {
+    "predict_long.json": predict_long_scan,
     "window_plan.json": window_plan,
     "lang_tables.json": lang_tables,
     "lang_detect.json": lang_detect,

@@ -6,6 +6,7 @@ import com.convaiinnovations.laya.infer.InferenceSession;
 import com.convaiinnovations.laya.onnx.LayaSession;
 import com.convaiinnovations.laya.sequence.Collator;
 import com.convaiinnovations.laya.sequence.SequenceBuilder;
+import com.convaiinnovations.laya.sequence.WindowPlan;
 import com.convaiinnovations.laya.tokenizer.Tokenizer;
 import java.io.IOException;
 import java.nio.file.Path;
@@ -240,6 +241,203 @@ public final class Agent implements AutoCloseable, Predictor {
             }
         }
         return List.of(out);
+    }
+
+    /** Scans a state longer than one sequence, with the checkpoint's own window and stride. */
+    public LongPrediction predictLong(Object state, Map<String, Question> questions) {
+        return predictLong(state, questions, null, null, null, 0);
+    }
+
+    /**
+     * Evaluates questions over a state longer than the context window.
+     *
+     * <p>{@link #predict} truncates a state that exceeds {@code max_len} to a single window and
+     * drops the rest silently. This tokenizes the state once, splits it into overlapping token
+     * windows, decodes each back to text, scores them all through {@link #predictBatch} -- so the
+     * windows share graph calls rather than costing one each -- and combines the per-window
+     * answers:
+     *
+     * <ul>
+     *   <li>{@code noul}: P(true) is the MAX over windows. The statement holds if any window
+     *       supports it.</li>
+     *   <li>{@code choice} and {@code score}: the answer from the single most-confident window,
+     *       so a localized signal is not out-voted by the many neutral windows a long document is
+     *       mostly made of.</li>
+     * </ul>
+     *
+     * <p>Ties go to the EARLIEST window, which is what the reference's {@code max} over a range
+     * does. The returned probability and confidence are the deciding window's, not a calibrated
+     * number for the document; {@link LongPrediction.Window} says which window that was.
+     *
+     * <p>A state that already fits one window is passed straight to {@link #predict}, with no
+     * window attribution and {@code windows == 1}.
+     *
+     * @param window     state tokens per window, or null for the per-question budget. Capped at
+     *                   the room the questions leave -- see {@link WindowPlan}
+     * @param stride     token step between windows, or null for a 50% overlap of the EFFECTIVE
+     *                   window
+     * @param batchSize  windows per graph call, or 0 to let {@link WindowPlan#batchCap} bound it
+     * @throws IllegalArgumentException for a null state or questions, and for a window or stride
+     *     {@link WindowPlan} refuses
+     */
+    public LongPrediction predictLong(Object state, Map<String, Question> questions,
+                                      Integer window, Integer stride, String language,
+                                      int batchSize) {
+        if (closed) {
+            throw new IllegalStateException(
+                    "this agent is closed; open a new one rather than reusing it");
+        }
+        // Refused rather than serialised, as predict and predictBatch refuse it: a missing state
+        // would otherwise be answered as a decision about the literal text "null".
+        if (state == null) {
+            throw new IllegalArgumentException("state must not be null; pass a string, a map or "
+                    + "a list");
+        }
+        if (questions == null) {
+            throw new IllegalArgumentException("questions must not be null");
+        }
+
+        int maxLen = config.maxLen();
+        int headMaxLen = config.headMaxLen();
+        WindowPlan.Budget plan = WindowPlan.budget(tokenizer, List.copyOf(questions.values()),
+                maxLen, headMaxLen, window, stride);
+
+        // The mask string is replaced, not stripped: a state containing the checkpoint's own mask
+        // token would otherwise add markers the head did not ask for, and the option spans
+        // downstream are found BY those markers.
+        String text = SequenceBuilder.serializeState(state).replace(maskToken(), " ");
+        int[] stateIds = tokenizer.encode(text);
+
+        if (stateIds.length <= plan.window()) {
+            // Identical to a plain call, with no windowing overhead and no window attribution --
+            // nothing decided between windows because there was only one.
+            Prediction single = predict(state, questions, language);
+            Map<String, LongPrediction.Windowed> answers = new LinkedHashMap<>();
+            for (Map.Entry<String, Answer> entry : single.answers().entrySet()) {
+                answers.put(entry.getKey(),
+                        new LongPrediction.Windowed(entry.getValue(), null));
+            }
+            Usage one = single.usage();
+            // `one.outputTokens()` carried through, not forced to zero. The MULTI-window path
+            // zeroes it because the reference does; the single-window path returns the plain
+            // call's usage as it was, and this head emits no tokens anyway -- so the two agree
+            // today, and hardcoding it would make them disagree the moment that changed.
+            return new LongPrediction(single.model(), answers,
+                    new LongPrediction.LongUsage(one.inputTokens(), one.outputTokens(),
+                            one.stateTokens(), one.stateTokensDropped(),
+                            one.truncated() ? 1 : 0, one.truncatedQuestions(),
+                            one.collapsedOptions(), 1));
+        }
+
+        List<String> scanned = new ArrayList<>();
+        List<Integer> starts = new ArrayList<>();
+        for (int at = 0; at < stateIds.length; at += plan.stride()) {
+            int end = Math.min(at + plan.window(), stateIds.length);
+            // Decoded back to text so predictBatch re-tokenizes each window as an ordinary
+            // state; the default 50% overlap absorbs any boundary drift on re-tokenization.
+            scanned.add(tokenizer.decode(java.util.Arrays.copyOfRange(stateIds, at, end)));
+            starts.add(at);
+            if (end >= stateIds.length) {
+                break;
+            }
+        }
+
+        Integer cap = WindowPlan.batchCap(scanned.size(), plan.window(),
+                Math.max(64, maxLen - headMaxLen - 8), batchSize > 0 ? batchSize : null);
+        List<Prediction> results = predictBatch(scanned, questions, language,
+                cap == null ? 0 : cap, false);
+        if (results.size() != scanned.size()) {
+            throw new IllegalStateException(String.format(
+                    "the state was split into %d windows and the batch returned %d results",
+                    scanned.size(), results.size()));
+        }
+
+        return aggregate(List.copyOf(questions.keySet()), results, starts, plan.window(),
+                stateIds.length);
+    }
+
+    /**
+     * Combines the per-window answers into one, naming the window that decided each.
+     *
+     * <p>Package-private and static so a test can drive it with recorded per-window results. The
+     * rules it implements -- a tie going to the earliest window, {@code noul} chosen on P(true)
+     * while a choice is chosen on confidence -- cannot be exercised through a real graph, because
+     * a model cannot be asked to produce a tie or a particular deciding window on demand. Driving
+     * it directly is what makes those rules testable at all.
+     *
+     * @param starts      first token of each window, parallel to {@code results}
+     * @param window      the EFFECTIVE window, which is what the reported span is measured in
+     * @param stateTokens the tokenized state's length, which clamps the final window's end
+     */
+    static LongPrediction aggregate(List<String> questionIds, List<Prediction> results,
+                                    List<Integer> starts, int window, int stateTokens) {
+        if (results.isEmpty()) {
+            throw new IllegalArgumentException("a scan with no windows has nothing to aggregate");
+        }
+        if (starts.size() != results.size()) {
+            throw new IllegalArgumentException(String.format(
+                    "%d window starts for %d results", starts.size(), results.size()));
+        }
+        Map<String, LongPrediction.Windowed> answers = new LinkedHashMap<>();
+        for (String id : questionIds) {
+            int best = 0;
+            double bestKey = Double.NEGATIVE_INFINITY;
+            for (int at = 0; at < results.size(); at++) {
+                Answer candidate = results.get(at).answer(id);
+                if (candidate == null) {
+                    throw new IllegalArgumentException(
+                            "window " + at + " has no answer for question " + id);
+                }
+                // noul is chosen on P(true) and everything else on the calibrated confidence --
+                // a DIFFERENT field, not the same number under two names.
+                double key = candidate instanceof Answer.Noul noul
+                        ? noul.noul()
+                        : candidate.answerConfidence();
+                // Strictly greater, so a tie keeps the EARLIEST window, as the reference does.
+                if (key > bestKey) {
+                    bestKey = key;
+                    best = at;
+                }
+            }
+            int start = starts.get(best);
+            answers.put(id, new LongPrediction.Windowed(results.get(best).answer(id),
+                    new LongPrediction.Window(best, start,
+                            Math.min(start + window, stateTokens), results.size())));
+        }
+        return new LongPrediction(Prediction.MODEL, answers, aggregateUsage(results));
+    }
+
+    /**
+     * Usage across the windows of one scan.
+     *
+     * <p>Numeric fields SUM, which makes {@code truncated} a count of windows that truncated
+     * rather than a flag. {@code collapsedOptions} is MERGED rather than replaced: it is keyed by
+     * question and set only on the windows where option spans actually collapsed, so replacing it
+     * left a caller holding whichever collapsing window came last -- and the deciding window is
+     * the most confident one, not the last one. {@code truncatedQuestions} is the last window's
+     * list, carried as the reference carries it, which is why the count can be above zero while
+     * the list is empty.
+     */
+    private static LongPrediction.LongUsage aggregateUsage(List<Prediction> results) {
+        int inputTokens = 0;
+        int stateTokens = 0;
+        int dropped = 0;
+        int truncatedWindows = 0;
+        List<String> truncatedQuestions = List.of();
+        Map<String, Usage.CollapsedOptions> collapsed = new LinkedHashMap<>();
+        for (Prediction result : results) {
+            Usage usage = result.usage();
+            inputTokens += usage.inputTokens();
+            stateTokens += usage.stateTokens();
+            dropped += usage.stateTokensDropped();
+            truncatedWindows += usage.truncated() ? 1 : 0;
+            truncatedQuestions = usage.truncatedQuestions();
+            collapsed.putAll(usage.collapsedOptions());
+        }
+        // Zero, not a sum: this head emits no tokens, and summing zeros across windows would
+        // still be zero while implying the field meant something per window.
+        return new LongPrediction.LongUsage(inputTokens, 0, stateTokens, dropped,
+                truncatedWindows, truncatedQuestions, collapsed, results.size());
     }
 
     /**
