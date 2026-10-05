@@ -301,6 +301,26 @@ String withSpecials = tok.decode(ids, false);     // ...kept
 AgentConfig cfg = AgentConfig.fromModelDirectory(Path.of("./checkpoint"));
 ```
 
+## Abstaining on a low-confidence answer
+
+```java
+var gated = ConfidenceGate.apply(prediction.answers(), 0.8);   // null = no gate at all
+gated.ifPresent(report -> report.forEach((id, v) -> {
+    if (v.abstention() == ConfidenceGate.Abstention.ABSTAINED) {
+        escalate(id, v.answer(), v.threshold());
+    }
+}));
+```
+
+Three states, not a boolean: `UNEVALUATED` is an answer the gate could not read, and calling
+that a pass is the same mistake as calling it a flag. An **ungated** call returns an empty
+`Optional`, so the presence of a report is what tells you a gate ran.
+
+A threshold is not a claim that the number is calibrated — "about c of the answers returned at
+c are correct" holds only after temperatures have been fitted and validated for that checkpoint
+and question shape. Pass a `Map` instead of a scalar to gate each option-count bucket
+(`choice:2`, `score:6-10`, …) at the level its calibration actually earns.
+
 ## A state longer than the context window
 
 ```java

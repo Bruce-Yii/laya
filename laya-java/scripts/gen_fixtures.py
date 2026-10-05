@@ -2935,6 +2935,140 @@ def predict_long_scan():
                 " batches; this family exists to pin those" % (name, multi, spans, capped))
     return out
 
+#: (case id, answers, min_confidence). The gate's whole contract is observable from the payload
+#: it writes, so each case records the answer dicts before and after.
+CONFIDENCE_CASES = [
+    # The no-op contract. An ungated call must return EXACTLY the payload it returned before --
+    # no `abstention`, no `abstention_threshold`, no flag -- because the PRESENCE of the field is
+    # what tells a caller the gate ran.
+    ("ungated-writes-nothing", [("q", "choice", 0.7, 0.5, 2)], None),
+    ("ungated-with-several", [("a", "choice", 0.9, 0.8, 3), ("b", "noul", 0.4, 0.4, 2)], None),
+    # A scalar threshold.
+    ("scalar-abstains", [("q", "choice", 0.7, 0.5, 2)], 0.8),
+    ("scalar-passes", [("q", "choice", 0.9, 0.5, 2)], 0.8),
+    ("scalar-exactly-at-threshold", [("q", "choice", 0.8, 0.5, 2)], 0.8),
+    # 0.0 WAS set, so states are reported -- and nothing can fall below it, so every answer with
+    # a usable confidence reads `passed`. The threshold echo is what distinguishes that from a
+    # real pass at a real threshold.
+    ("scalar-zero-reports-passed", [("q", "choice", 0.7, 0.5, 2)], 0.0),
+    ("scalar-one-abstains-everything", [("q", "choice", 0.99, 0.9, 2)], 1.0),
+    # `answer_confidence` first, `confidence` only as a fallback -- a DIFFERENT quantity on a
+    # different scale, so a port that reads the wrong one gates at the wrong number.
+    ("falls-back-to-confidence", [("q", "choice", None, 0.3, 2)], 0.5),
+    ("prefers-answer-confidence", [("q", "choice", 0.9, 0.1, 2)], 0.5),
+    # No usable number is NOT a pass and NOT a flag: the gate ran and could not decide.
+    ("no-usable-confidence", [("q", "choice", None, None, 2)], 0.5),
+    ("nan-is-not-a-confidence", [("q", "choice", "nan", "nan", 2)], 0.5),
+    ("bool-is-not-a-confidence", [("q", "choice", True, None, 2)], 0.5),
+    # Per-bucket thresholds: one number does not transfer across option counts.
+    ("map-by-bucket", [("two", "choice", 0.7, 0.5, 2), ("five", "choice", 0.7, 0.5, 5)],
+     {"choice:2": 0.9, "choice:3-5": 0.1}),
+    ("map-default-for-unnamed-bucket", [("q", "choice", 0.7, 0.5, 12)],
+     {"choice:2": 0.9, "default": 0.95}),
+    ("map-unnamed-bucket-no-default", [("q", "choice", 0.7, 0.5, 12)], {"choice:2": 0.9}),
+    ("map-noul-bucket", [("q", "noul", 0.6, 0.6, 2)], {"noul:2": 0.8}),
+    ("map-score-bucket", [("q", "score", 0.6, 0.6, 7)], {"score:6-10": 0.8}),
+    # A previously-flagged answer that now clears the bar must have the flag REMOVED, not left.
+    ("reflagging-clears-a-stale-flag", [("q", "choice", 0.9, 0.5, 2)], 0.5),
+]
+
+
+def _conf_answer(qtype, answer_confidence, confidence, options):
+    """One answer dict in the shape `predict` returns."""
+    def number(v):
+        return float("nan") if v == "nan" else v
+    probabilities = {str(i): round(1.0 / options, 6) for i in range(options)}
+    answer = {"type": qtype, "probabilities": probabilities,
+              "action": {"act_probability": 0.5}}
+    if qtype == "choice":
+        answer["choice"] = "0"
+    elif qtype == "score":
+        answer["score"] = 1.0
+        answer["legend"] = {str(i): "level %d" % i for i in range(options)}
+    else:
+        answer["noul"] = 0.6
+    if answer_confidence is not None:
+        answer["answer_confidence"] = number(answer_confidence)
+    if confidence is not None:
+        answer["confidence"] = number(confidence)
+    return answer
+
+
+def confidence_gate():
+    """`laya.confidence`: which number the gate reads, and what it writes.
+
+    The gate is a policy, and a policy whose application cannot be observed is not one. Its whole
+    contract is the payload it writes, so each case records the answers BEFORE and AFTER, and the
+    cases are chosen so a port that reads the wrong field or writes the wrong state differs
+    somewhere:
+
+      * `answer_confidence` is the quantity temperature scaling fits; `confidence` is normalized
+        entropy, a different quantity on a different scale. The gate reads the first and falls
+        back to the second, so `prefers-answer-confidence` and `falls-back-to-confidence` differ
+        only in which field is present and must give different thresholds' worth of behaviour.
+      * an UNSET threshold writes nothing at all -- the presence of `abstention` is how a caller
+        tells "this run had no gate" from "this answer cleared the gate", so a port that writes
+        a sentinel for the unconfigured case breaks that distinction for every caller.
+      * `0.0` IS a threshold that was set. Nothing can fall below it, so every answer with a
+        usable number reads `passed`, and the echoed threshold is what distinguishes that from a
+        real pass at a real bar.
+      * a bool and a NaN are not confidences. Both give "no usable number", which the gate
+        reports as `unevaluated` -- not as a pass, which is the same lie as reporting it as a flag.
+    """
+    import copy
+    import math
+
+    from laya.confidence import GATE_STATES, apply_confidence_gate, check_min_confidence
+
+    cases = []
+    for cid, answers, threshold in CONFIDENCE_CASES:
+        payload = {qid: _conf_answer(t, ac, c, n) for qid, t, ac, c, n in answers}
+        if cid == "reflagging-clears-a-stale-flag":
+            # A result dict reused from an earlier, stricter run.
+            for a in payload.values():
+                a["low_confidence"] = True
+        before = copy.deepcopy(payload)
+        validated = None if threshold is None else check_min_confidence(threshold)
+        results = [{"model": "laya-rl-agent-onnx", "answers": payload, "usage": {}}]
+        apply_confidence_gate(results, validated)
+
+        def clean(d):
+            # NaN does not survive JSON, and recording it as null would lose the distinction
+            # between "absent" and "not a number" -- which is exactly what this family tests.
+            out = {}
+            for k, v in d.items():
+                if isinstance(v, float) and math.isnan(v):
+                    out[k] = "__nan__"
+                elif isinstance(v, dict):
+                    out[k] = clean(v)
+                else:
+                    out[k] = v
+            return out
+
+        cases.append({
+            "case": cid,
+            "min_confidence": threshold,
+            "before": {q: clean(a) for q, a in before.items()},
+            "after": {q: clean(a) for q, a in results[0]["answers"].items()},
+        })
+
+    # Validation is part of the contract: a threshold outside [0,1], a bool, or an empty map is
+    # refused, and the message is what a caller sees.
+    refusals = []
+    for bad in (1.5, -0.1, True, "0.5", float("nan"), {}, {"choice:2": 2.0}, {1: 0.5}):
+        try:
+            check_min_confidence(bad)
+            refusals.append({"input": repr(bad), "error": None})
+        except (ValueError, TypeError) as problem:
+            refusals.append({"input": repr(bad), "error": str(problem)})
+
+    gated = sum(1 for c in cases if any("abstention" in a for a in c["after"].values()))
+    if gated < 12 or len(GATE_STATES) != 3:
+        raise AssertionError(
+            "only %d case(s) reach a gated answer across %d state(s); this family exists to pin"
+            " the three states and the no-op" % (gated, len(GATE_STATES)))
+    return {"states": list(GATE_STATES), "cases": cases, "refusals": refusals}
+
 def _decoder_shape(tokenizer_json):
     """The decoder section's type chain, flattened, so the fixture says what it was recorded on."""
     import io
@@ -2956,6 +3090,7 @@ def _decoder_shape(tokenizer_json):
 
 
 FAMILIES = {
+    "confidence_gate.json": confidence_gate,
     "predict_long.json": predict_long_scan,
     "window_plan.json": window_plan,
     "lang_tables.json": lang_tables,

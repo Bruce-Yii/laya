@@ -20,6 +20,15 @@ see [Installing](README.md#installing).
   `confidence` alongside `answerConfidence`.
 - Python-compatible tokenization (BPE and Metaspace, added tokens, normalizers), sequence
   building, collation, answer decoding and calibration.
+- `ConfidenceGate`: the opt-in abstention gate. Reports three states — `PASSED`, `ABSTAINED`
+  and `UNEVALUATED` — because an answer that carried no usable confidence is not a pass, and a
+  boolean cannot say so. Reads `answerConfidence` (what temperature scaling fits) and falls back
+  to `confidence` (normalised entropy, a different scale) only when the first is unusable.
+  Per-bucket thresholds are supported, since one threshold does not transfer across option
+  counts. Unlike the reference it does not mutate the answers — records cannot — so `apply`
+  returns a report, and an **ungated** call returns an empty `Optional` rather than a report of
+  nulls: the presence of the verdict is how a caller tells "no gate ran" from "everything
+  passed".
 - `Agent.predictLong` and `LongPrediction`: questions answered over a state longer than the
   context window. `predict` truncates such a state to one window and drops the rest silently;
   this tokenizes it once, scans it in overlapping windows, scores them in shared graph calls and
