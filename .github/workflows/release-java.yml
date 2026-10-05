@@ -67,12 +67,21 @@ jobs:
       # that lane already covered.
       - name: Model-free tests
         run: ./gradlew --no-daemon test
+      # 631 of the 640 registered tests run without a checkpoint. The floor was 440, which
+      # left 191 of slack -- the whole decode family could have vanished from this lane with
+      # the gate still green, and a floor that does not bind is not a gate.
+      #
+      # These lines sit ABOVE `run:`, not inside it. A `>` block folds to one line and `#` is
+      # not a comment inside a YAML scalar, so a comment written in there reaches the shell and
+      # silences the rest of the folded line: it took `--min-tests 625 --allow-aborted` off this
+      # command, dropping the floor to the script's default of 1 instead of raising it to 625,
+      # and losing `--allow-aborted` on a runner whose parity factories abort. A `|` block keeps
+      # the newlines so the `#` really is a shell comment there, which is why the broken and the
+      # correct form look identical in a diff. `scripts/check_workflow_folding.py` now fails the
+      # build on it rather than relying on a reader spotting it.
       - name: The suite was not vacuous
         run: >
           python3 scripts/check_test_results.py laya-java/build/test-results/test
-          # 631 of the 640 registered tests run without a checkpoint. 440 left 191 of
-          # slack, so the whole decode family could have vanished from this lane with the
-          # gate still green -- and a floor that does not bind is not a gate.
           --min-tests 625 --allow-aborted
 
       - name: Build the jars
