@@ -98,7 +98,11 @@ public final class AgentConfig {
                     "temperature must be a list of three values, one per question type, got "
                     + raw.getClass().getSimpleName());
         }
-        if (raw instanceof List) {
+        // `raw != null`, not `instanceof List` again: the throw above means any non-null value
+        // here is already a List, so a second type test reads as though it could fail on type
+        // when the only thing it can distinguish is absence. A static analyser flagged it as
+        // always-true, which it is.
+        if (raw != null) {
             List<?> values = (List<?>) raw;
             if (values.size() != 3) {
                 throw new Json.JsonException(
@@ -117,7 +121,8 @@ public final class AgentConfig {
                     "temperature_by_options must be a mapping, got "
                     + tbo.getClass().getSimpleName());
         }
-        if (tbo instanceof Map) {
+        // Same here: absence is the only case left, so test for it directly.
+        if (tbo != null) {
             for (Map.Entry<?, ?> entry : ((Map<?, ?>) tbo).entrySet()) {
                 byOptions.put(String.valueOf(entry.getKey()), clampTemperature(entry.getValue()));
             }
