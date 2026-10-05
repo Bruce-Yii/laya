@@ -20,6 +20,13 @@ see [Installing](README.md#installing).
   `confidence` alongside `answerConfidence`.
 - Python-compatible tokenization (BPE and Metaspace, added tokens, normalizers), sequence
   building, collation, answer decoding and calibration.
+- `sequence.WindowPlan`: how a scan over a state longer than one sequence is sized —
+  `stateRoom`, `budget` and `batchCap`, ported from `laya.common`. The window is capped at the
+  room the questions leave, and at the *smallest* room when several are asked, because a window
+  wider than that is re-truncated on the way in: its tail would reach no model while the reported
+  span said it did. `Budget` carries the reference's `RuntimeWarning` text as data as well as
+  logging it, since every clamp here is a decision the caller cannot otherwise see — their window
+  shrinks, their stride shrinks with it, and the forward-pass count can triple.
 - `Tokenizer.decode(int[])` and `decode(int[], boolean skipSpecialTokens)`: ids back to text,
   matching the `tokenizers` crate's `ByteLevel`, `Replace`, `ByteFallback`, `Fuse`, `Strip` and
   `Sequence` decoders. Byte-exact against the reference over both shipped checkpoints, including

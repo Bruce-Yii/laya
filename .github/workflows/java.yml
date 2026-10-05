@@ -289,18 +289,19 @@ jobs:
             graph: false
             families: >-
               --only tokenizer_ids.json --only sequences.json --only decode.json
-              --only decode_text.json
+              --only decode_text.json --only window_plan.json
             tests: >-
               --tests com.convaiinnovations.laya.tokenizer.TokenizerParityTest
               --tests com.convaiinnovations.laya.sequence.SequenceParityTest
               --tests com.convaiinnovations.laya.decode.DecoderParityTest
               --tests com.convaiinnovations.laya.tokenizer.PreTokenizerTablesTest
               --tests com.convaiinnovations.laya.tokenizer.TokenDecoderTest
-            # Measured locally. The margin is deliberately smaller than the 8 the 183/175 pair
-            # used, because the smallest class in this cell is PreTokenizerTablesTest at 5 tests
-            # and a margin of 8 let that whole class be dropped with the floor still green
-            # (measured: 369 of 374, exit 0). A floor below the total minus the smallest class
-            # does not bind any single class.
+              --tests com.convaiinnovations.laya.sequence.WindowPlanTest
+            # Measured locally: 444. The margin is deliberately smaller than the 8 the 183/175
+            # pair used, because the smallest class in this cell is PreTokenizerTablesTest at 5
+            # tests and a margin of 8 let that whole class be dropped with the floor still green
+            # (measured at the time: 369 of 374, exit 0). A floor below the total minus the
+            # smallest class does not bind any single class, so this stays within 5 of the total.
             #
             # What this does NOT protect, despite an earlier version of this comment saying so:
             # the window SLICES. A count floor cannot see them -- the 403 slice assertions live
@@ -308,7 +309,7 @@ jobs:
             # slices into a single test, and a slice list that emptied would still register its
             # test. The slices are guarded inside the suite instead, by the `total >= 400`
             # assertion in TokenDecoderTest and the `cases.size() >= 23` corpus floor beside it.
-            min-tests: 374
+            min-tests: 440
             timeout: 25
           # The one cell that needs the traced graph, and the only checkpoint the end-to-end
           # golden was recorded from.

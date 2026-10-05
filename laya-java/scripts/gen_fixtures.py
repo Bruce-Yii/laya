@@ -2411,6 +2411,229 @@ def _mixed_token_scope():
     return {"spec": spec, "separating_token": mixed, "scope": scope, "cases": cases}
 
 
+
+def _window_question(options, words=4, instructions="Pick one."):
+    """An internal question dict with a controllable head size.
+
+    `state_room` is `max_len - len(head) - 1`, and the head is the instructions plus one
+    `[MASK]`-prefixed span per option -- so the option count is the knob that drives the room down
+    and makes every clamping branch of `window_budget` reachable.
+    """
+    crit = {}
+    for i in range(options):
+        crit["opt%03d" % i] = " ".join("criterion%d word%d" % (i, w) for w in range(words))
+    return {"t": "choice", "ins": instructions, "crit": crit}
+
+
+#: (case id, which rooms the questions should leave, kwargs for window_budget).
+#:
+#: The rooms are named, not counted. `state_room` depends on the tokenizer, so the option count
+#: that clamps the default window on one checkpoint does nothing on the other -- english falls to
+#: a hard clamp at 100 four-word options and has no room at all by 150, while multilingual still
+#: has 414 of room at 150 and only hard-clamps at 200. A list of literal counts covered every
+#: branch on english and reached ZERO of the three warning branches on multilingual, which the
+#: coverage check at the end of `window_plan` caught. So each case asks for "roomy", "mild" or
+#: "hard" and the count is resolved per checkpoint by measurement.
+#:
+#: The warning TEXT is recorded verbatim rather than counted: it is the only thing that tells a
+#: caller why their scan needs 3x the forward passes, and a port that clamped correctly while
+#: saying nothing would pass a test that only checked the numbers.
+WINDOW_BUDGET_CASES = [
+    # No questions at all: nothing to fit, so the caller's window (or the default) stands and the
+    # room is reported as that size rather than measured.
+    ("no-questions", [], {}),
+    ("no-questions-explicit-window", [], {"window": 128}),
+    ("no-questions-explicit-stride", [], {"window": 128, "stride": 32}),
+    # Plenty of room, so nothing is clamped and the defaults apply.
+    ("roomy-default", ["roomy"], {}),
+    ("roomy-explicit-window", ["roomy"], {"window": 100}),
+    ("roomy-explicit-stride", ["roomy"], {"window": 100, "stride": 25}),
+    # stride == window: reads every token, no overlap. Allowed.
+    ("stride-equals-window", ["roomy"], {"window": 100, "stride": 100}),
+    ("stride-one", ["roomy"], {"window": 100, "stride": 1}),
+    # An explicit window wider than the room is clamped, with its own warning.
+    ("explicit-window-over-room", ["hard"], {"window": 100000}),
+    ("explicit-window-over-room-mild", ["mild"], {"window": 100000}),
+    # The DEFAULT window clamped mildly (under 2x) stays silent...
+    ("default-clamped-mild", ["mild"], {}),
+    # ...and clamped hard (at or past 2x) warns, naming the remedy.
+    ("default-clamped-hard", ["hard"], {}),
+    # The caller's stride was a 50% step for the window they ASKED for, and the library reduced
+    # the window underneath them: that is the library's clamp, so the stride is reduced too.
+    ("stride-valid-for-requested-window", ["hard"], {"window": 100000, "stride": 50000}),
+    # A stride that overshoots the window the caller asked for is the caller's own mistake.
+    ("stride-past-requested-window", ["roomy"], {"window": 100, "stride": 150}),
+    ("stride-past-default-window", ["roomy"], {"stride": 100000}),
+    # Zero and negative are "unset", not errors: `window if (window and window > 0)`.
+    ("window-zero-is-unset", ["roomy"], {"window": 0}),
+    ("window-negative-is-unset", ["roomy"], {"window": -5}),
+    ("stride-zero-is-unset", ["roomy"], {"window": 100, "stride": 0}),
+    ("stride-negative-is-unset", ["roomy"], {"window": 100, "stride": -3}),
+    # Several questions: the SMALLEST room decides, because the windows are one list of states
+    # scored for every question in shared passes.
+    ("smallest-room-decides", ["roomy", "hard"], {}),
+    ("smallest-room-decides-reversed", ["hard", "roomy"], {}),
+    # The options fill the sequence: no window can carry any state, so this is refused. Forced
+    # with an explicit budget rather than an option count, because the count that empties the room
+    # differs per checkpoint and on one of them is very large.
+    ("no-room-at-all", ["hard"], {"max_len": 220, "head_max_len": 512}),
+    ("no-room-at-all-roomy-question", ["roomy"], {"max_len": 8, "head_max_len": 512}),
+    # A tiny max_len, where the default window floor of 64 is what binds.
+    ("tiny-max-len", ["roomy"], {"max_len": 96, "head_max_len": 32}),
+]
+
+
+
+def _pick_option_counts(tok, state_room, max_len, head_max_len):
+    """Option counts that leave a roomy, a mildly clamped and a hard-clamped state budget.
+
+    Found by measurement, because `state_room` is a property of the tokenizer: the same question
+    leaves 102 state tokens on english and 614 on multilingual, so no literal count reaches the
+    same branch on both. Resolving them here is what lets one case list cover every branch of
+    `window_budget` on any checkpoint.
+
+    `room` is NOT monotonic in the option count -- 10 options leave 332 tokens on english and 30
+    leave 352, because the per-option spans are truncated at different points -- so this scans and
+    takes the first count that lands in each band rather than bisecting.
+    """
+    size = max(64, max_len - head_max_len - 8)
+    picked = {}
+    # From 2, not 0: a choice question with no options at all is degenerate, and "roomy"
+    # should be an ordinary question that simply leaves room.
+    for options in range(2, 401, 2):
+        room = state_room(tok, _window_question(options), max_len, head_max_len)
+        if room <= 0:
+            break
+        if "roomy" not in picked and room >= size:
+            picked["roomy"] = options
+        elif "hard" not in picked and size >= room * 2:
+            picked["hard"] = options
+        elif "mild" not in picked and size > room:
+            picked["mild"] = options
+        if len(picked) == 3:
+            break
+    missing = {"roomy", "mild", "hard"} - set(picked)
+    if missing:
+        raise AssertionError(
+            "no option count up to 400 leaves a %s state budget at max_len=%d head_max_len=%d,"
+            " so the window_budget cases cannot cover every branch on this checkpoint"
+            % ("/".join(sorted(missing)), max_len, head_max_len))
+    return picked
+
+def window_plan():
+    """`state_room`, `window_budget` and `window_batch_cap`: how a long-state scan is sized.
+
+    `predict_long` decodes each token window back to text and scores it as an ordinary state, so a
+    window wider than the room the questions leave is re-truncated on the way in -- the tail of
+    every window reaches no model while the reported span says it did. These three functions are
+    what stops that, and every one of their branches is a decision a caller cannot see: the window
+    they asked for may be reduced, their stride may be reduced with it, and the number of forward
+    passes may change by 3x as a result.
+
+    So the WARNINGS are recorded verbatim, not counted. They are the only thing that tells a
+    caller why a scan got slower, and a port that clamped correctly but said nothing would pass a
+    test that only checked the numbers.
+    """
+    import io
+    import os
+    import warnings
+
+    from laya.common import state_room, window_batch_cap, window_budget
+
+    rig = os.environ.get("LAYA_FIXTURE_CHECKPOINTS", DEFAULT_CHECKPOINT_ROOT)
+
+    out = {"by": {}, "batch_cap": _window_batch_cap_cases(window_batch_cap)}
+    for name in ("english", "multilingual"):
+        root = os.path.join(rig, name)
+        directory = os.path.join(root, "tokenizer")
+        if not os.path.isfile(os.path.join(directory, "tokenizer.json")):
+            out["by"][name] = {"skipped": "no tokenizer/ under %s" % root}
+            continue
+        from transformers import AutoTokenizer
+
+        tok = AutoTokenizer.from_pretrained(directory)
+        cfg = json.load(io.open(os.path.join(root, "rl_agent_config.json"), encoding="utf-8"))
+        default_max = cfg.get("max_len", 512)
+        default_head = cfg.get("head_max_len", 192)
+
+        rooms = []
+        # From 1. A choice question with zero options is expressible as an internal dict here --
+        # `crit: {}` -- but not through a typed API that validates its arguments, and it pins
+        # nothing about `state_room` that one option does not. Recording it only produced a row no
+        # port could build.
+        for options in (1, 2, 5, 20, 40, 60, 100, 150):
+            q = _window_question(options)
+            rooms.append({
+                "options": options,
+                "room": state_room(tok, q, default_max, default_head),
+                "room_tight": state_room(tok, q, 256, 128),
+            })
+
+        picked = _pick_option_counts(tok, state_room, default_max, default_head)
+
+        cases = []
+        for cid, wanted, kwargs in WINDOW_BUDGET_CASES:
+            questions = [_window_question(picked[w]) for w in wanted]
+            option_counts = [picked[w] for w in wanted]
+            max_len = kwargs.get("max_len", default_max)
+            head_max_len = kwargs.get("head_max_len", default_head)
+            record = {"case": cid, "rooms": list(wanted), "options": list(option_counts),
+                      "max_len": max_len, "head_max_len": head_max_len,
+                      "window": kwargs.get("window"), "stride": kwargs.get("stride")}
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                try:
+                    size, step, room = window_budget(
+                        tok, questions, max_len, head_max_len,
+                        window=kwargs.get("window"), stride=kwargs.get("stride"))
+                    record["result"] = {"window": size, "stride": step, "room": room}
+                except ValueError as refused:
+                    record["error"] = str(refused)
+            record["warnings"] = [str(w.message) for w in caught]
+            cases.append(record)
+        out["by"][name] = {"default_max_len": default_max, "default_head_max_len": default_head,
+                           "state_room": rooms, "option_counts": picked, "cases": cases}
+
+    # Every branch must actually be reached. A case list that stopped producing warnings or
+    # refusals would still look healthy case by case.
+    for name, entry in out["by"].items():
+        if "skipped" in entry:
+            continue
+        warned = sum(1 for c in entry["cases"] if c["warnings"])
+        refused = sum(1 for c in entry["cases"] if "error" in c)
+        if warned < 4 or refused < 2:
+            raise AssertionError(
+                "the %s cases reach %d warning(s) and %d refusal(s); window_budget has three"
+                " warning branches and two refusals, so the case list has stopped covering them"
+                % (name, warned, refused))
+    return out
+
+
+def _window_batch_cap_cases(window_batch_cap):
+    """`window_batch_cap` over a grid. Pure arithmetic, so this sweeps rather than samples.
+
+    The function exists because capping the window multiplies the window count on exactly the
+    inputs it targets, and `predict_batch(batch_size=None)` would then put every window in one
+    forward pass. It caps only past a 2x blow-up, so the grid has to straddle that threshold --
+    a sample that missed it would pass against a port that always capped, or never did.
+    """
+    cases = []
+    for n_windows in (1, 2, 3, 5, 11, 29, 36, 100, 413):
+        for window in (23, 43, 64, 102, 312, 504):
+            for budget in (64, 312, 504):
+                for batch in (None, 0, -1, 1, 8):
+                    cases.append({
+                        "n_windows": n_windows, "window": window, "config_budget": budget,
+                        "batch_size": batch,
+                        "cap": window_batch_cap(n_windows, window, budget, batch),
+                    })
+    capped = sum(1 for c in cases if c["cap"] is not None and not c["batch_size"])
+    if capped == 0:
+        raise AssertionError(
+            "no grid point reached the capping branch, so these cases cannot tell a port that"
+            " caps from one that returns None every time")
+    return cases
+
 def _decoder_shape(tokenizer_json):
     """The decoder section's type chain, flattened, so the fixture says what it was recorded on."""
     import io
@@ -2432,6 +2655,7 @@ def _decoder_shape(tokenizer_json):
 
 
 FAMILIES = {
+    "window_plan.json": window_plan,
     "lang_tables.json": lang_tables,
     "lang_detect.json": lang_detect,
     "presets.json": presets,
