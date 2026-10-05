@@ -924,6 +924,12 @@ public final class Router implements AutoCloseable, Predictor {
             // The build itself runs outside `lock`, so routing and eviction are not stalled for
             // the seconds a cold checkpoint takes, and serialised by `buildLock` so two cold
             // loads do not hold two checkpoints in flight at once.
+            //
+            // Acquired INSIDE the outer try deliberately, which reads like the anti-pattern and
+            // is not: the handler below is what records the failure on `inflight` and counts its
+            // latch down, so a throw from the acquisition itself must still reach it or every
+            // waiter on this checkpoint parks forever. `buildLock` is not held on that path, so
+            // the finally that releases it is never reached with nothing to release.
             buildLock.lock();
             try {
                 lock.lock();
@@ -959,12 +965,24 @@ public final class Router implements AutoCloseable, Predictor {
                         evictLocked(toClose);
                     }
                 } finally {
-                    // ALWAYS, even if eviction threw. Skipping it left the new slot published
-                    // with a lease that nothing could release -- so the agent could never be
-                    // retired or closed -- and left every waiter parked on a latch for a
-                    // checkpoint that had in fact loaded.
-                    finish(checkpoint, inflight);
-                    lock.unlock();
+                    // `finish` ALWAYS, even if eviction threw. Skipping it left the new slot
+                    // published with a lease that nothing could release -- so the agent could
+                    // never be retired or closed -- and left every waiter parked on a latch for
+                    // a checkpoint that had in fact loaded.
+                    //
+                    // And `lock.unlock()` in a finally OF ITS OWN, because the two statements in
+                    // sequence did not deliver what that paragraph claims: `finish` dereferences
+                    // `inflight` and counts down its latch, so a throw from it skipped the unlock
+                    // and left `lock` held with no owner able to release it. Every later
+                    // `lock.lock()` would then block forever -- including the handler below that
+                    // exists to record the failure, so the router would wedge rather than report.
+                    // Found by CodeQL's unreleased-lock query, which sees the control flow a
+                    // pattern scanner cannot.
+                    try {
+                        finish(checkpoint, inflight);
+                    } finally {
+                        lock.unlock();
+                    }
                 }
                 if (duplicate) {
                     toClose.add(agent);
@@ -1170,8 +1188,8 @@ public final class Router implements AutoCloseable, Predictor {
             lock.unlock();
         }
         for (Checkpoint checkpoint : wanted) {
-            lock.lock();
             boolean already;
+            lock.lock();
             try {
                 already = slots.containsKey(checkpoint);
             } finally {
