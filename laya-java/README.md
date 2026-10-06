@@ -13,12 +13,13 @@ four questions about a document cost one batched encode rather than four round t
 Implemented: tokenizer, sequence builder, config, ONNX inference (fused or split graph), answer
 decoding, `predict`, `predictBatch`, usage and truncation reporting, script and language detection
 (`lang.LanguageDetection`), the question presets (`Presets`), the checkpoint `Router` with its
-load-and-evict lifecycle, the embedding `Shortlist` with its LRU cache, and the email cleaner
-and state builder (`LayaEmail`).
+load-and-evict lifecycle, the embedding `Shortlist` with its LRU cache, the email cleaner
+and state builder (`LayaEmail`), the abstention gate (`ConfidenceGate`), scanning a state longer
+than the context window (`predictLong`), and schema-driven decisions (`Decisions.decide` /
+`decideBatch`).
 
-Not implemented yet: hooks, `predictLong`, structured `decide`, the
-`laya-java-client` HTTP module, Android. **Not published to Maven Central** — see
-[Installing](#installing).
+Not implemented yet: hooks, the `laya-java-client` HTTP module, Android. **Not published to
+Maven Central** — see [Installing](#installing).
 
 ## Where to go next
 
@@ -320,6 +321,43 @@ A threshold is not a claim that the number is calibrated — "about c of the ans
 c are correct" holds only after temperatures have been fitted and validated for that checkpoint
 and question shape. Pass a `Map` instead of a scalar to gate each option-count bucket
 (`choice:2`, `score:6-10`, …) at the level its calibration actually earns.
+
+## Deciding against a JSON schema
+
+```java
+import com.convaiinnovations.laya.json.Json;
+
+Map<String, Object> schema = (Map<String, Object>) Json.parse("""
+    {"type": "object", "properties": {
+       "department":  {"enum": ["billing", "support", "sales"]},
+       "urgency":     {"type": "integer", "minimum": 1, "maximum": 5},
+       "needs_human": {"type": "boolean"}}}""");
+
+Decisions.Decision d = Decisions.decide(agent, ticket, schema, null, 0.8);
+Map<String, Object> values = d.values();      // {"department": "billing", "urgency": 4, ...}
+```
+
+An `enum` or a `const` becomes a `choice`, a `boolean` becomes a `noul`, a bounded `integer` or
+`number` becomes a `score`, and the answers come back as **the schema's own values**: the choice's
+value and not the label it was shown under, so `enum: [10, 20, 30]` decides to the integer `20`.
+`anyOf` / `oneOf` with one non-null branch is unwrapped (pydantic's `Optional`), a one-item
+`allOf` is unwrapped with the outer keys on top, and a local `$ref` is inlined.
+
+Anything that cannot be answered from a fixed option set — a free string, an array, a nested
+object, a union of two real types — is refused with a `SchemaException` **naming the path**, which
+is the only part of the message a caller holding a 32-property schema can act on.
+
+`minConfidence` wires straight into `ConfidenceGate`: a field whose answer falls below the bar
+comes back as `null`, and a field that was never answered is **absent** rather than null, because
+"not believed" and "not asked" are different outcomes. The gate's full report is on
+`d.gate()`. `Decisions.decideBatch(agent, states, schema)` does the same for many states in one
+batched call, in input order.
+
+`Decisions.questions(schema)` and `Decisions.answersToJson(answers, schema)` are the two halves on
+their own, for a caller that runs the model itself.
+
+There is no pydantic on the JVM, so only the JSON-schema path is ported; mapping Java records
+would be a new design rather than a port.
 
 ## A state longer than the context window
 

@@ -41,7 +41,7 @@ import java.util.Map;
  * <p>One session is not safe for concurrent {@code predict} calls unless ONNX Runtime is
  * configured for it; hold one {@code Agent} per worker, or serialise access.
  */
-public final class Agent implements AutoCloseable, Predictor {
+public final class Agent implements AutoCloseable, Predictor, BatchPredictor {
 
     private final Tokenizer tokenizer;
     private final AgentConfig config;
@@ -140,6 +140,7 @@ public final class Agent implements AutoCloseable, Predictor {
      * answer -- it only cuts padding -- but leaving it off keeps the batched path's grouping
      * predictable, and a caller who wants the throughput can ask for it.
      */
+    @Override
     public List<Prediction> predictBatch(List<?> states, Map<String, Question> questions) {
         return predictBatch(states, questions, null, 0, false);
     }

@@ -3069,6 +3069,605 @@ def confidence_gate():
             " the three states and the no-op" % (gated, len(GATE_STATES)))
     return {"states": list(GATE_STATES), "cases": cases, "refusals": refusals}
 
+#: Mirrored from `laya.structured` so the case lists below can be built at import time, which
+#: keeping this script's `laya` imports inside the builders requires. `structured()` asserts them
+#: against the reference, so a change there fails the generator rather than silently recording a
+#: boundary case that is no longer on the boundary.
+STRUCTURED_MAX_PROPERTIES = 32
+STRUCTURED_MAX_OPTIONS = 32
+STRUCTURED_MAX_SCORE_LEVELS = 10
+
+
+def _sd_answer(kind, **kw):
+    """One answer dict in the shape `predict` returns, with only the fields `_project` reads.
+
+    `action` and `legend` are carried because the Java side's typed `Answer` records require
+    them, not because the projection looks at either.
+    """
+    answer = {"type": kind,
+              "confidence": kw.get("confidence", 0.6),
+              "answer_confidence": kw.get("answer_confidence", 0.7),
+              "action": {"act_probability": kw.get("act", 0.2)}}
+    if kind == "choice":
+        answer["choice"] = kw["choice"]
+        answer["probabilities"] = kw.get("probabilities", {})
+    elif kind == "score":
+        answer["score"] = kw["score"]
+        answer["probabilities"] = kw.get("probabilities", {})
+        answer["legend"] = kw.get("legend", {})
+    else:
+        answer["noul"] = kw["noul"]
+    if kw.get("low_confidence"):
+        answer["low_confidence"] = True
+    return answer
+
+
+def _sd_enum(values, **extra):
+    prop = {"enum": list(values)}
+    prop.update(extra)
+    return prop
+
+
+#: `schema -> questions`. Each case is the schema and nothing else: what is recorded is what
+#: `questions_from_json_schema` makes of it, including the generated instruction wording and the
+#: criteria ORDER, which is positional in laya and therefore part of the question.
+STRUCTURED_SCHEMAS = [
+    ("enum-is-a-choice",
+     {"type": "object", "properties": {"dept": _sd_enum(["billing", "support", "sales"])}}),
+    ("enum-of-numbers-keeps-its-values",
+     {"type": "object", "properties": {"code": _sd_enum([10, 20, 30])}}),
+    ("enum-with-a-null-branch",
+     {"type": "object", "properties": {"tier": _sd_enum(["gold", None])}}),
+    ("const-is-a-one-option-choice",
+     {"type": "object", "properties": {"kind": {"const": "refund"}}}),
+    # `{"const": None}` is a KEY THAT IS PRESENT WITH A NULL VALUE, not an absent key. A port
+    # testing `prop.get("const") is not None` drops this field into the "unsupported schema"
+    # branch instead of asking about it.
+    ("const-null-is-still-a-const",
+     {"type": "object", "properties": {"kind": {"const": None}}}),
+    ("boolean-is-a-noul",
+     {"type": "object", "properties": {"needs_human": {"type": "boolean"}}}),
+    # An enum whose values are ALL bools is a noul, not a two-option choice: the labels would be
+    # "True"/"False" and the head would be asked a choice question about a boolean.
+    ("enum-of-booleans-is-a-noul",
+     {"type": "object", "properties": {"flag": _sd_enum([True, False])}}),
+    ("integer-is-a-score",
+     {"type": "object", "properties": {"urgency": {"type": "integer",
+                                                   "minimum": 1, "maximum": 5}}}),
+    ("number-with-integer-bounds-is-a-score",
+     {"type": "object", "properties": {"n": {"type": "number", "minimum": 0, "maximum": 2}}}),
+    ("score-from-zero",
+     {"type": "object", "properties": {"n": {"type": "integer", "minimum": 0, "maximum": 3}}}),
+    ("score-with-a-negative-minimum",
+     {"type": "object", "properties": {"n": {"type": "integer", "minimum": -2, "maximum": 2}}}),
+    ("score-of-one-level",
+     {"type": "object", "properties": {"n": {"type": "integer", "minimum": 7, "maximum": 7}}}),
+    ("description-replaces-the-generated-instruction",
+     {"type": "object", "properties": {
+         "dept": _sd_enum(["billing", "support"], description="Which desk owns this?"),
+         "ok": {"type": "boolean", "description": "Is the customer satisfied?"},
+         "n": {"type": "integer", "minimum": 1, "maximum": 3,
+               "description": "How loud is the complaint?"}}}),
+    # pydantic v2 renders `Optional[X]` as a two-branch anyOf with no top-level type.
+    ("anyof-optional-is-unwrapped",
+     {"type": "object", "properties": {
+         "dept": {"anyOf": [_sd_enum(["billing", "support"]), {"type": "null"}],
+                  "description": "pick a desk"}}}),
+    ("oneof-optional-is-unwrapped",
+     {"type": "object", "properties": {
+         "n": {"oneOf": [{"type": "integer", "minimum": 1, "maximum": 4}, {"type": "null"}]}}}),
+    # The outer description is carried onto the branch only when the branch has none.
+    ("anyof-branch-keeps-its-own-description",
+     {"type": "object", "properties": {
+         "dept": {"anyOf": [_sd_enum(["a", "b"], description="the branch's"), {"type": "null"}],
+                  "description": "the outer one"}}}),
+    ("nullable-type-list-is-unwrapped",
+     {"type": "object", "properties": {"dept": {"type": ["string", "null"],
+                                                "enum": ["billing", "support"]}}}),
+    ("nullable-integer-type-list",
+     {"type": "object", "properties": {"n": {"type": ["integer", "null"],
+                                             "minimum": 0, "maximum": 3}}}),
+    # pydantic v1 wraps a described `$ref` in a one-item allOf; the outer keys win.
+    ("allof-of-one-is-unwrapped-outer-keys-on-top",
+     {"type": "object",
+      "properties": {"dept": {"allOf": [{"$ref": "#/$defs/Desk"}], "description": "the field's"}},
+      "$defs": {"Desk": _sd_enum(["billing", "support"], description="An enumeration.")}}),
+    # "Outer keys on top" is only observable when the one-item `allOf` member and the outer
+    # object SHARE a key. With a bare `$ref` member they never do, so a port that let the member
+    # win passed that case -- measured, by a mutant that swapped the two and survived.
+    ("allof-of-one-inline-outer-keys-win",
+     {"type": "object", "properties": {
+         "dept": {"allOf": [_sd_enum(["a", "b"], description="the branch's")],
+                  "description": "the field's"}}}),
+    # The same rule for `$ref`: the property's own keys sit on top of the definition's, so a
+    # sibling `maximum` narrows the definition's range rather than being ignored.
+    ("ref-sibling-keys-beat-the-definition",
+     {"type": "object", "properties": {"n": {"$ref": "#/$defs/Scale", "maximum": 1}},
+      "$defs": {"Scale": {"type": "integer", "minimum": 0, "maximum": 3}}}),
+    # The definition's own description is DROPPED: pydantic fills it from the enum's docstring,
+    # which describes the type rather than asking about this field.
+    ("ref-into-defs-drops-the-definition-description",
+     {"type": "object", "properties": {"dept": {"$ref": "#/$defs/Desk"}},
+      "$defs": {"Desk": _sd_enum(["billing", "support"], description="An enumeration.")}}),
+    ("ref-into-definitions-draft-07",
+     {"type": "object", "properties": {"dept": {"$ref": "#/definitions/Desk"}},
+      "definitions": {"Desk": _sd_enum([1, 2, 3])}}),
+    ("ref-with-a-sibling-description",
+     {"type": "object",
+      "properties": {"dept": {"$ref": "#/$defs/Desk", "description": "the field's"}},
+      "$defs": {"Desk": _sd_enum(["billing", "support"])}}),
+    # A `$ref` the definition itself carries is an alias, followed by the caller's loop.
+    ("ref-alias-chain",
+     {"type": "object", "properties": {"dept": {"$ref": "#/$defs/Alias"}},
+      "$defs": {"Alias": {"$ref": "#/$defs/Desk"}, "Desk": _sd_enum(["billing", "support"])}}),
+    ("top-level-type-may-be-absent",
+     {"properties": {"ok": {"type": "boolean"}}}),
+    # Property order is the question order, and the criteria order is the option order.
+    ("property-order-is-preserved",
+     {"type": "object", "properties": {
+         "zebra": {"type": "boolean"}, "alpha": _sd_enum(["z", "a", "m"]),
+         "middle": {"type": "integer", "minimum": 0, "maximum": 1}}}),
+    ("max-options-boundary",
+     {"type": "object", "properties": {"c": _sd_enum([str(i) for i in range(STRUCTURED_MAX_OPTIONS)])}}),
+    ("max-score-levels-boundary",
+     {"type": "object", "properties": {"n": {"type": "integer", "minimum": 1,
+                                             "maximum": STRUCTURED_MAX_SCORE_LEVELS}}}),
+    ("max-properties-boundary",
+     {"type": "object",
+      "properties": {"p%02d" % i: {"type": "boolean"} for i in range(STRUCTURED_MAX_PROPERTIES)}}),
+]
+
+#: `answers -> schema values`. The schema is carried with each case because the projection is a
+#: function of BOTH: a choice maps back through its options and a score adds its `minimum`.
+STRUCTURED_PROJECTIONS = [
+    # The schema VALUE, not the label the model answered with. A port returning the label is
+    # indistinguishable here for a string enum and wrong for every other value type.
+    ("choice-returns-the-value-not-the-label",
+     {"type": "object", "properties": {"code": _sd_enum([10, 20, 30])}},
+     {"code": _sd_answer("choice", choice="20",
+                         probabilities={"10": 0.1, "20": 0.8, "30": 0.1})}),
+    ("choice-value-and-label-coincide-for-a-string-enum",
+     {"type": "object", "properties": {"dept": _sd_enum(["billing", "support"])}},
+     {"dept": _sd_answer("choice", choice="support",
+                         probabilities={"billing": 0.3, "support": 0.7})}),
+    ("const-projects-to-the-const-value",
+     {"type": "object", "properties": {"kind": {"const": 7}}},
+     {"kind": _sd_answer("choice", choice="7", probabilities={"7": 1.0})}),
+    ("choice-null-value",
+     {"type": "object", "properties": {"tier": _sd_enum(["gold", None])}},
+     {"tier": _sd_answer("choice", choice="null",
+                         probabilities={"gold": 0.2, "null": 0.8})}),
+    # A label no option carries comes back as the label itself rather than raising -- the model
+    # is constrained to the options, so this is a contract for a hand-built answer.
+    ("choice-unknown-label-falls-back-to-the-label",
+     {"type": "object", "properties": {"code": _sd_enum([10, 20])}},
+     {"code": _sd_answer("choice", choice="99", probabilities={"10": 0.5, "20": 0.5})}),
+    # argmax over the probabilities, plus `minimum`. `score` itself is ignored when they exist,
+    # and it is set here to a level that disagrees so a port reading it is caught.
+    ("score-is-argmax-plus-minimum",
+     {"type": "object", "properties": {"urgency": {"type": "integer",
+                                                   "minimum": 1, "maximum": 5}}},
+     {"urgency": _sd_answer("score", score=0.9,
+                            probabilities={"0": 0.1, "1": 0.1, "2": 0.6, "3": 0.1, "4": 0.1})}),
+    ("score-argmax-with-a-zero-minimum",
+     {"type": "object", "properties": {"n": {"type": "integer", "minimum": 0, "maximum": 3}}},
+     {"n": _sd_answer("score", score=0.0,
+                      probabilities={"0": 0.1, "1": 0.2, "2": 0.1, "3": 0.6})}),
+    ("score-argmax-with-a-negative-minimum",
+     {"type": "object", "properties": {"n": {"type": "integer", "minimum": -2, "maximum": 2}}},
+     {"n": _sd_answer("score", score=4.0,
+                      probabilities={"0": 0.6, "1": 0.1, "2": 0.1, "3": 0.1, "4": 0.1})}),
+    # A tie takes the FIRST level, because `max` over the index range keeps the earliest.
+    ("score-argmax-tie-takes-the-first-level",
+     {"type": "object", "properties": {"n": {"type": "integer", "minimum": 1, "maximum": 3}}},
+     {"n": _sd_answer("score", score=2.0, probabilities={"0": 0.4, "1": 0.4, "2": 0.2})}),
+    # With no probabilities the fallback rounds `score`, which is already a 0-based LEVEL INDEX
+    # -- so `minimum` is added once and never subtracted first.
+    ("score-without-probabilities-rounds",
+     {"type": "object", "properties": {"n": {"type": "integer", "minimum": 3, "maximum": 7}}},
+     {"n": _sd_answer("score", score=2.4, probabilities={})}),
+    # Python's `round` is half to EVEN. `Math.round` is half up and gives 3 here.
+    ("score-without-probabilities-rounds-half-to-even",
+     {"type": "object", "properties": {"n": {"type": "integer", "minimum": -2, "maximum": 2}}},
+     {"n": _sd_answer("score", score=2.5, probabilities={})}),
+    ("score-without-probabilities-rounds-half-to-even-odd-case",
+     {"type": "object", "properties": {"n": {"type": "integer", "minimum": -2, "maximum": 2}}},
+     {"n": _sd_answer("score", score=1.5, probabilities={})}),
+    # Exactly 0.5 is TRUE: the comparison is `>=`, so a port spelling it `>` flips this one case
+    # and no other.
+    ("noul-exactly-half-is-true",
+     {"type": "object", "properties": {"ok": {"type": "boolean"}}},
+     {"ok": _sd_answer("noul", noul=0.5)}),
+    ("noul-just-below-half-is-false",
+     {"type": "object", "properties": {"ok": {"type": "boolean"}}},
+     {"ok": _sd_answer("noul", noul=0.49999999999999994)}),
+    ("noul-true",
+     {"type": "object", "properties": {"ok": {"type": "boolean"}}},
+     {"ok": _sd_answer("noul", noul=0.93)}),
+    # A flagged answer is NULL, whatever it said. Null, not absent: the field was asked.
+    ("low-confidence-choice-is-null",
+     {"type": "object", "properties": {"dept": _sd_enum(["billing", "support"])}},
+     {"dept": _sd_answer("choice", choice="support", low_confidence=True,
+                         probabilities={"billing": 0.3, "support": 0.7})}),
+    ("low-confidence-score-is-null",
+     {"type": "object", "properties": {"n": {"type": "integer", "minimum": 1, "maximum": 3}}},
+     {"n": _sd_answer("score", score=1.0, low_confidence=True,
+                      probabilities={"0": 0.2, "1": 0.7, "2": 0.1})}),
+    ("low-confidence-noul-is-null",
+     {"type": "object", "properties": {"ok": {"type": "boolean"}}},
+     {"ok": _sd_answer("noul", noul=0.93, low_confidence=True)}),
+    # An ABSENT answer is absent from the values. Different from a flagged one, which is null:
+    # "the model was not asked" and "the model was not believed" are not the same outcome.
+    ("an-unanswered-field-is-omitted-not-null",
+     {"type": "object", "properties": {"dept": _sd_enum(["billing", "support"]),
+                                       "ok": {"type": "boolean"}}},
+     {"ok": _sd_answer("noul", noul=0.8)}),
+    ("every-kind-at-once",
+     {"type": "object", "properties": {
+         "dept": _sd_enum(["billing", "support"]),
+         "urgency": {"type": "integer", "minimum": 1, "maximum": 5},
+         "needs_human": {"type": "boolean"}}},
+     {"dept": _sd_answer("choice", choice="billing",
+                         probabilities={"billing": 0.9, "support": 0.1}),
+      "urgency": _sd_answer("score", score=3.0,
+                            probabilities={"0": 0.0, "1": 0.1, "2": 0.1, "3": 0.7, "4": 0.1}),
+      "needs_human": _sd_answer("noul", noul=0.2)}),
+]
+
+#: Every schema the mapping refuses, and the message a caller reads. The message is the contract
+#: here: it names the path, which is the only thing that makes a 32-field schema debuggable.
+STRUCTURED_REFUSALS = [
+    ("free-string", {"type": "object", "properties": {"note": {"type": "string"}}}),
+    ("array", {"type": "object",
+               "properties": {"tags": {"type": "array", "items": {"type": "string"}}}}),
+    ("nested-object", {"type": "object",
+                       "properties": {"inner": {"type": "object",
+                                                "properties": {"a": {"type": "boolean"}}}}}),
+    ("union-of-two-real-types",
+     {"type": "object", "properties": {"x": {"anyOf": [{"type": "string"},
+                                                       {"type": "integer"}]}}}),
+    ("union-of-null-only",
+     {"type": "object", "properties": {"x": {"anyOf": [{"type": "null"}]}}}),
+    ("oneof-of-two-real-types",
+     {"type": "object", "properties": {"x": {"oneOf": [{"type": "boolean"},
+                                                       {"type": "integer"}]}}}),
+    ("type-list-with-two-non-null-types",
+     {"type": "object", "properties": {"x": {"type": ["string", "integer"]}}}),
+    ("top-level-is-an-array", {"type": "array", "items": {"type": "string"}}),
+    ("top-level-has-no-properties", {"type": "object"}),
+    # Both halves of the top-level test, separately. Every other case here is missing
+    # `properties` as well as having the wrong `type`, so a port that dropped the type check
+    # entirely still refused all of them -- measured, by a mutant that did exactly that.
+    ("top-level-type-is-wrong-but-properties-is-there",
+     {"type": "array", "properties": {"ok": {"type": "boolean"}}}),
+    ("top-level-is-a-string-schema", {"type": "string"}),
+    ("empty-properties", {"type": "object", "properties": {}}),
+    ("properties-is-not-an-object", {"type": "object", "properties": []}),
+    ("too-many-properties",
+     {"type": "object",
+      "properties": {"p%02d" % i: {"type": "boolean"} for i in range(STRUCTURED_MAX_PROPERTIES + 1)}}),
+    ("too-many-options",
+     {"type": "object",
+      "properties": {"c": _sd_enum([str(i) for i in range(STRUCTURED_MAX_OPTIONS + 1)])}}),
+    ("empty-enum", {"type": "object", "properties": {"c": _sd_enum([])}}),
+    ("duplicate-choice-labels", {"type": "object", "properties": {"c": _sd_enum(["1", 1])}}),
+    ("numeric-without-bounds", {"type": "object", "properties": {"n": {"type": "integer"}}}),
+    ("numeric-with-float-bounds",
+     {"type": "object", "properties": {"n": {"type": "number",
+                                             "minimum": 0.5, "maximum": 1.5}}}),
+    ("maximum-below-minimum",
+     {"type": "object", "properties": {"n": {"type": "integer",
+                                             "minimum": 5, "maximum": 1}}}),
+    ("too-many-score-levels",
+     {"type": "object", "properties": {"n": {"type": "integer", "minimum": 0,
+                                             "maximum": STRUCTURED_MAX_SCORE_LEVELS}}}),
+    ("empty-property-schema", {"type": "object", "properties": {"c": {}}}),
+    ("property-is-not-an-object", {"type": "object", "properties": {"c": "nope"}}),
+    ("unresolvable-ref",
+     {"type": "object", "properties": {"c": {"$ref": "#/$defs/Missing"}}, "$defs": {}}),
+    ("remote-ref",
+     {"type": "object", "properties": {"c": {"$ref": "https://example.test/Desk"}}}),
+    ("recursive-ref",
+     {"type": "object", "properties": {"c": {"$ref": "#/$defs/Node"}},
+      "$defs": {"Node": {"$ref": "#/$defs/Node"}}}),
+]
+
+
+def _structured_runner(results):
+    """A runner that answers from a script, so `decide` is exercised without a checkpoint.
+
+    It accepts and records `**kwargs`, which is how the reference's `min_confidence` forwarding
+    stays visible: `decide` passes it down to `predict` and `decide_batch` does not.
+    """
+    import copy
+
+    class _Scripted:
+        def __init__(self):
+            self.predict_kwargs = []
+            self.batch_kwargs = []
+
+        def predict(self, state, questions, **kwargs):
+            self.predict_kwargs.append(sorted(kwargs))
+            return copy.deepcopy(results[0])
+
+        def predict_batch(self, states, questions, **kwargs):
+            self.batch_kwargs.append(sorted(kwargs))
+            return [copy.deepcopy(results[i]) for i in range(len(states))]
+
+    return _Scripted()
+
+
+def _structured_result(answers):
+    return {"model": "laya-rl-agent-onnx", "answers": answers,
+            "usage": {"input_tokens": 12, "output_tokens": 0, "state_tokens": 9,
+                      "state_tokens_dropped": 0, "truncated": False,
+                      "truncated_questions": []}}
+
+
+#: End-to-end `decide` / `decide_batch`: the answers a runner returns, and the decision that
+#: comes back. `min_confidence` is the wiring these pin -- the gate decides which fields are
+#: nulled, and the port must read the gate rather than re-implementing the rule.
+STRUCTURED_CALLS = [
+    ("decide-ungated", False,
+     {"type": "object", "properties": {"dept": _sd_enum(["billing", "support"]),
+                                       "ok": {"type": "boolean"}}}, None,
+     [{"dept": _sd_answer("choice", choice="support", answer_confidence=0.9,
+                          probabilities={"billing": 0.3, "support": 0.7}),
+       "ok": _sd_answer("noul", noul=0.9, answer_confidence=0.55)}]),
+    # One field below the bar and one above it, in the same decision: the gate is per answer,
+    # so a port that nulls all or nothing passes neither half of this.
+    ("decide-gated-nulls-only-the-field-below-the-bar", False,
+     {"type": "object", "properties": {"dept": _sd_enum(["billing", "support"]),
+                                       "ok": {"type": "boolean"}}}, 0.6,
+     [{"dept": _sd_answer("choice", choice="support", answer_confidence=0.9,
+                          probabilities={"billing": 0.3, "support": 0.7}),
+       "ok": _sd_answer("noul", noul=0.9, answer_confidence=0.55)}]),
+    ("decide-gated-nulls-everything", False,
+     {"type": "object", "properties": {"dept": _sd_enum(["billing", "support"]),
+                                       "ok": {"type": "boolean"}}}, 0.95,
+     [{"dept": _sd_answer("choice", choice="support", answer_confidence=0.9,
+                          probabilities={"billing": 0.3, "support": 0.7}),
+       "ok": _sd_answer("noul", noul=0.9, answer_confidence=0.55)}]),
+    # A scalar 0.0 IS a gate: states are reported and nothing is nulled.
+    ("decide-gated-at-zero-nulls-nothing", False,
+     {"type": "object", "properties": {"dept": _sd_enum(["billing", "support"])}}, 0.0,
+     [{"dept": _sd_answer("choice", choice="billing", answer_confidence=0.1,
+                          probabilities={"billing": 0.6, "support": 0.4})}]),
+    # A noul reports the two-sided distribution it implies, ROUNDED to four decimals as every
+    # other number in an answer is. 0.123456 is chosen so the rounding is visible: unrounded the
+    # sides are 0.876544 and 0.123456, which differ from the recorded 0.8765 and 0.1235 by 4.4e-5
+    # -- a gap a tolerance can see, where 0.9 would hide it at 1e-17.
+    ("decide-rounds-the-nouls-two-sided-distribution", False,
+     {"type": "object", "properties": {"ok": {"type": "boolean"}}}, None,
+     [{"ok": _sd_answer("noul", noul=0.123456, answer_confidence=0.88)}]),
+    ("decide-batch-keeps-input-order", True,
+     {"type": "object", "properties": {"n": {"type": "integer", "minimum": 1, "maximum": 3}}},
+     None,
+     [{"n": _sd_answer("score", score=0.0, probabilities={"0": 0.8, "1": 0.1, "2": 0.1})},
+      {"n": _sd_answer("score", score=1.0, probabilities={"0": 0.1, "1": 0.8, "2": 0.1})},
+      {"n": _sd_answer("score", score=2.0, probabilities={"0": 0.1, "1": 0.1, "2": 0.8})}]),
+    ("decide-batch-gates-each-state-on-its-own", True,
+     {"type": "object", "properties": {"dept": _sd_enum(["billing", "support"]),
+                                       "ok": {"type": "boolean"}}}, 0.5,
+     [{"dept": _sd_answer("choice", choice="support", answer_confidence=0.9,
+                          probabilities={"billing": 0.3, "support": 0.7}),
+       "ok": _sd_answer("noul", noul=0.9, answer_confidence=0.55)},
+      {"dept": _sd_answer("choice", choice="billing", answer_confidence=0.4,
+                          probabilities={"billing": 0.6, "support": 0.4}),
+       "ok": _sd_answer("noul", noul=0.2, answer_confidence=0.55)}]),
+]
+
+
+def structured():
+    """`laya.structured`: a JSON schema as questions, and the answers projected back onto it.
+
+    Four things a port gets wrong by default, and each has cases chosen so that getting it wrong
+    changes something here:
+
+      * a `choice` projects to the schema VALUE, not the label the model answered with. For a
+        string enum the two coincide, so `enum: [10, 20, 30]` is what tells them apart.
+      * a `score` is `minimum + argmax(probabilities)`. `score` itself is the probability-weighted
+        LEVEL INDEX, so the fallback for an answer with no probabilities rounds it and adds
+        `minimum` once -- subtracting `minimum` first and adding it back cancels out and silently
+        drops it. Python's `round` is half to EVEN, which `Math.round` is not.
+      * a `noul` is `>= 0.5`, so exactly 0.5 is TRUE and a port spelling it `>` differs on that
+        one value and no other.
+      * a low-confidence answer projects to NULL, and an UNANSWERED field is absent instead.
+        "not believed" and "not asked" are different outcomes and a port that conflates them
+        reports a decision nobody made.
+
+    The pydantic half of the module is deliberately NOT recorded: there is no pydantic on the
+    JVM, and `_schema_of` is the only thing between a model and the JSON-schema path this
+    records.
+    """
+    import copy
+
+    from laya import structured as reference
+    from laya.structured import (SchemaError, answers_to_json, decide, decide_batch,
+                                 plan_from_json_schema, questions_from_json_schema)
+
+    # The mirrored limits above are only safe if they are still the reference's.
+    limits = {"max_properties": reference.MAX_PROPERTIES,
+              "max_options": reference.MAX_OPTIONS,
+              "max_score_levels": reference.MAX_SCORE_LEVELS}
+    mirrored = {"max_properties": STRUCTURED_MAX_PROPERTIES,
+                "max_options": STRUCTURED_MAX_OPTIONS,
+                "max_score_levels": STRUCTURED_MAX_SCORE_LEVELS}
+    if limits != mirrored:
+        raise AssertionError(
+            "the mirrored limits %r are no longer laya.structured's %r, so every boundary case"
+            " below is recorded off the boundary" % (mirrored, limits))
+
+    schemas = []
+    for cid, schema in STRUCTURED_SCHEMAS:
+        plan = plan_from_json_schema(schema)
+        schemas.append({
+            "case": cid,
+            "schema": schema,
+            "questions": questions_from_json_schema(schema),
+            # The plan as well as the questions: the OPTION VALUES and the score `minimum` never
+            # reach a question, and they are exactly what the projection needs. A fixture that
+            # recorded only the questions would leave both unpinned until a projection case
+            # happened to cover them.
+            "plan": [{"name": f.name, "kind": f.kind,
+                      "options": [[label, value] for label, value in f.options],
+                      "minimum": f.minimum} for f in plan],
+        })
+
+    projections = []
+    for cid, schema, answers in STRUCTURED_PROJECTIONS:
+        projections.append({"case": cid, "schema": schema, "answers": answers,
+                            "values": answers_to_json(answers, schema)})
+
+    refusals = []
+    for cid, schema in STRUCTURED_REFUSALS:
+        try:
+            questions_from_json_schema(schema)
+        except SchemaError as problem:
+            refusals.append({"case": cid, "schema": schema, "error": str(problem)})
+        else:
+            raise AssertionError("%s was supposed to be refused and was not" % cid)
+
+    # `decide` itself: exactly one of schema/questions, and a batch over a real sequence.
+    arguments = []
+    for cid, call in (
+            ("decide-with-both", lambda: decide(None, "s", schema={"type": "object"},
+                                                questions={})),
+            ("decide-with-neither", lambda: decide(None, "s")),
+            ("decide-batch-with-both",
+             lambda: decide_batch(None, ["s"], schema={"type": "object"}, questions={})),
+            ("decide-batch-with-neither", lambda: decide_batch(None, ["s"])),
+            ("decide-batch-over-a-string",
+             lambda: decide_batch(None, "not a list", schema={"type": "object"})),
+            ("decide-batch-without-a-batching-runner",
+             lambda: decide_batch(object(), ["s"],
+                                  schema={"type": "object",
+                                          "properties": {"ok": {"type": "boolean"}}})),
+    ):
+        try:
+            call()
+        except (ValueError, TypeError) as problem:
+            arguments.append({"case": cid, "error": str(problem)})
+        else:
+            raise AssertionError("%s was supposed to be refused and was not" % cid)
+
+    calls = []
+    for cid, batch, schema, threshold, scripted in STRUCTURED_CALLS:
+        runner = _structured_runner([_structured_result(a) for a in scripted])
+        states = ["state %d" % i for i in range(len(scripted))]
+        if batch:
+            decisions = decide_batch(runner, states, schema=schema, return_details=True,
+                                     min_confidence=threshold)
+        else:
+            decisions = [decide(runner, states[0], schema=schema, return_details=True,
+                                min_confidence=threshold)]
+        calls.append({
+            "case": cid,
+            "batch": batch,
+            "schema": schema,
+            "min_confidence": threshold,
+            # The answers the runner HANDED BACK, before the gate wrote anything into them --
+            # which is what a port has to feed its own runner stub.
+            "predictions": copy.deepcopy(scripted),
+            "decisions": [{"values": d.values,
+                           "confidence": d.confidence,
+                           "answer_confidence": d.answer_confidence,
+                           "probabilities": d.probabilities} for d in decisions],
+            # `decide` forwards `min_confidence` to `predict`; `decide_batch` applies the gate
+            # itself and forwards nothing. Recorded because a port whose runner has no such
+            # keyword must take the second path for both, and this is what says so.
+            "forwarded": sorted(set(sum(runner.predict_kwargs + runner.batch_kwargs, []))),
+        })
+
+    # Coverage. Each of these is a branch of the mapping, and a case list that stops reaching one
+    # leaves that branch asserted by nothing -- which is how a fixture family quietly stops being
+    # a gate.
+    kinds = {f["kind"] for case in schemas for f in case["plan"]}
+    missing_kinds = {"choice", "score", "noul"} - kinds
+    if missing_kinds:
+        raise AssertionError("no schema case produces a %s question"
+                             % ", ".join(sorted(missing_kinds)))
+    required_messages = [
+        "a free string cannot be a fixed option set",
+        "arrays are not supported",
+        "nested objects are not supported",
+        "only 'Optional[...]' unions (one non-null branch) are supported",
+        "'type' has multiple non-null types",
+        "the top level must be an object with 'properties'",
+        "'properties' must be a non-empty object",
+        "exceeds MAX_PROPERTIES=%d" % STRUCTURED_MAX_PROPERTIES,
+        "exceeds MAX_OPTIONS=%d" % STRUCTURED_MAX_OPTIONS,
+        "exceeds MAX_SCORE_LEVELS=%d" % STRUCTURED_MAX_SCORE_LEVELS,
+        "'enum' must not be empty",
+        "duplicate choice labels",
+        "needs integer 'minimum' and 'maximum'",
+        "is below 'minimum'",
+        "unsupported schema",
+        "property must be an object",
+        "is recursive",
+        "does not resolve to an entry",
+    ]
+    recorded = [r["error"] for r in refusals]
+    unreached = [m for m in required_messages if not any(m in e for e in recorded)]
+    if unreached:
+        raise AssertionError("no refusal case reaches: %s" % "; ".join(unreached))
+
+    projected = [v for case in projections for v in case["values"].values()]
+    omitted = sum(1 for case in projections
+                  if set(case["schema"]["properties"]) - set(case["values"]))
+    # A null from a FLAG and a null that is the schema's own value are different branches.
+    nulled = sum(1 for case in projections for name, value in case["values"].items()
+                 if value is None and case["answers"][name].get("low_confidence"))
+    null_valued = sum(1 for case in projections for name, value in case["values"].items()
+                      if value is None and not case["answers"][name].get("low_confidence"))
+    booleans = sum(1 for v in projected if isinstance(v, bool))
+    integers = sum(1 for v in projected if isinstance(v, int) and not isinstance(v, bool))
+    relabelled = sum(1 for case in projections
+                     for name, value in case["values"].items()
+                     if isinstance(value, int) and not isinstance(value, bool)
+                     and case["answers"][name]["type"] == "choice")
+    no_probability_scores = sum(1 for case in projections
+                                for answer in case["answers"].values()
+                                if answer["type"] == "score" and not answer["probabilities"])
+    shifted = sum(1 for case in projections
+                  for name in case["values"]
+                  if case["answers"][name]["type"] == "score"
+                  and case["schema"]["properties"][name].get("minimum") not in (0, None))
+    half = sum(1 for case in projections
+               for answer in case["answers"].values()
+               if answer.get("noul") == 0.5)
+    shortfalls = [name for name, count, floor in (
+        ("a null from a low-confidence answer", nulled, 3),
+        ("an omitted field", omitted, 1),
+        ("a schema whose own value is null", null_valued, 1),
+        ("a boolean", booleans, 4),
+        ("an integer level", integers, 7),
+        ("a choice whose VALUE is not its label", relabelled, 2),
+        ("a score with no probabilities", no_probability_scores, 3),
+        ("a score whose minimum is not zero", shifted, 4),
+        ("a noul of exactly 0.5", half, 1),
+    ) if count < floor]
+    if shortfalls:
+        raise AssertionError("the projection cases no longer reach: %s" % "; ".join(shortfalls))
+
+    gated_nulls = sum(1 for case in calls for d in case["decisions"]
+                      for v in d["values"].values() if v is None)
+    batched = sum(1 for case in calls if case["batch"])
+    if gated_nulls < 3 or batched < 2 or len(arguments) < 4:
+        raise AssertionError(
+            "the end-to-end cases no longer pin the wiring: %d gated null(s), %d batch case(s),"
+            " %d argument refusal(s)" % (gated_nulls, batched, len(arguments)))
+
+    return {
+        "limits": limits,
+        "schemas": schemas,
+        "projections": projections,
+        "refusals": refusals,
+        "arguments": arguments,
+        "calls": calls,
+    }
+
+
 def _decoder_shape(tokenizer_json):
     """The decoder section's type chain, flattened, so the fixture says what it was recorded on."""
     import io
@@ -3090,6 +3689,7 @@ def _decoder_shape(tokenizer_json):
 
 
 FAMILIES = {
+    "structured.json": structured,
     "confidence_gate.json": confidence_gate,
     "predict_long.json": predict_long_scan,
     "window_plan.json": window_plan,
