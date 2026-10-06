@@ -35,7 +35,8 @@ public final class HookRegistry {
 
     /** Installs one hook. Returns this, for chaining. */
     public HookRegistry addHook(Hook hook) {
-        return addHooks(List.of(hook));
+        // Hooks.singleton, not List.of: see that method for why a null has to reach normalise.
+        return addHooks(Hooks.singleton(hook));
     }
 
     /** Installs several hooks, in order. Returns this, for chaining. */
@@ -121,10 +122,14 @@ public final class HookRegistry {
          *
          * <p>The scan runs BACKWARDS, taking the most recent match, because installation
          * appends and a hook that was already there sits earlier than this scope's copy of it.
-         * That direction is fidelity to the reference and nothing more: the copies are the same
-         * object, so the list left behind is identical either way and no test can tell the two
-         * apart. Measured, not assumed — reversing the loop survives the whole suite. What IS
-         * observable, and is pinned, is that only ONE copy goes.
+         * That is the reference's direction, and it is OBSERVABLE — an earlier version of this
+         * paragraph claimed it was not, on the grounds that the copies are the same object. They
+         * are, so the MULTISET left behind is identical either way; the ORDER is not, and order
+         * is the one thing about a hook list that is a contract. With {@code addHook(a)},
+         * {@code addHook(x)} and then {@code hooksInstalled(a)} the list is {@code [a, x, a]}:
+         * dropping the last match leaves {@code [a, x]} and dropping the first leaves
+         * {@code [x, a]}, so a forward scan would reorder two hooks the caller installed itself
+         * and change which one sees the other's work. A test pins the direction.
          *
          * <p>Idempotent, as {@link AutoCloseable} asks: closing twice would otherwise take a
          * second copy that belongs to someone else.

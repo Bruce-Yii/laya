@@ -5,6 +5,7 @@ import com.convaiinnovations.laya.Question;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.locks.Lock;
 import java.util.function.Consumer;
@@ -91,8 +92,18 @@ public final class Hooks {
      * its budget dropped and which question was blamed. This is the sum over the call, which is
      * the only number a hook can report without re-deriving per-state attribution the reference
      * does not give it either.
+     *
+     * <p>{@code long}, not {@code int}, and that is a DELIBERATE DIVERGENCE from the reference's
+     * shape rather than a transcription slip. A {@link com.convaiinnovations.laya.Usage} counts
+     * one state in an {@code int}; summing those into an {@code int} wraps silently, and the
+     * wrap was measured — three results of 1,000,000,000 input tokens each totalled
+     * {@code -1294967296}. The reference cannot produce that number, because a Python
+     * {@code int} does not overflow, so a port that reported it would be the only one of the two
+     * runtimes lying to a metering hook about what a call cost. A {@code long} holds the sum of
+     * {@link Integer#MAX_VALUE} over more than four billion results, which is past the point
+     * where the batch itself is the problem.
      */
-    public record Totals(int inputTokens, int outputTokens) {
+    public record Totals(long inputTokens, long outputTokens) {
     }
 
     /**
@@ -177,33 +188,69 @@ public final class Hooks {
      */
     public static Hook onPredictStart(Consumer<PredictContext> callback) {
         requireCallback(callback, "onPredictStart");
-        return new Hook() {
-            @Override
-            public void onPredictStart(PredictContext ctx) {
-                callback.accept(ctx);
-            }
-
-            @Override
-            public String toString() {
-                return "onPredictStart(" + callback + ")";
-            }
-        };
+        return new _StartAdapter(callback);
     }
 
     /** Wraps a hook object around a plain {@code onPredictEnd} callback. */
     public static Hook onPredictEnd(Consumer<PredictContext> callback) {
         requireCallback(callback, "onPredictEnd");
-        return new Hook() {
-            @Override
-            public void onPredictEnd(PredictContext ctx) {
-                callback.accept(ctx);
-            }
+        return new _EndAdapter(callback);
+    }
 
-            @Override
-            public String toString() {
-                return "onPredictEnd(" + callback + ")";
-            }
-        };
+    /**
+     * The reference's {@code _StartAdapter}, name included.
+     *
+     * <p>A leading underscore is not a Java convention and this is the only place in the port
+     * that uses one. It is here because the class name is DATA: {@link #dispatch} and
+     * {@link #call} quote it in the two lines they report, the reference quotes
+     * {@code type(hook).__name__} and {@code method.__qualname__} in the same two, and
+     * {@link #call} promises a caller grepping their logs across the runtimes finds the same
+     * text. These two adapters are the advertised low-friction way to add one callback, so they
+     * are the hooks most likely to be the ones named in a failure line.
+     *
+     * <p>A NAMED class rather than the anonymous one this was: {@link Class#getSimpleName} of an
+     * anonymous class is the EMPTY STRING, so both lines read {@code laya: hook .on_predict_start
+     * exceeded 0.05s} — a blank where the reference puts {@code _StartAdapter.on_predict_start}.
+     * The hook a {@code raiseErrors(false)} policy exists to protect is a telemetry hook, and it
+     * could not be identified from its own failure line.
+     */
+    private static final class _StartAdapter implements Hook {
+
+        private final Consumer<PredictContext> callback;
+
+        _StartAdapter(Consumer<PredictContext> callback) {
+            this.callback = callback;
+        }
+
+        @Override
+        public void onPredictStart(PredictContext ctx) {
+            callback.accept(ctx);
+        }
+
+        @Override
+        public String toString() {
+            return "onPredictStart(" + callback + ")";
+        }
+    }
+
+    /** The reference's {@code _EndAdapter}, name included — see {@link _StartAdapter}. */
+    private static final class _EndAdapter implements Hook {
+
+        private final Consumer<PredictContext> callback;
+
+        _EndAdapter(Consumer<PredictContext> callback) {
+            this.callback = callback;
+        }
+
+        @Override
+        public void onPredictEnd(PredictContext ctx) {
+            callback.accept(ctx);
+        }
+
+        @Override
+        public String toString() {
+            return "onPredictEnd(" + callback + ")";
+        }
     }
 
     private static void requireCallback(Consumer<PredictContext> callback, String name) {
@@ -293,14 +340,37 @@ public final class Hooks {
         }
     }
 
-    /** Appends one hook to the process-wide defaults. */
+    /**
+     * Appends one hook to the process-wide defaults.
+     *
+     * <p>Process-wide and mutable, with no automatic restore: whatever is set here applies to
+     * every agent in the JVM until something clears it. A test that sets a default and does not
+     * clear it in teardown pollutes every test that runs after it, and the pollution surfaces as
+     * a failure somewhere else. {@link #clearDefaultHooks} in an {@code @AfterEach} is the whole
+     * discipline, and this port's own suites do exactly that.
+     */
     public static void addDefaultHook(Hook hook) {
-        List<Hook> normalised = normalise(List.of(hook), null, null);
+        List<Hook> normalised = normalise(singleton(hook), null, null);
         synchronized (DEFAULTS_MUTEX) {
             List<Hook> grown = new ArrayList<>(defaults);
             grown.addAll(normalised);
             defaults = List.copyOf(grown);
         }
+    }
+
+    /**
+     * A one-element list that tolerates null, so {@link #normalise} is what refuses it.
+     *
+     * <p>{@code List.of(hook)} would throw a bare {@link NullPointerException} from inside the
+     * JDK first, which made the "a hooks entry must not be null" message unreachable from every
+     * single-hook entry point — {@link #addDefaultHook}, {@link HookRegistry#addHook} and
+     * {@link HookCall#andThen} — and handed the caller a stack trace naming neither the argument
+     * nor what was wrong with it.
+     */
+    static List<Hook> singleton(Hook hook) {
+        List<Hook> one = new ArrayList<>(1);
+        one.add(hook);
+        return one;
     }
 
     /** Removes every process-wide default hook. */
@@ -323,16 +393,32 @@ public final class Hooks {
      * {@code -Werror} needs {@code @SuppressWarnings("try")} on the enclosing method. That is a
      * known javac wart about the idiom, not about this method.
      *
+     * <p>The scopes NEST. Closing one restores the value it found, not {@code false}, so an
+     * inner scope closing does not switch the defaults back on inside an outer one that is still
+     * open. That is the reference's {@code _SKIP_DEFAULTS.reset(token)}, which nests by
+     * construction; a {@link ThreadLocal} has no token, so the captured value is the token.
+     *
      * <p>This is the reference's {@code _SKIP_DEFAULTS}, which a router enters so that a scan
      * made of many internal predictions fires a process-wide hook once for the scan rather than
      * once per forward pass. There it is a {@code contextvars.ContextVar} and here it is a
      * {@link ThreadLocal}, and the difference is real: a {@code ContextVar} is copied into an
      * asyncio task, while a {@code ThreadLocal} is not inherited by a thread the scope starts.
-     * Work handed to another thread inside the scope therefore sees the defaults again. Nothing
-     * in this port dispatches hooks off the calling thread, so there is nowhere for that to bite
-     * today — it is written down because the first code that does will be surprised otherwise.
+     * Work handed to another thread inside the scope therefore sees the defaults again.
+     *
+     * <p>One place in this port DOES run a hook off the calling thread — {@link Policy#timeout}
+     * runs each hook on a {@code laya-hook-timeout} thread so the wait can be bounded — and an
+     * earlier version of this paragraph said there was no such place. It still does not bite,
+     * but for a different reason than "there is nowhere for it to": this flag is read by
+     * {@link #compose}, on the calling thread, before anything is dispatched, so the hook thread
+     * never consults it. The reference copies the whole context into its runner thread
+     * ({@code contextvars.copy_context()}) rather than relying on that, which is why a
+     * {@code ContextVar} a CALLER set is visible to a hook there and a {@link ThreadLocal} one
+     * is not visible here. That difference is real and unported.
      */
     public static DefaultsScope withoutDefaultHooks() {
+        // The PREVIOUS value, not false: the scopes nest, and an inner one closing must not
+        // cancel an outer one's suppression. This is the reference's `_SKIP_DEFAULTS.reset(token)`
+        // written out -- a ThreadLocal has no token, so the token is the captured value.
         boolean previous = SKIP_DEFAULTS.get();
         SKIP_DEFAULTS.set(true);
         return () -> SKIP_DEFAULTS.set(previous);
@@ -382,8 +468,10 @@ public final class Hooks {
      * the Java side has to produce the same number from the representable equivalent.
      */
     public static Totals aggregateUsage(List<Prediction> results) {
-        int input = 0;
-        int output = 0;
+        // Summed as longs: see Totals for the measured wrap an int accumulator produced, and for
+        // why reproducing it would be fidelity to a shape rather than to a behaviour.
+        long input = 0;
+        long output = 0;
         for (Prediction result : results) {
             input += result.usage().inputTokens();
             output += result.usage().outputTokens();
@@ -400,9 +488,23 @@ public final class Hooks {
      * when {@code raiseErrors} is false.
      *
      * <p>A timed-out hook KEEPS RUNNING. Neither Java nor Python can interrupt a thread that
-     * will not cooperate, so the deadline protects the request and not the process — a hook that
-     * blocks forever leaks a thread per call. That is the reference's behaviour too, and it is
-     * the reason the timeout is opt-in.
+     * will not cooperate, so what the deadline bounds is THE WAIT — not the request, and not the
+     * process. The distinction is not pedantry and an earlier version of this paragraph had it
+     * wrong. The abandoned thread still holds the live, mutable {@link PredictContext} of a call
+     * that has moved on without it, and it can still write to it: measured over 60 identical
+     * calls with a hook that overran a 50&nbsp;ms deadline and then assigned results, the late
+     * write was accepted 60 times out of 60 and {@code ctx.usage} ended up describing a
+     * different answer from {@code ctx.results} in 60 of them — because {@link #around} had
+     * already totalled the usage of the answer it saw. In the runs where the write landed inside
+     * the handful of microseconds before {@code around} read the results back, the CALLER was
+     * handed the abandoned hook's answer instead. That is the reference's hazard too — it has
+     * the same abandoned thread and the same shared dataclass.
+     *
+     * <p>What this port does about it, and the reference cannot easily: the thread is MARKED as
+     * abandoned the moment its deadline expires, and {@link PredictContext} refuses a write from
+     * a thread that carries that mark: the same 60 calls then disagree 0 times. See
+     * {@link PredictContext#states(List)} for the one window it does not close. A hook that
+     * blocks forever still leaks a thread per call, which is why the timeout is opt-in.
      *
      * <p>{@code raiseErrors} governs a {@link RuntimeException} and nothing else. An
      * {@link Error} is rethrown whatever the policy says, which is the reference's rule in Java
@@ -430,7 +532,7 @@ public final class Hooks {
                     throw problem;
                 }
                 policy.onFailure().accept(String.format("laya: hook %s.%s failed: %s",
-                        hook.getClass().getSimpleName(), event.wireName(), problem.getMessage()));
+                        hookName(hook), event.wireName(), problem.getMessage()));
             }
         }
     }
@@ -453,17 +555,23 @@ public final class Hooks {
         try {
             runner.join(timeout.toMillis(), timeout.toNanosPart() % 1_000_000);
         } catch (InterruptedException interrupted) {
+            // Re-asserted BEFORE wrapping, because catching InterruptedException clears the
+            // flag: a caller up the stack that polls `Thread.interrupted()` to decide whether to
+            // shut down would otherwise be told it was never asked to.
             Thread.currentThread().interrupt();
             throw new IllegalStateException("interrupted while waiting for hook "
-                    + hook.getClass().getSimpleName() + "." + event.wireName(), interrupted);
+                    + hookName(hook) + "." + event.wireName(), interrupted);
         }
         if (runner.isAlive()) {
+            // The thread is not coming back under our control, so it is cut off from the call
+            // instead: anything it writes to the context from here on is refused. See dispatch.
+            ctx.abandon(runner);
             // Seconds, not `Duration.toString`'s "PT0.05S". The reference names the hook as
             // `<class>.<method>` and the deadline in seconds, and a caller grepping their logs
-            // across the two runtimes should find the same line.
+            // across the two runtimes should find the same line -- which is what `hookName` and
+            // `seconds` are for, and what each of them documents it used to get wrong.
             throw new HookTimeoutException(String.format("laya: hook %s.%s exceeded %ss",
-                    hook.getClass().getSimpleName(), event.wireName(),
-                    timeout.toNanos() / 1e9));
+                    hookName(hook), event.wireName(), seconds(timeout)));
         }
         if (box[0] instanceof RuntimeException problem) {
             throw problem;
@@ -471,6 +579,84 @@ public final class Hooks {
         if (box[0] instanceof Error problem) {
             throw problem;
         }
+    }
+
+    /**
+     * The name the two reported lines call a hook, which is the reference's own choice of name.
+     *
+     * <p>{@link Class#getSimpleName} alone is not it. For an ANONYMOUS class it is the empty
+     * string, so {@code "laya: hook %s.%s failed"} came out as {@code laya: hook .on_predict_start
+     * failed} — the one line a swallowed telemetry failure produces, naming nothing. Python has
+     * no anonymous class and its {@code __qualname__} always names something, so the reference
+     * cannot reach this case at all. A local or anonymous class falls back to the binary name's
+     * last segment, {@code Enclosing$1}, which is ugly and is still a name.
+     *
+     * <p>Public because {@link Policy#onFailure} is a caller's own sink: a sink that wants to
+     * attribute a failure to a hook should not have to re-derive the name this port already
+     * picked, and get a blank for an anonymous one.
+     */
+    public static String hookName(Hook hook) {
+        Class<?> type = hook.getClass();
+        String simple = type.getSimpleName();
+        if (!simple.isEmpty()) {
+            return simple;
+        }
+        String binary = type.getName();
+        int lastDot = binary.lastIndexOf('.');
+        return lastDot < 0 ? binary : binary.substring(lastDot + 1);
+    }
+
+    /**
+     * A deadline in seconds, formatted as the reference's {@code %g} formats it.
+     *
+     * <p>Not {@code %s} on a {@code double}, which is what this was: that prints {@code 1.0} for
+     * a one-second deadline where CPython's {@code %g} prints {@code 1}, so the one line the
+     * javadoc on {@link #call} promises would be greppable across both runtimes differed on the
+     * commonest value there is. Measured in both: {@code 'laya: hook X exceeded %gs' % 1} is
+     * {@code exceeded 1s}, and {@code String.format("exceeded %ss", 1.0)} is
+     * {@code exceeded 1.0s}.
+     *
+     * <p>Java's own {@code %g} is not C's and cannot be used: it neither strips trailing zeros
+     * nor switches to a fixed-point form, so it renders a one-second deadline as
+     * {@code 1.00000}. This is C's rule written out — six significant digits, the exponent form
+     * outside {@code [1e-4, 1e6)}, trailing zeros removed. {@code fixtures/hooks.json} records
+     * CPython's own rendering per recorded deadline — {@code 1}, {@code 2}, {@code 10},
+     * {@code 60}, {@code 1.5}, {@code 0.05} and {@code 1e-07} — and a test compares this method
+     * against that field rather than against a string somebody typed. Checked by hand over a
+     * wider sweep as well: 23 values including {@code 0.1}, {@code 0.25}, {@code 3600},
+     * {@code 86400}, {@code 123456.789} and {@code 1e-09}, byte-identical on all 23.
+     *
+     * <p>Public for the same reason as {@link #hookName}: a caller logging a deadline of their
+     * own should be able to produce the line this port produces, rather than one that differs
+     * from it in the same way it used to differ from the reference.
+     */
+    public static String seconds(Duration timeout) {
+        double value = timeout.toNanos() / 1e9;
+        // %.5e is six significant digits, and its exponent is the one AFTER rounding -- which is
+        // what the branch below has to read, or 9.999999 lands in the wrong form.
+        String scientific = String.format(Locale.ROOT, "%.5e", value);
+        int marker = scientific.indexOf('e');
+        int exponent = Integer.parseInt(scientific.substring(marker + 1));
+        if (exponent < -4 || exponent >= 6) {
+            return trimZeros(scientific.substring(0, marker))
+                    + String.format(Locale.ROOT, "e%s%02d", exponent < 0 ? "-" : "+",
+                            Math.abs(exponent));
+        }
+        return trimZeros(String.format(Locale.ROOT, "%." + (5 - exponent) + "f", value));
+    }
+
+    private static String trimZeros(String decimal) {
+        if (decimal.indexOf('.') < 0) {
+            return decimal;
+        }
+        int end = decimal.length();
+        while (end > 0 && decimal.charAt(end - 1) == '0') {
+            end--;
+        }
+        if (end > 0 && decimal.charAt(end - 1) == '.') {
+            end--;
+        }
+        return decimal.substring(0, end);
     }
 
     /** A hook that outran {@link Policy#timeout}. Unchecked, so the usual policy governs it. */

@@ -384,11 +384,42 @@ per-call `HookCall`, hook objects before the `onStart`/`onEnd` callbacks. A trac
 watch what a per-call hook did only sees it if it runs after it.
 
 `agent.hooks()` also carries the policy. `raiseErrors(false)` reports a throwing hook and carries
-on, which is what a telemetry hook needs — it must not be able to fail a request.
-`concurrent(false)` serialises hooks that are not re-entrant. `timeout(Duration)` bounds each hook
-call; an overrunning hook fails the request, though it **keeps running** in the background, since
-neither runtime can interrupt a thread that will not cooperate. A `HookCall` can override
-`raiseErrors` and `timeout` for one call without touching the others.
+on, which is what a telemetry hook needs — it must not be able to fail a request. An `Error` is
+rethrown whatever it says, which is the reference's rule in Java terms: it catches `Exception` and
+deliberately not `BaseException`. `concurrent(false)` serialises hooks that are not re-entrant.
+A `HookCall` can override `raiseErrors` and `timeout` for one call without touching the others.
+
+`timeout(Duration)` bounds **the wait** for each hook call — not the hook, and not the request. An
+overrunning hook fails the call and **keeps running**, since neither runtime can interrupt a thread
+that will not cooperate, so a hook that blocks forever leaks a daemon thread per call. That much is
+the reference's behaviour.
+
+Where this port diverges, deliberately: the abandoned thread is then **cut off from the call**.
+Once its deadline has passed, every `ctx` mutator it calls throws `IllegalStateException` instead
+of rewriting a call that moved on without it. The reference has the identical hazard and no cheap
+way to close it. Measured here before the guard, over 60 calls whose start hook overran a 50 ms
+deadline by 30 ms and then assigned results: 60 of 60 late writes were accepted, and `ctx.usage`
+ended up describing a different answer from `ctx.results` in 60 of 60 — in some runs the *caller*
+got the abandoned hook's answer. With the guard: 0 of 60. It is a narrowing and not a proof — a
+write already past its check when the deadline expires still lands, which happened in 2 to 17 of
+60 once the overrun was cut to 1–5 ms, so the window is a few instructions wide rather than the
+whole remainder of the call.
+
+Both lines dispatch reports — the swallowed failure and the overrun — name the hook as
+`<class>.<event>` and spell a deadline in seconds exactly as the reference's `%g` does, so
+`exceeded 1s` and not `exceeded 1.0s`, and one grep works against either runtime's logs.
+`Hooks.onPredictStart`/`onPredictEnd` return the reference's own `_StartAdapter`/`_EndAdapter`
+classes for the same reason: the name is what appears in that line, and an anonymous Java class
+has none. `Hooks.hookName(hook)` and `Hooks.seconds(duration)` are public, so your own
+`onFailure` sink can produce the same text.
+
+Two smaller divergences, both for the same reason — a number or a name that differed between the
+runtimes where the port claims they do not. `Hooks.Totals` counts in `long`, because summing
+per-state `int` usage into an `int` wrapped silently (three results of a billion input tokens
+totalled `-1294967296`), and a Python `int` cannot. And a `PredictContext` refuses a null `states`
+or `questions` by name rather than letting the copy throw a bare `NullPointerException`; before
+hooks were wired in, `predictBatch(List.of(), null)` returned an empty list, which the reference
+does not do either.
 
 Scope hooks to a block with `try (var scope = agent.hooks().hooksInstalled(tracer)) { ... }`. It
 removes one copy of each hook it added — not every copy by identity, which would take one the

@@ -58,8 +58,42 @@ see [Installing](README.md#installing).
   it behind a lock when asked, and totals usage. `Agent.predict` and `Agent.predictBatch` run
   it; `Agent.predictLong` deliberately does not, for the reason under *Known limitations*.
   Everything above is recorded from the reference in `fixtures/hooks.json`, including what a
-  start hook sees, what `skip` does to inference, and what a throwing hook does under each
-  policy.
+  start hook sees, what `skip` does to inference, what a throwing hook does under each policy,
+  and how a deadline is spelled in the line an overrun reports.
+- Three **deliberate divergences** inside `hooks`, each because a number or a name differed
+  between the runtimes where the port claims they do not:
+  - A hook that outran `timeout(Duration)` is **cut off from the call**. The deadline bounds the
+    WAIT, not the hook and not the request — neither runtime can interrupt a thread that will not
+    cooperate — so the abandoned thread is still holding the live, mutable `PredictContext` of a
+    call that moved on without it. Measured over 60 calls whose start hook overran a 50 ms
+    deadline by 30 ms and then assigned results: 60 of 60 late writes were accepted, and
+    `ctx.usage` ended up describing a different answer from `ctx.results` in 60 of 60; in some
+    runs the caller itself got the abandoned hook's answer. Every `PredictContext` mutator now
+    throws `IllegalStateException` for a thread whose deadline has passed, and the same 60 calls
+    disagree 0 times. The reference has the identical hazard and no cheap way to close it. It is
+    a narrowing, not a proof: with the overrun cut to 1–5 ms, so that the write and the deadline
+    collide, 2 to 17 of 60 late writes still landed. The context's mutable fields are `volatile`
+    for the same reason — after `join` expires there is no happens-before edge to the caller.
+  - `Hooks.Totals` counts in `long`. Summing per-state `int` usage into an `int` wraps silently —
+    three results of 1,000,000,000 input tokens each totalled `-1294967296` — and a Python `int`
+    cannot, so the port would have been the only one of the two lying to a metering hook about
+    what a call cost.
+  - `PredictContext` refuses a null `states` or `questions` **by name**, rather than letting its
+    own defensive copy throw a bare `NullPointerException`. Before the hooks were wired in,
+    `predictBatch(List.of(), null)` returned an empty list, because the empty-state
+    short-circuit ran before anything looked at the questions; the reference refuses a non-dict
+    `questions` for an empty batch as much as for any other, so that empty list was this port's
+    divergence rather than a ported behaviour.
+- The two lines dispatch reports are **greppable across both runtimes**, which they were not.
+  A deadline is formatted as CPython's `%g` formats it, so a one-second deadline reads
+  `exceeded 1s` and not `exceeded 1.0s` — a whole number of seconds being the common case for a
+  deadline — with the rendering recorded per value in `fixtures/hooks.json` rather than typed
+  out. And `Hooks.onPredictStart` / `onPredictEnd` return NAMED classes (`_StartAdapter`,
+  `_EndAdapter`, the reference's own names), because `getSimpleName()` of the anonymous classes
+  they used to return is the empty string: the two advertised low-friction hooks reported
+  `laya: hook .on_predict_start failed`, naming nothing, in the one line a swallowed telemetry
+  failure leaves. `Hooks.hookName` and `Hooks.seconds` are public so a caller's own `onFailure`
+  sink can produce the same text.
 - `Agent.using(tokenizer, config, session, modelName)` and `Agent.modelName()`: the checkpoint
   name a hook reads off `PredictContext.model()`. `Agent.open` takes it from the model
   directory's own name, since `rl_agent_config.json` does not carry one.
@@ -97,6 +131,18 @@ see [Installing](README.md#installing).
 - `-PtestJavaVersion` runs the tests on a different JDK from the one the classes are compiled
   for, because the toolchain pins the compiler to 17 and a lane that merely installs another JDK
   tests the same thing twice.
+- Three guards against a suite that is green because it tested nothing. A fixture section that
+  emptied used to produce a `@TestFactory` with no tests in it, which JUnit does not fail, so
+  `HooksTest.section` now refuses an empty or missing section and names it — the count floor
+  alone was not enough, because with the smallest section emptied the `build` lane ran 793
+  against a floor of 794 and caught it by exactly one test while the `jdk-matrix` lane, one test
+  higher, landed exactly ON 794 and exited 0. The two lanes now carry floors one apart for that
+  reason. A recorded value with no Java counterpart used to fall into the branch that asserts
+  only about the reference, so a representable addition stopped testing Java silently; the
+  timeout factory now fails on a value it has been told nothing about. And the process-wide
+  default hooks are cleared after every test in the module by an auto-registered
+  `DefaultHooksIsolation` extension, rather than by two classes remembering to — pinned by a
+  class that deliberately does not remember.
 - That matrix earned itself on its first run. The JDK 21 cell failed where 17 and 24 passed,
   because `Character.isLetter` on Unicode 15.0 agrees with CPython 15.0 EXACTLY, and a test had
   asserted that the JDK disagrees. Catching up is not a reason to drop the table -- it is the

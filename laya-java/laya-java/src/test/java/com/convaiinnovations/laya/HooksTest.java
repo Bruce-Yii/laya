@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.fail;
 import static org.junit.jupiter.api.DynamicTest.dynamicTest;
 
 import com.convaiinnovations.laya.hooks.Hook;
@@ -19,8 +20,12 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
+import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.DynamicTest;
@@ -64,9 +69,33 @@ final class HooksTest {
         return (Map<String, Object>) (Map<?, ?>) Fixtures.load("hooks.json");
     }
 
+    /**
+     * One recorded section, which may never be EMPTY.
+     *
+     * <p>JUnit does not fail a {@code @TestFactory} that returns no tests, so a section that
+     * emptied — a renamed key, a generator branch that stopped recording, a bad merge — produced
+     * a factory with nothing in it and a green suite.
+     *
+     * <p>The count floor in CI is the other half of that guard and it is not enough on its own.
+     * Measured with this check deleted and {@code as_sequence} — 5 cases, the smallest section —
+     * emptied: Gradle still exits 0, 812 of 831 tests run, and the floor that was in place when
+     * the section was last recorded, 794, does not notice at all. A floor only ever notices
+     * because it sits within a few tests of the total, which makes WHICH lane it is in decide
+     * whether it notices: the {@code build} lane catches that emptying by one test, and a floor
+     * shared with {@code jdk-matrix}, which runs one test more because
+     * {@code TestJvmVersionTest} is enabled only there, would have landed exactly ON it and
+     * exited 0. The two lanes now carry floors one apart for that reason, and this check is the
+     * per-section half that does not depend on the arithmetic at all. It names the section.
+     */
     @SuppressWarnings("unchecked")
     private static List<Object> section(String name) {
-        return (List<Object>) family().get(name);
+        Object recorded = family().get(name);
+        assertNotNull(recorded, "hooks.json has no section called " + name
+                + "; this factory would otherwise register no tests at all");
+        List<Object> cases = (List<Object>) recorded;
+        assertFalse(cases.isEmpty(), "hooks.json section " + name + " is EMPTY, so the factory "
+                + "reading it registers no tests -- which JUnit does not treat as a failure");
+        return cases;
     }
 
     @SuppressWarnings("unchecked")
@@ -461,14 +490,28 @@ final class HooksTest {
     // -- validate_timeout ---------------------------------------------------
 
     @TestFactory
-    @DisplayName("a timeout is a positive duration, and the non-positive ones are refused")
+    @DisplayName("a timeout is a positive duration, is refused when non-positive, and renders as the reference renders it")
     List<DynamicTest> timeoutsMatch() {
         List<DynamicTest> tests = new ArrayList<>();
         for (Object raw : section("timeouts")) {
             Map<String, Object> one = map(raw);
             String input = (String) one.get("input");
-            Duration candidate = durationFor(input);
-            if (candidate == null && !"None".equals(input)) {
+            if (!DURATIONS.containsKey(input)) {
+                if (!UNREPRESENTABLE.contains(input)) {
+                    // A value was added to the reference's HOOK_TIMEOUT_VALUES and nobody said
+                    // which of the two it is. It MUST NOT fall through to the unrepresentable
+                    // branch by default, because that branch asserts only about the Python side
+                    // and never calls validateTimeout at all -- so a representable addition
+                    // would quietly stop testing Java. Measured: appending a plain `2` to
+                    // HOOK_TIMEOUT_VALUES survived the whole suite before this guard existed.
+                    tests.add(dynamicTest(input + " (UNRECORDED)", () ->
+                            fail("hooks.json records the timeout value " + input + ", which this "
+                                 + "factory maps to neither a Duration nor the unrepresentable "
+                                 + "set. Add it to DURATIONS, or to UNREPRESENTABLE with the "
+                                 + "reason -- leaving it out stops the Java side being tested "
+                                 + "for it.")));
+                    continue;
+                }
                 // nan, inf and -inf have no Duration, and '0.5' is a string the reference
                 // coerces where Java has no such value to be handed. Unreachable, not skipped:
                 // the refusal is still asserted on the reference's side.
@@ -481,9 +524,19 @@ final class HooksTest {
                 }));
                 continue;
             }
+            Duration candidate = DURATIONS.get(input);
             tests.add(dynamicTest(input, () -> {
                 if (Boolean.TRUE.equals(one.get("accepted"))) {
                     assertEquals(candidate, Hooks.validateTimeout(candidate));
+                    if (candidate != null) {
+                        // The deadline as the overrun line spells it. `%g`, recorded from
+                        // CPython, is `1` for a one-second deadline where `%s` on a double is
+                        // `1.0` -- and a whole number of seconds is the commonest deadline there
+                        // is, so it is the commonest form of that line.
+                        assertEquals(one.get("seconds"), Hooks.seconds(candidate),
+                                "the deadline in the overrun message, as the reference formats "
+                                + "it with %g");
+                    }
                 } else {
                     assertThrows(IllegalArgumentException.class,
                             () -> Hooks.validateTimeout(candidate));
@@ -493,18 +546,36 @@ final class HooksTest {
         return tests;
     }
 
-    private static Duration durationFor(String recorded) {
-        return switch (recorded) {
-            case "None" -> null;
-            case "1" -> Duration.ofSeconds(1);
-            case "1.5" -> Duration.ofMillis(1500);
-            case "0.05" -> Duration.ofMillis(50);
-            case "0", "0.0" -> Duration.ZERO;
-            case "-1" -> Duration.ofSeconds(-1);
-            case "-0.5" -> Duration.ofMillis(-500);
-            default -> null;
-        };
+    /**
+     * Every recorded timeout value that HAS a {@link Duration}, including null for "no limit".
+     *
+     * <p>A map with an explicit null value rather than a {@code switch} returning null on its
+     * default arm: the default arm made "unmapped" and "representable as no limit" the same
+     * answer, which is how a representable addition could slip into the branch that tests
+     * nothing. {@code containsKey} tells them apart.
+     */
+    private static final Map<String, Duration> DURATIONS = durations();
+
+    private static Map<String, Duration> durations() {
+        Map<String, Duration> out = new LinkedHashMap<>();
+        out.put("None", null);
+        out.put("1", Duration.ofSeconds(1));
+        out.put("2", Duration.ofSeconds(2));
+        out.put("10", Duration.ofSeconds(10));
+        out.put("60", Duration.ofSeconds(60));
+        out.put("1.5", Duration.ofMillis(1500));
+        out.put("0.05", Duration.ofMillis(50));
+        out.put("1e-07", Duration.ofNanos(100));
+        out.put("0", Duration.ZERO);
+        out.put("0.0", Duration.ZERO);
+        out.put("-1", Duration.ofSeconds(-1));
+        out.put("-0.5", Duration.ofMillis(-500));
+        return out;
     }
+
+    /** The recorded values a {@link Duration} cannot hold at all, each for a stated reason. */
+    private static final List<String> UNREPRESENTABLE =
+            List.of("'0.5'", "nan", "inf", "-inf");
 
     // -- the registry -------------------------------------------------------
 
@@ -757,8 +828,14 @@ final class HooksTest {
             return null;
         }
         Map<String, Object> want = map(recorded);
-        return Map.of("input_tokens", integer(want.get("input_tokens")),
-                "output_tokens", integer(want.get("output_tokens")));
+        // Long, because Hooks.Totals counts in longs -- see that record for the measured int
+        // overflow. A recorded Integer would never equal what a hook actually read.
+        return Map.of("input_tokens", longOf(want.get("input_tokens")),
+                "output_tokens", longOf(want.get("output_tokens")));
+    }
+
+    private static Long longOf(Object value) {
+        return value == null ? null : ((Number) value).longValue();
     }
 
     // -- the parts the reference cannot record ------------------------------
@@ -767,8 +844,14 @@ final class HooksTest {
     @DisplayName("a hook that overruns its deadline fails the call rather than holding it")
     void aSlowHookTimesOut() {
         List<Object> log = new ArrayList<>();
+        // One second, not five. The thread this test abandons cannot be joined -- that is the
+        // behaviour being asserted -- so the only thing that bounds it is how long the hook
+        // sleeps, and the suite should not carry a thread for five seconds to prove a 50 ms
+        // deadline. A 20x margin over the deadline is still not a race: `join(50)` returns at
+        // 50 ms whatever the hook is doing. `noAbandonedHookThreadOutlivesTheSuite` below is
+        // what makes the bound an assertion rather than an intention.
         Hook slow = HookStubs.hook(log, "slow", HookStubs.Hooks0.EVENTS,
-                Map.of("on_predict_start", "sleep:5"), false);
+                Map.of("on_predict_start", "sleep:1"), false);
         PredictContext ctx = new PredictContext(List.of("s0"),
                 HookStubs.questions(List.of("q")), null, null);
         Hooks.Policy policy = Hooks.Policy.raising().timeout(Duration.ofMillis(50));
@@ -857,5 +940,418 @@ final class HooksTest {
         assertSame(HookCall.none(), HookCall.none(), "the empty call is a constant");
         assertTrue(HookCall.none().isEmpty());
         assertFalse(HookCall.none().raiseErrors(true).isEmpty());
+    }
+
+    // -- the defects an adversarial review reproduced -----------------------
+
+    @Test
+    @DisplayName("a scope removes the MOST RECENT copy, which is an order and not just a count")
+    @SuppressWarnings("try")
+    void aScopeRemovesTheMostRecentCopy() {
+        HookRegistry registry = new HookRegistry();
+        List<Object> log = new ArrayList<>();
+        Hook own = HookStubs.hook(log, "own");
+        Hook other = HookStubs.hook(log, "other");
+        registry.addHook(own);
+        registry.addHook(other);
+        try (HookRegistry.Scope scope = registry.hooksInstalled(own)) {
+            assertEquals(List.of("own", "other", "own"), labels(registry.hooks()),
+                    "the scope's copy is appended, so the caller's own copy is the EARLIER one");
+        }
+        // The direction of the scan is observable after all. Scanning forward takes the copy at
+        // index 0 and leaves [other, own]; scanning backward takes index 2 and leaves
+        // [own, other]. Same multiset, different dispatch order -- and order is the one thing
+        // about a hook list this port calls a contract, because it decides whether `own` sees
+        // what `other` did or the other way round.
+        assertEquals(List.of("own", "other"), labels(registry.hooks()),
+                "a forward scan would leave [other, own] and silently reorder two hooks the "
+                + "caller installed itself");
+    }
+
+    @Test
+    @DisplayName("an Error is never swallowed, whatever raiseErrors says")
+    void anErrorIsNeverSwallowed() {
+        List<Object> log = new ArrayList<>();
+        Hook fatal = new Hook() {
+            @Override
+            public void onPredictStart(PredictContext ctx) {
+                // Not a RuntimeException. The reference catches `Exception` and deliberately not
+                // `BaseException`, so a KeyboardInterrupt or a SystemExit is never swallowed by
+                // a telemetry hook; on the JVM the same rule is "RuntimeException, not Error".
+                throw new StackOverflowError("the hook recursed");
+            }
+        };
+        Hook after = HookStubs.hook(log, "after");
+        PredictContext ctx = new PredictContext(List.of("s0"),
+                HookStubs.questions(List.of("q")), null, null);
+        List<String> reported = new ArrayList<>();
+        Hooks.Policy swallowing =
+                Hooks.Policy.raising().raiseErrors(false).onFailure(reported::add);
+
+        StackOverflowError problem = assertThrows(StackOverflowError.class,
+                () -> Hooks.dispatch(List.of(fatal, after), Hooks.Event.PREDICT_START, ctx,
+                        swallowing),
+                "raiseErrors(false) governs a RuntimeException and nothing else; an "
+                + "OutOfMemoryError reported as a line of text and carried on from is the same "
+                + "mistake");
+        assertEquals("the hook recursed", problem.getMessage(),
+                "the Error itself reaches the caller, not something wrapping it");
+        assertEquals(List.of(), reported,
+                "...and the failure sink never saw it, so nothing logged it as handled");
+        assertEquals(List.of(), log, "...and the rest of the chain did not run");
+    }
+
+    @Test
+    @DisplayName("withoutDefaultHooks nests: an inner scope closing does not cancel the outer")
+    @SuppressWarnings("try")
+    void withoutDefaultHooksNests() {
+        List<Object> log = new ArrayList<>();
+        Hook probe = HookStubs.hook(log, "probe");
+        Hooks.setDefaultHooks(List.of(probe));
+        try (Hooks.DefaultsScope outer = Hooks.withoutDefaultHooks()) {
+            try (Hooks.DefaultsScope inner = Hooks.withoutDefaultHooks()) {
+                assertEquals(List.of(), Hooks.compose(List.of(), HookCall.none()));
+            }
+            // The close restores the value it FOUND, which was already "suppressed". Restoring a
+            // literal false here instead would read as "the scope is over" and switch the
+            // defaults back on inside a scope that is still open -- which is the whole reason the
+            // reference uses `_SKIP_DEFAULTS.reset(token)` rather than `set(False)`.
+            assertEquals(List.of(), Hooks.compose(List.of(), HookCall.none()),
+                    "the inner scope closing must not cancel the outer suppression");
+        }
+        assertEquals(List.of(probe), Hooks.compose(List.of(), HookCall.none()),
+                "and the outer scope closing does restore them");
+    }
+
+    @Test
+    @DisplayName("a hook that outran its deadline keeps running, on a daemon thread")
+    void anAbandonedHookRunsOnADaemonThread() throws Exception {
+        Parked parked = new Parked();
+        PredictContext ctx = new PredictContext(List.of("s0"),
+                HookStubs.questions(List.of("q")), null, null);
+        Hooks.Policy policy = Hooks.Policy.raising().timeout(Duration.ofMillis(50));
+        try {
+            assertThrows(Hooks.HookTimeoutException.class, () ->
+                    Hooks.dispatch(List.of(parked), Hooks.Event.PREDICT_START, ctx, policy));
+            Thread runner = parked.ranOn.get();
+            assertNotNull(runner, "the hook never started, so this proves nothing");
+            assertEquals("laya-hook-timeout", runner.getName(),
+                    "the name is what makes an abandoned hook identifiable in a thread dump");
+            assertTrue(runner.isAlive(),
+                    "the hook is still running -- which is the point: the deadline bounded the "
+                    + "WAIT, not the hook");
+            assertTrue(runner.isDaemon(),
+                    "a non-daemon thread would hold the JVM open after the caller is finished, "
+                    + "so a timed-out hook could stop a process from exiting at all");
+        } finally {
+            parked.release();
+        }
+    }
+
+    @Test
+    @DisplayName("a 50ms deadline cuts the wait off near 50ms, not near a second")
+    void theDeadlineIsActuallyTheDeadline() throws Exception {
+        Parked parked = new Parked();
+        PredictContext ctx = new PredictContext(List.of("s0"),
+                HookStubs.questions(List.of("q")), null, null);
+        Hooks.Policy policy = Hooks.Policy.raising().timeout(Duration.ofMillis(50));
+        try {
+            long began = System.nanoTime();
+            assertThrows(Hooks.HookTimeoutException.class, () ->
+                    Hooks.dispatch(List.of(parked), Hooks.Event.PREDICT_START, ctx, policy));
+            double waited = (System.nanoTime() - began) / 1_000_000.0;
+            // Two bounds, both loose on purpose. The lower one catches a deadline that is
+            // IGNORED -- a wait that returns before the hook could possibly have finished makes
+            // the outcome of a fast hook a race, which is the reason validateTimeout refuses a
+            // zero. The upper one catches a deadline that is INFLATED: nothing else in the suite
+            // noticed when every deadline was multiplied by twenty, because the parked hook
+            // never finishes either way and the only difference is how long the call waited.
+            // 15x the deadline, not 1.2x, so a loaded machine cannot turn this red.
+            assertTrue(waited >= 45.0,
+                    "the wait returned after " + waited + " ms on a 50 ms deadline, which is "
+                    + "before the hook could have finished");
+            assertTrue(waited < 750.0,
+                    "a 50 ms deadline held the call for " + waited + " ms");
+        } finally {
+            parked.release();
+        }
+    }
+
+    @Test
+    @DisplayName("being interrupted while waiting for a hook restores the flag before wrapping it")
+    void interruptWhileWaitingRestoresTheFlag() throws Exception {
+        Parked parked = new Parked();
+        PredictContext ctx = new PredictContext(List.of("s0"),
+                HookStubs.questions(List.of("q")), null, null);
+        // Long enough that the deadline cannot be what ends the wait.
+        Hooks.Policy policy = Hooks.Policy.raising().timeout(Duration.ofSeconds(30));
+        AtomicReference<Throwable> thrown = new AtomicReference<>();
+        AtomicReference<Boolean> flagAfterwards = new AtomicReference<>();
+        Thread waiter = new Thread(() -> {
+            try {
+                Hooks.dispatch(List.of(parked), Hooks.Event.PREDICT_START, ctx, policy);
+            } catch (RuntimeException problem) {
+                thrown.set(problem);
+                flagAfterwards.set(Thread.currentThread().isInterrupted());
+            }
+        }, "interrupt-while-waiting");
+        try {
+            waiter.start();
+            assertTrue(parked.entered.await(10, TimeUnit.SECONDS),
+                    "the hook must be inside its event before its waiter is interrupted");
+            waiter.interrupt();
+            waiter.join(10_000);
+            assertNotNull(thrown.get(), "the waiter was interrupted and did not report it");
+            assertEquals(IllegalStateException.class, thrown.get().getClass());
+            assertTrue(thrown.get().getMessage()
+                            .startsWith("interrupted while waiting for hook "),
+                    "the message named: " + thrown.get().getMessage());
+            // Catching InterruptedException CLEARS the flag. Re-asserting it is the only thing
+            // that keeps a shutdown request alive: a caller up the stack polling
+            // Thread.interrupted() would otherwise be told it was never asked to stop.
+            assertTrue(Boolean.TRUE.equals(flagAfterwards.get()),
+                    "the interrupt flag was swallowed along with the exception");
+        } finally {
+            parked.release();
+        }
+    }
+
+    @Test
+    @DisplayName("a hook cut off by its deadline can no longer write to the call")
+    void anAbandonedHookCannotWriteToTheCall() throws Exception {
+        Parked parked = new Parked(ctx -> ctx.results(List.of(HookStubs.result(999))));
+        PredictContext ctx = new PredictContext(List.of("s0"),
+                HookStubs.questions(List.of("q")), null, null);
+        Hooks.Policy policy = Hooks.Policy.raising().timeout(Duration.ofMillis(50));
+        assertThrows(Hooks.HookTimeoutException.class, () ->
+                Hooks.dispatch(List.of(parked), Hooks.Event.PREDICT_START, ctx, policy));
+        // The call carries on without it, which is what the deadline is for.
+        ctx.results(List.of(HookStubs.result(111)));
+        parked.release();
+
+        assertNotNull(parked.refused.get(),
+                "the abandoned hook's write was ACCEPTED, so a hook the call stopped waiting for "
+                + "can still rewrite the answer the caller already has");
+        assertEquals(IllegalStateException.class, parked.refused.get().getClass());
+        // `HookStubs.result(i)` reports `10 + i` input tokens, so this is the 111 above and not
+        // the 999 the abandoned hook tried to put there.
+        assertEquals(tokens(List.of(HookStubs.result(111))), tokens(ctx.results()),
+                "...and the call kept the answer it had moved on with");
+    }
+
+    @Test
+    @DisplayName("the overrun line names the hook and spells the deadline as the reference does")
+    void theOverrunLineIsGreppableAcrossBothRuntimes() throws Exception {
+        Parked parked = new Parked();
+        // Through the convenience wrapper, which is the shape most likely to be named in one of
+        // these lines and the shape that used to report no name at all.
+        Hook wrapped = Hooks.onPredictStart(parked::onPredictStart);
+        PredictContext ctx = new PredictContext(List.of("s0"),
+                HookStubs.questions(List.of("q")), null, null);
+        try {
+            Hooks.HookTimeoutException problem = assertThrows(Hooks.HookTimeoutException.class,
+                    () -> Hooks.dispatch(List.of(wrapped), Hooks.Event.PREDICT_START, ctx,
+                            Hooks.Policy.raising().timeout(Duration.ofSeconds(1))));
+            // Two divergences in one line, both measured against CPython:
+            //   "exceeded 1.0s" -- %s on a double, where the reference's %g gives "1s", and a
+            //                      whole number of seconds is the common case for a deadline;
+            //   "hook .on_"     -- getSimpleName() of the anonymous class this wrapper used to
+            //                      return is the EMPTY string, where the reference's
+            //                      __qualname__ is "_StartAdapter.on_predict_start".
+            assertEquals("laya: hook _StartAdapter.on_predict_start exceeded 1s",
+                    problem.getMessage());
+        } finally {
+            parked.release();
+        }
+    }
+
+    @Test
+    @DisplayName("the convenience callbacks name themselves when their failure is swallowed")
+    void convenienceHooksAreNamedInTheirOwnFailureLine() {
+        PredictContext ctx = new PredictContext(List.of("s0"),
+                HookStubs.questions(List.of("q")), null, null);
+        List<String> reported = new ArrayList<>();
+        Hooks.Policy swallowing =
+                Hooks.Policy.raising().raiseErrors(false).onFailure(reported::add);
+
+        Hooks.dispatch(List.of(Hooks.onPredictStart(seen -> {
+            throw new IllegalArgumentException("boom");
+        })), Hooks.Event.PREDICT_START, ctx, swallowing);
+        Hooks.dispatch(List.of(Hooks.onPredictEnd(seen -> {
+            throw new IllegalArgumentException("bang");
+        })), Hooks.Event.PREDICT_END, ctx, swallowing);
+
+        // raiseErrors(false) exists for a telemetry hook, and this line is the ONLY trace such a
+        // hook's failure leaves. An empty name makes it untraceable to the hook that produced it.
+        assertEquals(List.of("laya: hook _StartAdapter.on_predict_start failed: boom",
+                        "laya: hook _EndAdapter.on_predict_end failed: bang"), reported,
+                "the reference names these _StartAdapter/_EndAdapter, and an anonymous Java "
+                + "class names nothing");
+    }
+
+    @Test
+    @DisplayName("a caller's own anonymous hook still has a name, which the reference cannot lack")
+    void anAnonymousHookStillReportsAName() {
+        PredictContext ctx = new PredictContext(List.of("s0"),
+                HookStubs.questions(List.of("q")), null, null);
+        List<String> reported = new ArrayList<>();
+        Hooks.dispatch(List.of(new Hook() {
+            @Override
+            public void onPredictStart(PredictContext seen) {
+                throw new IllegalArgumentException("boom");
+            }
+        }), Hooks.Event.PREDICT_START, ctx,
+                Hooks.Policy.raising().raiseErrors(false).onFailure(reported::add));
+
+        assertEquals(1, reported.size());
+        // Python has no anonymous class and `__qualname__` always names something, so there is
+        // no reference behaviour to match here -- only a line that must not be blank.
+        assertTrue(reported.get(0).startsWith("laya: hook HooksTest$"),
+                "an anonymous hook reported: " + reported.get(0));
+        assertFalse(reported.get(0).contains("hook ."),
+                "getSimpleName() of an anonymous class is the empty string, which left the hook "
+                + "unnamed in the one line its swallowed failure produces");
+    }
+
+    @Test
+    @DisplayName("usage totals do not wrap where the reference cannot wrap")
+    void usageTotalsDoNotOverflow() {
+        List<Prediction> huge = new ArrayList<>();
+        for (int i = 0; i < 3; i++) {
+            huge.add(new Prediction(Prediction.MODEL, Map.of(),
+                    new Usage(1_000_000_000, 1_000_000_000, 0, 0, false, List.of(), Map.of())));
+        }
+        Hooks.Totals got = Hooks.aggregateUsage(huge);
+        // An int accumulator gives -1294967296, which no Python int can produce. `usage` is what
+        // a metering hook bills from, so a wrap there is a wrong invoice rather than a wrong log.
+        assertEquals(3_000_000_000L, got.inputTokens(),
+                "three billion input tokens wrapped into an int accumulator");
+        assertEquals(3_000_000_000L, got.outputTokens());
+    }
+
+    @Test
+    @DisplayName("a null hook is refused by name from every entry point that takes one")
+    void aNullHookIsRefusedByNameEverywhere() {
+        String expected = "a hooks entry must not be null";
+        // Each of these wrapped the hook in List.of(...) first, so the caller got a bare NPE
+        // from inside the JDK and the message below was unreachable from all four.
+        assertEquals(expected, assertThrows(IllegalArgumentException.class,
+                () -> Hooks.addDefaultHook(null)).getMessage());
+        assertEquals(expected, assertThrows(IllegalArgumentException.class,
+                () -> new HookRegistry().addHook(null)).getMessage());
+        assertEquals(expected, assertThrows(IllegalArgumentException.class,
+                () -> HookCall.of((Hook) null)).getMessage());
+        assertEquals(expected, assertThrows(IllegalArgumentException.class,
+                () -> HookCall.none().andThen(null)).getMessage());
+        List<Hook> withNull = new ArrayList<>();
+        withNull.add(null);
+        assertEquals(expected, assertThrows(IllegalArgumentException.class,
+                () -> HookCall.of(withNull)).getMessage());
+    }
+
+    @Test
+    @DisplayName("a context refuses a null states or questions by name, rather than NPEing")
+    void aContextRefusesNullsByName() {
+        Map<String, Question> questions = HookStubs.questions(List.of("q"));
+        assertEquals("states must not be null", assertThrows(IllegalArgumentException.class,
+                () -> new PredictContext(null, questions, null, null)).getMessage());
+        // Before the hooks were wired in, `predictBatch(List.of(), null)` returned an empty list:
+        // the empty-state short-circuit ran before anything looked at the questions. It now
+        // refuses, which is what the reference does for an empty batch as much as any other --
+        // its own check is `questions must be a dict of question id -> definition`, reached even
+        // when `states` is empty. Tolerating the null instead would answer a real batch with
+        // empty answers and zero usage.
+        assertEquals("questions must not be null", assertThrows(IllegalArgumentException.class,
+                () -> new PredictContext(List.of(), null, null, null)).getMessage());
+        assertEquals("questions must not be null", assertThrows(IllegalArgumentException.class,
+                () -> new PredictContext(List.of("s0"), null, null, null)).getMessage());
+    }
+
+    /**
+     * No test may leave a hook thread running past this class.
+     *
+     * <p>Every test here that abandons one releases it, except {@link #aSlowHookTimesOut}, which
+     * cannot — not being able to is the behaviour it asserts — and which therefore sleeps for a
+     * bounded second rather than the five it used to. This is what turns that bound into an
+     * assertion instead of an intention: the review that found the rest of this commit observed
+     * two abandoned {@code laya-hook-timeout} threads alive in the middle of a run of the
+     * shipped suite, and a leak nobody counts is a leak that grows.
+     */
+    @AfterAll
+    static void noAbandonedHookThreadOutlivesTheSuite() throws InterruptedException {
+        List<Thread> lingering = new ArrayList<>();
+        for (Thread thread : Thread.getAllStackTraces().keySet()) {
+            if ("laya-hook-timeout".equals(thread.getName())) {
+                lingering.add(thread);
+            }
+        }
+        for (Thread thread : lingering) {
+            thread.join(10_000);
+        }
+        List<String> stuck = new ArrayList<>();
+        for (Thread thread : lingering) {
+            if (thread.isAlive()) {
+                stuck.add(thread.toString());
+            }
+        }
+        assertEquals(List.of(), stuck,
+                "a hook thread outlived the suite: a test abandoned it and nothing released it");
+    }
+
+    /**
+     * A hook that parks inside its event until the test releases it.
+     *
+     * <p>A sleep would do the same job less well in both directions: it is a race against the
+     * deadline at one end — the thing under test — and at the other it leaves a thread running
+     * for however long it was given. This one is deterministic (the hook is provably still inside
+     * {@code on_predict_start} when the deadline expires) and {@link #release} joins the thread,
+     * so a test asserting that a hook CANNOT be stopped does not have to leak one to prove it.
+     */
+    private static final class Parked implements Hook {
+
+        private final CountDownLatch entered = new CountDownLatch(1);
+        private final CountDownLatch released = new CountDownLatch(1);
+        private final AtomicReference<Thread> ranOn = new AtomicReference<>();
+        private final AtomicReference<Throwable> refused = new AtomicReference<>();
+        private final Consumer<PredictContext> afterRelease;
+
+        Parked() {
+            this(ctx -> {
+                // Park and nothing more: the deadline is the subject, not what the hook does.
+            });
+        }
+
+        Parked(Consumer<PredictContext> afterRelease) {
+            this.afterRelease = afterRelease;
+        }
+
+        @Override
+        public void onPredictStart(PredictContext ctx) {
+            ranOn.set(Thread.currentThread());
+            entered.countDown();
+            try {
+                released.await();
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+            try {
+                afterRelease.accept(ctx);
+            } catch (RuntimeException problem) {
+                refused.set(problem);
+            }
+        }
+
+        /** Lets the parked hook finish, and waits for its thread to be gone. */
+        void release() throws InterruptedException {
+            released.countDown();
+            Thread thread = ranOn.get();
+            if (thread != null && thread != Thread.currentThread()) {
+                thread.join(10_000);
+                if (thread.isAlive()) {
+                    fail("the released hook thread did not finish");
+                }
+            }
+        }
     }
 }

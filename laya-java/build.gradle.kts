@@ -83,6 +83,15 @@ subprojects {
             // answer actually exists.
             systemProperty("laya.test.expectedJavaVersion", want.toString())
         }
+        // Process-wide default hooks are global mutable state with no automatic restore, so a
+        // test that sets one and does not clear it fails whichever test runs next. Two classes
+        // clear it in their own teardown and that was the whole protection -- discipline, not a
+        // mechanism, and correct only until the third class forgets. Auto-detection registers
+        // `DefaultHooksIsolation` (see that class) for classes that have not opted in, which is
+        // precisely the class that would forget. It is global to this module's tests, so
+        // `src/test/resources/META-INF/services/org.junit.jupiter.api.extension.Extension` is
+        // the one file that says what it turns on, and it holds exactly one entry.
+        systemProperty("junit.jupiter.extensions.autodetection.enabled", "true")
         // Passed through rather than inherited silently, so a lane that forgets them is a lane
         // whose parity tests abort loudly instead of one that quietly tests less.
         //

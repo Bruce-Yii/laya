@@ -3270,7 +3270,13 @@ HOOK_USAGE_CASES = [
 
 
 #: Values offered to `validate_timeout`.
-HOOK_TIMEOUT_VALUES = [None, 1, 1.5, 0.05, "0.5", 0, 0.0, -1, -0.5,
+#:
+#: The whole seconds -- 1, 2, 10, 60 -- and 1e-07 are here for the RENDERING, not the validation:
+#: `_call_hook` reports an overrun with `%g`, which prints `1` where a naive port prints `1.0`
+#: and `1e-07` where it prints `1.0E-7`. A whole number of seconds is the common case for a
+#: deadline, so it is the common case for that line, and `laya-java` compares its own formatter
+#: against the `seconds` field below rather than against a string somebody typed.
+HOOK_TIMEOUT_VALUES = [None, 1, 2, 10, 60, 1.5, 0.05, 1e-07, "0.5", 0, 0.0, -1, -0.5,
                        float("nan"), float("inf"), float("-inf")]
 
 
@@ -3568,10 +3574,14 @@ def hook_dispatch():
             accepted = validate_timeout(value)
             entry["accepted"] = True
             entry["value"] = accepted
+            # Exactly the rendering `_call_hook` puts in its TimeoutError, which the port has to
+            # reproduce character for character -- see that function and `HOOK_TIMEOUT_VALUES`.
+            entry["seconds"] = None if accepted is None else "%g" % accepted
             entry["error"] = None
         except (ValueError, OverflowError) as problem:
             entry["accepted"] = False
             entry["value"] = None
+            entry["seconds"] = None
             entry["error"] = str(problem)
         timeouts.append(entry)
 

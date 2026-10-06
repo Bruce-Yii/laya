@@ -770,72 +770,112 @@
       "input": "None",
       "accepted": true,
       "value": null,
+      "seconds": null,
       "error": null
     },
     {
       "input": "1",
       "accepted": true,
       "value": 1.0,
+      "seconds": "1",
+      "error": null
+    },
+    {
+      "input": "2",
+      "accepted": true,
+      "value": 2.0,
+      "seconds": "2",
+      "error": null
+    },
+    {
+      "input": "10",
+      "accepted": true,
+      "value": 10.0,
+      "seconds": "10",
+      "error": null
+    },
+    {
+      "input": "60",
+      "accepted": true,
+      "value": 60.0,
+      "seconds": "60",
       "error": null
     },
     {
       "input": "1.5",
       "accepted": true,
       "value": 1.5,
+      "seconds": "1.5",
       "error": null
     },
     {
       "input": "0.05",
       "accepted": true,
       "value": 0.05,
+      "seconds": "0.05",
+      "error": null
+    },
+    {
+      "input": "1e-07",
+      "accepted": true,
+      "value": 1e-07,
+      "seconds": "1e-07",
       "error": null
     },
     {
       "input": "'0.5'",
       "accepted": true,
       "value": 0.5,
+      "seconds": "0.5",
       "error": null
     },
     {
       "input": "0",
       "accepted": false,
       "value": null,
+      "seconds": null,
       "error": "hooks_timeout must be a positive finite number or None; got 0"
     },
     {
       "input": "0.0",
       "accepted": false,
       "value": null,
+      "seconds": null,
       "error": "hooks_timeout must be a positive finite number or None; got 0.0"
     },
     {
       "input": "-1",
       "accepted": false,
       "value": null,
+      "seconds": null,
       "error": "hooks_timeout must be a positive finite number or None; got -1"
     },
     {
       "input": "-0.5",
       "accepted": false,
       "value": null,
+      "seconds": null,
       "error": "hooks_timeout must be a positive finite number or None; got -0.5"
     },
     {
       "input": "nan",
       "accepted": false,
       "value": null,
+      "seconds": null,
       "error": "hooks_timeout must be a positive finite number or None; got nan"
     },
     {
       "input": "inf",
       "accepted": false,
       "value": null,
+      "seconds": null,
       "error": "hooks_timeout must be a positive finite number or None; got inf"
     },
     {
       "input": "-inf",
       "accepted": false,
       "value": null,
+      "seconds": null,
       "error": "hooks_timeout must be a positive finite number or None; got -inf"
     }
   ],

@@ -31,7 +31,11 @@ public record HookCall(List<Hook> hooks, List<Consumer<PredictContext>> onPredic
             new HookCall(List.of(), List.of(), List.of(), null, null);
 
     public HookCall {
-        hooks = List.copyOf(hooks);
+        // normalise, not List.copyOf: both copy and both refuse a null entry, but only one of
+        // them says which argument was wrong. `List.copyOf` threw a bare NullPointerException
+        // from inside the JDK, so "a hooks entry must not be null" was unreachable from `of` and
+        // `andThen` -- the two ways a caller actually builds one of these.
+        hooks = Hooks.normalise(hooks, null, null);
         onPredictStart = List.copyOf(onPredictStart);
         onPredictEnd = List.copyOf(onPredictEnd);
         timeout = Hooks.validateTimeout(timeout);
@@ -49,7 +53,9 @@ public record HookCall(List<Hook> hooks, List<Consumer<PredictContext>> onPredic
 
     /** Several hooks, for this call only, in the given order. */
     public static HookCall of(List<? extends Hook> hooks) {
-        return new HookCall(List.copyOf(hooks), List.of(), List.of(), null, null);
+        // Handed over unfiltered, so the canonical constructor above is what copies and what
+        // refuses a null entry. `List.copyOf` here threw before it could.
+        return new HookCall(new ArrayList<>(hooks), List.of(), List.of(), null, null);
     }
 
     /** This call with one more hook appended. */

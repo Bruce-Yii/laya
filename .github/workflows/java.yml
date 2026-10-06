@@ -156,18 +156,22 @@ jobs:
       - name: Tests that need no model
         working-directory: laya-java
         run: ./gradlew --no-daemon test
-      # Measured locally: 812 registered, 798 RUN -- the floor counts what ran, so the 14
-      # checkpoint-backed cases this lane aborts are not in it. The margin is 4, the same shape
-      # as the 685/680 it replaces, and for the reason the `tokenizer` parity cell gives: a
-      # floor below the total minus the SMALLEST class does not bind that class. `AgentHooksTest`
-      # is 8 tests, so at the old 680 the whole of it could be deleted with this step still
-      # green. Verified both ways: with `AgentHooksTest` dropped 790 run and this exits 1; with
-      # `HooksTest` dropped 693 run and it exits 1.
+      # Measured locally on Corretto 17: 831 registered, 817 RUN -- the floor counts what ran,
+      # so the 14 checkpoint-backed cases this lane aborts are not in it. The margin is 4, the
+      # same shape as the 812/798 it replaces, and for the reason the `tokenizer` parity cell
+      # gives: a floor below the total minus the SMALLEST class does not bind that class.
+      # `AgentHooksTest` is 8 tests, so a floor more than 8 below the total would let the whole
+      # of it be deleted with this step still green. Verified by actually shrinking the suite:
+      # with `AgentHooksTest` dropped 809 run and this exits 1; with `HooksTest` and its stubs
+      # dropped 695 run and it exits 1.
+      #
+      # This floor and the jdk-matrix one differ by one ON PURPOSE -- see that lane for why a
+      # shared number let a whole five-test class be deleted there.
       - name: Model-free suite was not vacuous
         if: ${{ !cancelled() }}
         run: >
           python laya-java/scripts/check_test_results.py
-          laya-java/laya-java/build/test-results/test --min-tests 794 --allow-aborted
+          laya-java/laya-java/build/test-results/test --min-tests 813 --allow-aborted
 
       # The samples are single-file source programs, deliberately NOT a Gradle module: a
       # `samples` subproject would inherit the root build's MavenPublication and
@@ -322,11 +326,22 @@ jobs:
       # checkpoint-backed factories abort here, would forgive it. Measured: with the flag
       # dropped, Gradle exits 0 and the floor alone exits 0 on 488 tests, having run JDK 17 twice
       # and reported it as two JDKs. With `--require-passed` it exits 1.
+      #
+      # 814, not the build lane's 813, and the one is the point. This lane runs one test MORE
+      # than that one -- `TestJvmVersionTest` is `@EnabledIfSystemProperty` and only enabled
+      # here -- so 818 run against a shared floor of 813 would be a margin of 5, and the
+      # smallest class this lane could lose whole is `PreTokenizerTablesTest` at exactly 5.
+      # That is not hypothetical. Measured on the previous shared floor of 794, with the
+      # smallest `hooks.json` section emptied and no per-section guard: the build lane ran 793
+      # and exited 1 by exactly one test, and this lane ran 794 -- exactly ON the floor, so
+      # `check_test_results` exited 0 and the vacuity was invisible in the one lane that had the
+      # margin to hide it. The emptiness guard inside `HooksTest.section` is the real fix for
+      # that case; this keeps the arithmetic from being what saved it.
       - name: Model-free suite was not vacuous, and ran on the right JVM
         if: ${{ !cancelled() }}
         run: >
           python laya-java/scripts/check_test_results.py
-          laya-java/laya-java/build/test-results/test --min-tests 794 --allow-aborted
+          laya-java/laya-java/build/test-results/test --min-tests 814 --allow-aborted
           --require-passed TestJvmVersionTest
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: ${{ failure() }}
