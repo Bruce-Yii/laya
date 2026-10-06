@@ -1822,20 +1822,23 @@ def predict_golden():
 # `laya-typed-decisions` is fine-tuned from the ENGLISH checkpoint, which is what makes a
 # fixture family for it worth its weight. It ships the same `tokenizer.json` byte for byte
 # (diffed: identical) and the same `answerdotai/ModernBERT-large` encoder, and nothing in a
-# `.onnx` file says which checkpoint traced it. Measured: opening the ENGLISH checkpoint against
-# the typed graph raises nothing and answers {refund: 0.9077, replace: 0.0923} on a two-option
-# question -- the same digits, to the last one, as the typed checkpoint against its own graph,
-# because the weights are entirely the graph's and the two configs agree on the `choice:2`
-# temperature. `model` does not separate them either: the ONNX path reports
-# `laya-rl-agent-onnx` whichever checkpoint it opened. Only the multilingual checkpoint fails
-# loudly, and for an unrelated reason -- a 235292 token id against a 50368-row embedding, which
-# ONNX Runtime rejects at the `node_embedding` Gather.
+# `.onnx` file says which checkpoint traced it. Measured, with the english checkpoint symlinked
+# in as `typed-decisions/`: opening it against the typed graph raises nothing and reproduces the
+# probabilities recorded below inside the Java test's tolerance -- `off-workflow` answers
+# {billing: 0.8967, other: 0.1033}, which is what this file records for the right pairing, because
+# the weights are entirely the graph's and the two configs agree on the `choice:2` temperature.
+# `model` does not separate them either: the ONNX path reports `laya-rl-agent-onnx` whichever
+# checkpoint it opened. Only the multilingual checkpoint fails loudly, and for an unrelated
+# reason -- a 235292 token id against a 50368-row embedding, which ONNX Runtime rejects at the
+# `node_embedding` Gather.
 #
-# So the discriminator has to come from `rl_agent_config.json`, which is where the two do differ:
-# `max_len` 1024 against english's 512, `head_max_len` 256 against 192, `model_name`
-# `laya-typed-decisions` against `rl-agent`, and base temperatures [1.0148, 1.0374, 1.0575]
-# against [1.6369, 1.2514, 1.9834]. Those are recorded below as `config`, and the Java test
-# asserts them before it compares a single probability.
+# So the discriminator has to come from `rl_agent_config.json`, and from a narrower part of it
+# than it looks: `max_len` 1024 against english's 512, `head_max_len` 256 against 192,
+# `model_name` `laya-typed-decisions` against `rl-agent`, and base temperatures
+# [1.0148, 1.0374, 1.0575] against [1.6369, 1.2514, 1.9834]. NOT `temperature_by_options`, which
+# the two ship identically, every key and every digit, `choice:11+` at 0.1006 included. Those are
+# recorded below as `config`, and the Java test asserts them on the shared agent as it opens it,
+# so a wrong pairing fails every case rather than being caught by one test among fourteen.
 #
 # The question ids are read from `laya.router` rather than retyped: an exact id-set match is the
 # entire signature `match_typed_decisions_workflow` tests, so a signature change has to move this
@@ -2093,6 +2096,29 @@ TYPED_MANY_OPTION_QUESTIONS = {
 TYPED_OVER_BUDGET_STATE = ("line item number one, unit price 300.02 against a purchase order at "
                            "214.30, delivery accepted with exceptions. ") * 90
 
+# A score question with SIX levels, which `common.temp_bucket` maps to `score:6-10` -- a bucket
+# NEITHER this checkpoint nor the english one it is fine-tuned from ships. Their
+# `temperature_by_options` tables are identical, every key and every digit, `choice:11+` at
+# 0.10058280825614929 included, so the bucket lookup and the clamp cannot tell the two apart. The
+# miss is what makes the fitted `temperature[QTYPE_SCORE]` the scale actually applied here: 1.0374
+# on this checkpoint against 1.2514 on english. Without this case every recorded question landed in
+# a bucket both files ship, so the fitted triple was asserted in `config` and never once reached a
+# forward pass, and `over-budget` was the only case whose NUMBERS could tell the two apart.
+TYPED_UNBUCKETED_SCORE_QUESTIONS = {
+    "payment_priority": {
+        "type": "score",
+        "instructions": "How high a priority is settling this invoice this week?",
+        "criteria": [
+            "No priority; it can wait a quarter.",
+            "Low: settle within the month.",
+            "Normal: settle on the agreed terms.",
+            "Elevated: settle this week.",
+            "High: the vendor has threatened to stop shipping.",
+            "Critical: the line stops without it.",
+        ],
+    },
+}
+
 # A question set whose ids are NOT a workflow signature. The checkpoint still answers it -- being
 # fine-tuned on four schemas does not make it refuse a fifth -- and recording that is what stops
 # a port from special-casing the signatures somewhere in the forward pass, where they have no
@@ -2153,7 +2179,35 @@ TYPED_CASES = [
      TYPED_INVOICE_QUESTIONS),
     ("off-workflow", "We were billed twice for March and want a refund today.", "en", None,
      TYPED_OFF_WORKFLOW_QUESTIONS),
+    ("unbucketed-score", "Invoice INV-2026-8842 for 300,020 USD is three days overdue and the "
+                         "vendor has put the next casting run on hold until it clears.", None,
+     None, TYPED_UNBUCKETED_SCORE_QUESTIONS),
 ]
+
+
+def _graph_revision(graph):
+    """The `.laya-revision` stamp `prepare_checkpoint.py` wrote beside `graph`, or None.
+
+    `graph` is recorded as a basename, which is the same string at every revision, so nothing in
+    this file used to say WHICH revision traced the weights it was recorded from. The stamp is the
+    only thing on disk that does. With it recorded, a `HF_REVISION` bump is caught by `--check`:
+    the regenerated `revision` differs from the committed one and the parity cell goes red naming
+    the bump, rather than a golden being re-recorded from new weights in silence.
+    """
+    # Imported rather than re-spelled: the stamp name and its layout belong to the script that
+    # writes them, and a second copy here would be a constant that can drift from the only code
+    # that produces the file it names.
+    if HERE not in sys.path:
+        sys.path.insert(0, HERE)
+    from prepare_checkpoint import STAMP
+
+    marker = (os.path.join(graph, STAMP) if os.path.isdir(graph) else graph + STAMP)
+    try:
+        with open(marker, "r", encoding="utf-8") as handle:
+            recorded = handle.read().strip().split()
+    except OSError:
+        return None
+    return recorded[0] if recorded else None
 
 
 def typed_decisions_golden():
@@ -2165,8 +2219,8 @@ def typed_decisions_golden():
     would re-record `predict.json` from the wrong weights, and both sides of that comparison come
     from the same mistake, so it passes. `LAYA_TYPED_ONNX_GRAPH` keeps the two unable to collide.
 
-    Records `skipped` when the graph is absent, so `unverifiable` leaves the committed file alone
-    rather than replacing it with a marker.
+    Records `skipped` when the graph OR the checkpoint is absent, so `unverifiable` leaves the
+    committed file alone rather than replacing it with a marker.
 
     Platform-sensitive in the last reported digit, as `predict_golden` is; the Java test's
     tolerance is the gate, not byte equality of this file.
@@ -2179,6 +2233,14 @@ def typed_decisions_golden():
     if not graph or not os.path.exists(graph):
         return {"skipped": "set LAYA_TYPED_ONNX_GRAPH to a laya.onnx exported from the "
                            "typed-decisions checkpoint to record this family"}
+    # The graph is not enough on its own: `ONNXAgent` reads the budgets, the fitted temperatures
+    # and the tokenizer out of the checkpoint directory. Checked here because without it "graph
+    # present, checkpoint absent" was the one mode of this family that raised a bare
+    # `FileNotFoundError` from inside `laya/onnx_agent.py` instead of writing the marker every
+    # sibling builder writes -- loud, but naming a path rather than the command to run.
+    if not os.path.isfile(os.path.join(rig, model, "rl_agent_config.json")):
+        return {"skipped": "no rl_agent_config.json for %s under %s: run "
+                           "prepare_checkpoint.py --checkpoint %s" % (model, rig, model)}
     from laya.onnx_agent import ONNXAgent
     from laya.router import _TYPED_DECISION_WORKFLOWS
 
@@ -2215,10 +2277,12 @@ def typed_decisions_golden():
     return {
         "checkpoint": model,
         "graph": os.path.basename(graph),
+        "revision": _graph_revision(graph),
         # What tells this checkpoint from the english one it was fine-tuned from, which ships the
-        # identical tokenizer and the identical encoder. Asserted by the Java test before any
-        # probability is compared, because a mismatch here means the numbers below were produced
-        # by the wrong weights and comparing them is worse than not running.
+        # identical tokenizer and the identical encoder. Asserted on the shared agent as it is
+        # opened, so it gates every case below rather than being one more test among them: a
+        # mismatch here means those numbers were produced by the wrong weights and comparing them
+        # is worse than not running.
         "config": {
             "model_name": cfg["model_name"],
             "encoder": cfg["encoder"],

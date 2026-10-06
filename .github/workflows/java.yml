@@ -153,6 +153,12 @@ jobs:
 
       # Without LAYA_CHECKPOINTS the checkpoint-backed factories abort by assumption and the rest
       # run. `--min-tests` is what stops an aborted suite from looking like a pass.
+      #
+      # Measured: 703 register here, 686 run, 17 abort on a checkpoint this lane does not have.
+      # Exact, not padded -- it stood at 680 long enough for the real figure to pass it by, which
+      # is how a floor stops being one. ONE below the JDK-matrix lane's floor on purpose: that
+      # lane passes `-PtestJavaVersion`, which is what makes `TestJvmVersionTest` run instead of
+      # skip, so it executes 687. Same suite, one more test, because the flag enables it.
       - name: Tests that need no model
         working-directory: laya-java
         run: ./gradlew --no-daemon test
@@ -160,7 +166,7 @@ jobs:
         if: ${{ !cancelled() }}
         run: >
           python laya-java/scripts/check_test_results.py
-          laya-java/laya-java/build/test-results/test --min-tests 680 --allow-aborted
+          laya-java/laya-java/build/test-results/test --min-tests 686 --allow-aborted
 
       # The samples are single-file source programs, deliberately NOT a Gradle module: a
       # `samples` subproject would inherit the root build's MavenPublication and
@@ -315,11 +321,14 @@ jobs:
       # checkpoint-backed factories abort here, would forgive it. Measured: with the flag
       # dropped, Gradle exits 0 and the floor alone exits 0 on 488 tests, having run JDK 17 twice
       # and reported it as two JDKs. With `--require-passed` it exits 1.
+      #
+      # 687, one above the `build` lane's 686: `-PtestJavaVersion` is what makes
+      # `TestJvmVersionTest` run rather than skip, so this lane executes exactly one test more.
       - name: Model-free suite was not vacuous, and ran on the right JVM
         if: ${{ !cancelled() }}
         run: >
           python laya-java/scripts/check_test_results.py
-          laya-java/laya-java/build/test-results/test --min-tests 680 --allow-aborted
+          laya-java/laya-java/build/test-results/test --min-tests 687 --allow-aborted
           --require-passed TestJvmVersionTest
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: ${{ failure() }}
@@ -409,27 +418,33 @@ jobs:
           #     holding both would export two graphs and run two exports serially -- the 40
           #     minutes this matrix was split to avoid, paid twice in one cell instead of once
           #     in each of two that run in parallel.
-          #   * The export cache is keyed on `graph-model`, so each checkpoint's graph is
-          #     invalidated by its own revision bump. A merged cell would key two graphs under
-          #     one entry and re-export both whenever either moved.
+          #   * The export cache is keyed per checkpoint (`graph-model` is in the key), so a
+          #     restore brings back ONE graph and a miss re-exports one. A merged cell would key
+          #     two graphs under one entry and re-export both on any miss, including the 1.7 GB
+          #     it already had. Not "each checkpoint's graph is invalidated by its own revision
+          #     bump" -- there is no such thing: `prepare_checkpoint.py` pins a single
+          #     `HF_REVISION` for every checkpoint, and that file is inside this key's
+          #     `hashFiles(...)`, so a bump invalidates every cell at once. What stops a restored
+          #     pre-bump cache from being reused is the `.laya-revision` stamp `stamped()` reads,
+          #     not the key.
           #   * These two goldens fail for unrelated reasons. A merged cell reports one status
           #     for both, and the first thing a reader of a red parity lane needs to know is
           #     which checkpoint moved.
           #
           # Cost, measured locally with the Hub blobs already cached: 846 MB of checkpoint, a
           # 39 s ONNX export producing 3.6 MB of graph beside 1.7 GB of external weights, 103 s
-          # to record the family and 109 s for the 13 tests. On a cold runner the download is
+          # to record the family and 140-180 s for the 14 tests. On a cold runner the download is
           # the open variable and is why this carries the same 75-minute ceiling as `predict`.
           - name: typed-decisions
             checkpoints: typed-decisions
             graph-model: typed-decisions
             families: --only typed_decisions.json
             tests: --tests com.convaiinnovations.laya.TypedDecisionsParityTest
-            # Measured locally: 13 -- 8 single-state cases, 3 batch configs, the config identity
+            # Measured locally: 14 -- 9 single-state cases, 3 batch configs, the config identity
             # check and the workflow-signature check. Exact rather than padded down, because the
             # two non-factory tests are what catch a wrong checkpoint/graph pairing and a margin
             # of 2 would let both be dropped with this floor still green.
-            min-tests: 13
+            min-tests: 14
             timeout: 75
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0

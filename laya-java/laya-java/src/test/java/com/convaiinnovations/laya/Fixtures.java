@@ -36,11 +36,14 @@ public final class Fixtures {
      *
      * <p>A second variable rather than reusing the first, because a graph carries the weights and
      * nothing in it says which checkpoint traced it -- so a wrong pairing answers rather than
-     * failing. Measured: the english checkpoint opened against the typed-decisions graph raises
-     * nothing and returns {@code {refund: 0.9077, replace: 0.0923}}, digit for digit what the
-     * typed-decisions checkpoint returns against its own graph, and {@link Prediction#model()}
-     * reads {@code laya-rl-agent-onnx} either way. One variable holding one directory would make
-     * that pairing the default whenever both suites run in the same JVM.
+     * failing. Measured, with the english checkpoint symlinked in as {@code typed-decisions/}:
+     * opening it against the typed-decisions graph raises nothing and reproduces the recorded
+     * probabilities inside the golden's tolerance -- {@code off-workflow} answers
+     * {@code {billing: 0.8967, other: 0.1033}}, which is what
+     * {@code fixtures/typed_decisions.json} records for the right pairing -- and
+     * {@link Prediction#model()} reads {@code laya-rl-agent-onnx} either way. One variable
+     * holding one directory would make that pairing the default whenever both suites run in the
+     * same JVM.
      */
     public static final String TYPED_GRAPH_ENV = "LAYA_TYPED_ONNX_GRAPH";
 

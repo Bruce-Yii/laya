@@ -1,6 +1,7 @@
 {
   "checkpoint": "typed-decisions",
   "graph": "laya.onnx",
+  "revision": "55cf4c4ebb4ebe31b2550e8bdf3bd21b99753851",
   "config": {
     "model_name": "laya-typed-decisions",
     "encoder": "answerdotai/ModernBERT-large",
@@ -1102,6 +1103,61 @@
         "input_tokens": 36,
         "output_tokens": 0,
         "state_tokens": 12,
+        "state_tokens_dropped": 0,
+        "truncated": false,
+        "truncated_questions": []
+      }
+    },
+    "unbucketed-score": {
+      "state": "Invoice INV-2026-8842 for 300,020 USD is three days overdue and the vendor has put the next casting run on hold until it clears.",
+      "lang": null,
+      "workflow": null,
+      "questions": {
+        "payment_priority": {
+          "type": "score",
+          "instructions": "How high a priority is settling this invoice this week?",
+          "criteria": [
+            "No priority; it can wait a quarter.",
+            "Low: settle within the month.",
+            "Normal: settle on the agreed terms.",
+            "Elevated: settle this week.",
+            "High: the vendor has threatened to stop shipping.",
+            "Critical: the line stops without it."
+          ]
+        }
+      },
+      "model": "laya-rl-agent-onnx",
+      "answers": {
+        "payment_priority": {
+          "type": "score",
+          "score": 3.0829,
+          "legend": {
+            "0": "No priority; it can wait a quarter.",
+            "1": "Low: settle within the month.",
+            "2": "Normal: settle on the agreed terms.",
+            "3": "Elevated: settle this week.",
+            "4": "High: the vendor has threatened to stop shipping.",
+            "5": "Critical: the line stops without it."
+          },
+          "probabilities": {
+            "0": 0.0086,
+            "1": 0.107,
+            "2": 0.1279,
+            "3": 0.3645,
+            "4": 0.3335,
+            "5": 0.0585
+          },
+          "confidence": 0.1946,
+          "answer_confidence": 0.3645,
+          "action": {
+            "act_probability": 1.0
+          }
+        }
+      },
+      "usage": {
+        "input_tokens": 128,
+        "output_tokens": 0,
+        "state_tokens": 36,
         "state_tokens_dropped": 0,
         "truncated": false,
         "truncated_questions": []

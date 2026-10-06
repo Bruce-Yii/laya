@@ -93,7 +93,13 @@ subprojects {
         // are supposed to abort by assumption. Treating blank as unset is what makes "this cell
         // has no graph" and "this machine has no graph" the same case, which is what the tests
         // are written against.
-        listOf("LAYA_CHECKPOINTS", "LAYA_ONNX_GRAPH", "LAYA_PREDICT_GOLDEN").forEach { name ->
+        //
+        // EVERY variable the tests read belongs in this list. `LAYA_TYPED_ONNX_GRAPH` was left
+        // out when it was added and worked anyway, because the Test JVM inherits the ambient
+        // environment -- which is exactly the quiet inheritance this block exists to replace,
+        // and it is the one of the four that two of the three parity cells set to `''`.
+        listOf("LAYA_CHECKPOINTS", "LAYA_ONNX_GRAPH", "LAYA_TYPED_ONNX_GRAPH",
+                "LAYA_PREDICT_GOLDEN").forEach { name ->
             System.getenv(name)?.takeIf { it.isNotBlank() }?.let { environment(name, it) }
         }
     }

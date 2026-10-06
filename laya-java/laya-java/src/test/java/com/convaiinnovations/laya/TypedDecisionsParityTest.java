@@ -20,8 +20,11 @@ import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.DynamicTest;
+import org.junit.jupiter.api.MethodOrderer;
+import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestFactory;
+import org.junit.jupiter.api.TestMethodOrder;
 
 /**
  * End to end on the {@code typed-decisions} checkpoint, which nothing in this port used to run.
@@ -49,8 +52,16 @@ import org.junit.jupiter.api.TestFactory;
  *       probabilities are the only thing that separates the two implementations.
  *   <li>{@code max_len} 1024 against the english checkpoint's 512. The {@code over-budget} case
  *       drops 1211 state tokens at that budget and marks all five questions truncated.
+ *   <li>A question whose option count lands in a bucket NEITHER checkpoint ships.
+ *       {@code unbucketed-score} is a six-level score question, so {@code temp_bucket} returns
+ *       {@code score:6-10}, the lookup misses, and the fitted {@code temperature[QTYPE_SCORE]}
+ *       is the scale applied: 1.0374 here against 1.2514 on english. Every other recorded
+ *       question resolves to a bucket both checkpoints ship -- their
+ *       {@code temperature_by_options} tables are identical, every key and every digit -- so
+ *       without this case the fitted triple was asserted and never applied.
  * </ul>
  */
+@TestMethodOrder(MethodOrderer.OrderAnnotation.class)
 final class TypedDecisionsParityTest {
 
     /** The checkpoint this golden was recorded from; also the directory it lives in. */
@@ -59,32 +70,58 @@ final class TypedDecisionsParityTest {
     /** Shared for the class: the graph is 1.7 GB of weights and opening it twice buys nothing. */
     private static Agent shared;
 
+    /**
+     * The identity failure, if the checkpoint opened is not the one this golden was recorded from.
+     *
+     * <p>Recorded rather than thrown once, because {@link #agent} rethrows it to EVERY consumer.
+     * Caching it is what keeps that from costing a second 1.7 GB open per test.
+     */
+    private static AssertionError mispaired;
+
     @AfterAll
     static void closeAgent() {
         if (shared != null) {
             shared.close();
             shared = null;
         }
+        mispaired = null;
     }
 
     /**
-     * The loaded config is the typed-decisions one, before any probability is compared.
+     * The loaded config is the typed-decisions one.
      *
      * <p>Not ceremony. This checkpoint is fine-tuned FROM the english one and ships its
      * {@code tokenizer.json} byte for byte and its {@code answerdotai/ModernBERT-large} encoder,
-     * so the english checkpoint opened against this graph raises nothing and answers
-     * {@code {refund: 0.9077, replace: 0.0923}} -- the same digits as the right pairing, because
-     * the weights are the graph's. {@link Prediction#model()} does not separate them either: the
-     * ONNX path reports {@code laya-rl-agent-onnx} whichever checkpoint it opened. The budgets
-     * and the temperatures do separate them, so they are what is asserted.
+     * so the english checkpoint opened against this graph raises nothing and reproduces the
+     * recorded probabilities -- {@code off-workflow}'s {@code {billing: 0.8967, other: 0.1033}}
+     * among them, digit for digit, because the weights are the graph's.
+     * {@link Prediction#model()} does not separate them either: the ONNX path reports
+     * {@code laya-rl-agent-onnx} whichever checkpoint it opened. What separates them is the
+     * budgets and the fitted temperatures, so those are what is asserted. NOT
+     * {@code config.model_name}, which the golden records and which would name the checkpoint
+     * outright: {@link AgentConfig} does not parse that key, so there is nothing to compare it
+     * against without adding a field to it.
+     *
+     * <p>This test is only the NAMED place that failure is reported. The assertion itself runs
+     * inside {@link #agent}, on the shared agent as it is opened, so it gates every case in this
+     * class instead of being one more test among them -- which is what it was: JUnit 5 applies no
+     * ordering of its own, and measured against the english checkpoint symlinked in as
+     * {@code typed-decisions} this check ran NINTH of thirteen, after all eight probability
+     * comparisons. {@link Order} pins it first as well, so the report reads in the order the
+     * gating actually happens.
      */
     @Test
+    @Order(1)
     @DisplayName("the agent under test is the typed-decisions checkpoint, not the english one")
-    @SuppressWarnings("unchecked")
     void configIsTheTypedCheckpoint() throws IOException {
         Map<String, Object> golden = requireGolden();
+        assertTypedCheckpoint(golden, agent(golden).config());
+    }
+
+    /** The identity comparison itself, so {@link #agent} can apply it to every consumer. */
+    @SuppressWarnings("unchecked")
+    private static void assertTypedCheckpoint(Map<String, Object> golden, AgentConfig config) {
         Map<String, Object> want = (Map<String, Object>) golden.get("config");
-        AgentConfig config = agent(golden).config();
         assertEquals(want.get("encoder"), config.encoder(), "encoder");
         assertEquals(((Number) want.get("max_len")).intValue(), config.maxLen(), "max_len");
         assertEquals(((Number) want.get("head_max_len")).intValue(), config.headMaxLen(),
@@ -109,6 +146,14 @@ final class TypedDecisionsParityTest {
         // above. 0.1006 in `rl_agent_config.json`, 0.5 in use: a port that read the file value
         // straight through would sharpen the many-options distribution by ~5x, and a lone 0.5 in
         // the golden could not be told from a bucket that was fitted at 0.5.
+        //
+        // This catches a PORT bug, and nothing else in this method does less. It has no power
+        // over the wrong-checkpoint pairing: measured, the english and typed-decisions
+        // `temperature_by_options` tables are identical, every key and every digit, 0.1006
+        // included, so the keyset assert, the per-bucket loop, the raw-value assert and this
+        // clamp all pass unchanged under the wrong checkpoint. What discriminates above is
+        // `max_len` (1024 vs 512), `head_max_len` (256 vs 192) and the fitted `temperature`
+        // triple -- those three and nothing more.
         Map<String, Object> raw = (Map<String, Object>) want.get("temperature_by_options_raw");
         assertEquals(0.10058280825614929, ((Number) raw.get("choice:11+")).doubleValue(),
                 "the checkpoint still ships the sharpening bucket this case depends on");
@@ -124,6 +169,7 @@ final class TypedDecisionsParityTest {
      * returns, which reads as coverage of a path that no longer exists.
      */
     @Test
+    @Order(2)
     @DisplayName("each case's question ids still match the workflow it was recorded under")
     @SuppressWarnings("unchecked")
     void workflowsStillMatch() {
@@ -151,6 +197,7 @@ final class TypedDecisionsParityTest {
     }
 
     @TestFactory
+    @Order(3)
     @DisplayName("single-state typed-decisions predictions match Python")
     @SuppressWarnings("unchecked")
     List<DynamicTest> singleMatches() throws IOException {
@@ -169,14 +216,15 @@ final class TypedDecisionsParityTest {
                 assertUsage((Map<String, Object>) c.get("usage"), got.usage());
             }));
         }
-        // Four workflows plus the three cases that are here for the checkpoint's own budgets and
+        // Four workflows plus the four cases that are here for the checkpoint's own budgets and
         // temperature buckets. A factory whose fixture key emptied used to generate zero
         // assertions and still exit 0, which is what this floor is for.
-        assertTrue(tests.size() >= 8, "expected the golden's cases, got " + tests.size());
+        assertTrue(tests.size() >= 9, "expected the golden's cases, got " + tests.size());
         return tests;
     }
 
     @TestFactory
+    @Order(4)
     @DisplayName("batched typed-decisions predictions match Python at every batch size")
     @SuppressWarnings("unchecked")
     List<DynamicTest> batchMatches() throws IOException {
@@ -197,6 +245,10 @@ final class TypedDecisionsParityTest {
                         assertEquals(want.size(), got.size(), "one prediction per state");
                         for (int i = 0; i < want.size(); i++) {
                             Map<String, Object> w = (Map<String, Object>) want.get(i);
+                            // Recorded on every batch result by the generator and, until now,
+                            // compared only on the single-state path -- a field the fixture
+                            // carries that nothing read.
+                            assertEquals(w.get("model"), got.get(i).model(), "model");
                             // The caller's order, whatever order the batcher grouped them in.
                             assertAnswers((Map<String, Object>) w.get("answers"),
                                     got.get(i).answers());
@@ -216,10 +268,33 @@ final class TypedDecisionsParityTest {
         return golden;
     }
 
-    /** The shared agent, opened on first use so the assumptions still skip cleanly. */
+    /**
+     * The shared agent, opened on first use so the assumptions still skip cleanly.
+     *
+     * <p>Where the identity check lives, so it gates every consumer rather than racing them.
+     * JUnit 5 orders nothing by default and this class shares one agent, so whichever test ran
+     * first opened the weights and the config comparison was just another test in the list --
+     * measured ninth of thirteen, after all eight probability comparisons had already passed
+     * against the wrong checkpoint. Asserted here, a mispairing fails every case that touches
+     * the weights, with the reason named. The failure is cached because rethrowing it is cheap
+     * and reopening 1.7 GB of graph per test is not; {@code shared} is set either way so the
+     * open happens once.
+     */
     private static synchronized Agent agent(Map<String, Object> golden) throws IOException {
         if (shared == null) {
-            shared = openAgent(golden);
+            // Deliberately NOT guarded by a separate `opened` flag: `openAgent` aborts by
+            // assumption when the checkpoint or the graph is missing, and that abort has to be
+            // rethrown to every caller, not swallowed into a null `shared`.
+            Agent agent = openAgent(golden);
+            try {
+                assertTypedCheckpoint(golden, agent.config());
+            } catch (AssertionError failure) {
+                mispaired = failure;
+            }
+            shared = agent;
+        }
+        if (mispaired != null) {
+            throw mispaired;
         }
         return shared;
     }
