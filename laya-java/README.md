@@ -13,12 +13,14 @@ four questions about a document cost one batched encode rather than four round t
 Implemented: tokenizer, sequence builder, config, ONNX inference (fused or split graph), answer
 decoding, `predict`, `predictBatch`, usage and truncation reporting, script and language detection
 (`lang.LanguageDetection`), the question presets (`Presets`), the checkpoint `Router` with its
-load-and-evict lifecycle, the embedding `Shortlist` with its LRU cache, and the email cleaner
-and state builder (`LayaEmail`).
+load-and-evict lifecycle, the embedding `Shortlist` with its LRU cache, the email cleaner and
+state builder (`LayaEmail`), the long-state scan (`predictLong`), the abstention gate
+(`ConfidenceGate`), and the prediction hooks (`hooks`).
 
-Not implemented yet: hooks, `predictLong`, structured `decide`, the
-`laya-java-client` HTTP module, Android. **Not published to Maven Central** — see
-[Installing](#installing).
+Not implemented yet: structured `decide`, the `laya-java-client` HTTP module, Android. Hooks run
+on `predict` and `predictBatch`; `Router` and `predictLong` do not dispatch them, and there is no
+`AsyncHook` — see [Watching and shaping a call](#watching-and-shaping-a-call). **Not published to
+Maven Central** — see [Installing](#installing).
 
 ## Where to go next
 
@@ -350,6 +352,60 @@ every window of a long document tokenize differently from the reference, so the 
 `Agent.using(tokenizer, config, session)` assembles an agent from parts — for a caller that already
 holds them, or to drive the batching and usage accounting through a stub
 `infer.InferenceSession` instead of a 1.2 GB graph.
+
+## Watching and shaping a call
+
+```java
+agent.hooks().addHook(new Hook() {
+    @Override public void onPredictEnd(PredictContext ctx) {
+        metrics.record(ctx.model(), ctx.usage().inputTokens(), ctx.elapsedMs());
+    }
+});
+
+// Per call: answer from a cache without the model running at all.
+agent.predictBatch(states, questions, null, 0, false,
+        HookCall.of(Hooks.onPredictStart(ctx -> cache.lookup(ctx.states())
+                .ifPresent(ctx::skip))));
+```
+
+A hook is the one place your code runs **inside** a prediction. Implement any of the six methods
+on `Hook` — the rest default to doing nothing — and install it on the agent, on a single call, or
+process-wide with `Hooks.setDefaultHooks`.
+
+`PredictContext` is the call, and it is mutable on purpose. A start hook may rewrite
+`ctx.states(...)` or `ctx.questions(...)`, move the token budget with `ctx.maxLen(...)` /
+`ctx.headMaxLen(...)`, or answer outright with `ctx.skip(results)` — which skips inference while
+still running the end hooks. An end hook may replace `ctx.results(...)`, and sees `ctx.usage()`
+totalled over the call plus `ctx.elapsedMs()`. Every hook of one call gets the **same** context,
+so `ctx.runId()` pairs a start with its end without state of your own.
+
+The order is a contract: **process-wide defaults, then installed, then per-call**, and within a
+per-call `HookCall`, hook objects before the `onStart`/`onEnd` callbacks. A tracer installed to
+watch what a per-call hook did only sees it if it runs after it.
+
+`agent.hooks()` also carries the policy. `raiseErrors(false)` reports a throwing hook and carries
+on, which is what a telemetry hook needs — it must not be able to fail a request.
+`concurrent(false)` serialises hooks that are not re-entrant. `timeout(Duration)` bounds each hook
+call; an overrunning hook fails the request, though it **keeps running** in the background, since
+neither runtime can interrupt a thread that will not cooperate. A `HookCall` can override
+`raiseErrors` and `timeout` for one call without touching the others.
+
+Scope hooks to a block with `try (var scope = agent.hooks().hooksInstalled(tracer)) { ... }`. It
+removes one copy of each hook it added — not every copy by identity, which would take one the
+application had installed before the block, and not a snapshot, which would undo an overlapping
+block and discard anything added inside this one.
+
+`predictLong` runs **no** hooks — not per-call, not installed, not process-wide. A scan is sized
+before any hook could run, and the reference only lets hooks into `predict_long` by way of a start
+probe, a post-chain budget check and two separate "a hook answered the document" paths. None of
+those are ported, and without them a hook that adds one option silently re-truncates every window.
+Window the state yourself and hand the windows to `predictBatch` if you need hooks over a long
+document.
+
+There is no `AsyncHook`. It exists in the reference to finish a coroutine from synchronous code,
+and a JVM method call is already synchronous: a hook that wants asynchronous work composes it and
+blocks on it — `ship(ctx.results()).toCompletableFuture().join()` — bounded however your runtime
+wants, or by `timeout(Duration)`.
 
 ## Threads
 

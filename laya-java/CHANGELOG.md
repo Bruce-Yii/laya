@@ -44,6 +44,25 @@ see [Installing](README.md#installing).
   span said it did. `Budget` carries the reference's `RuntimeWarning` text as data as well as
   logging it, since every clamp here is a decision the caller cannot otherwise see — their window
   shrinks, their stride shrinks with it, and the forward-pass count can triple.
+- `hooks`: the opt-in lifecycle, ported from `laya.hooks`. `Hook` is one interface with six
+  default no-op methods — the reference's structural `Hook` protocol and its concrete `BaseHook`
+  are the same thing once an interface can carry defaults. `PredictContext` is the per-call,
+  mutable state every hook of one call shares: a start hook may rewrite the states, the
+  questions and the token budget, or answer the call outright with `ctx.skip(...)`, in which
+  case the model never runs; an end hook may replace the results and sees the call's totalled
+  `usage` and `elapsedMs`. `HookRegistry` is the per-agent list — `agent.hooks()` — editable
+  while the agent is alive and snapshotted per call, with `hooksInstalled` scoping hooks to a
+  block. `HookCall` carries per-call hooks and policy overrides. `Hooks` composes the chain —
+  **process-wide defaults, then installed, then per-call**, which is a contract and not an
+  implementation detail — dispatches it, bounds each hook with an optional deadline, serialises
+  it behind a lock when asked, and totals usage. `Agent.predict` and `Agent.predictBatch` run
+  it; `Agent.predictLong` deliberately does not, for the reason under *Known limitations*.
+  Everything above is recorded from the reference in `fixtures/hooks.json`, including what a
+  start hook sees, what `skip` does to inference, and what a throwing hook does under each
+  policy.
+- `Agent.using(tokenizer, config, session, modelName)` and `Agent.modelName()`: the checkpoint
+  name a hook reads off `PredictContext.model()`. `Agent.open` takes it from the model
+  directory's own name, since `rl_agent_config.json` does not carry one.
 - `Tokenizer.decode(int[])` and `decode(int[], boolean skipSpecialTokens)`: ids back to text,
   matching the `tokenizers` crate's `ByteLevel`, `Replace`, `ByteFallback`, `Fuse`, `Strip` and
   `Sequence` decoders. Byte-exact against the reference over both shipped checkpoints, including
@@ -87,8 +106,25 @@ see [Installing](README.md#installing).
 
 ### Known limitations
 
-- Not implemented: hooks, `predictLong`, structured `decide`, the `laya-java-client` HTTP module,
-  Android.
+- Not implemented: structured `decide`, the `laya-java-client` HTTP module, Android.
+- `AsyncHook` is not ported, and will not be. It exists in the reference to finish a coroutine
+  from synchronous code; a JVM method call is already synchronous, so a hook that wants
+  asynchronous work composes it and blocks on it in one line. Porting the wrapper would mean
+  choosing a future type for every caller and owning a thread pool to await on.
+- Hooks run on `predict` and `predictBatch` only. `Router` does not dispatch them — so
+  `PredictContext` has no `router`/`decision` pair, rather than two fields that are always null
+  — and `predictLong` deliberately does not either. The reference's `predict_long` survives
+  hooks only by way of a start probe, a post-chain budget check and two separate "a hook
+  answered the document" paths, none of which this port has; without them a hook that adds one
+  option silently re-truncates every window, and a hook that answers the call leaves `windows`
+  claiming a scan that never ran. Running hooks there without that machinery would be worse
+  than not running them.
+- `Hooks.withoutDefaultHooks` is a `ThreadLocal` where the reference's `_SKIP_DEFAULTS` is a
+  `contextvars.ContextVar`. A `ContextVar` is copied into an asyncio task; a `ThreadLocal` is
+  not inherited by a thread started inside the scope. Nothing here dispatches hooks off the
+  calling thread, so there is nowhere for it to bite today.
+- A timed-out hook keeps running, on both runtimes: neither Java nor Python can interrupt a
+  thread that will not cooperate, so the deadline bounds the request and not the process.
 - `typed-decisions` is routable — `Router` knows it and resolves its aliases — but has no recorded
   end-to-end fixtures. The routing decision is tested; a forward pass against that checkpoint is
   not.
@@ -125,5 +161,10 @@ Recorded here because each one was a defect first and a lesson second.
   does not merely misreport a score, it changes which labels survive the cut.
 - `%.0f` and `round()` are half-to-**even** in CPython; `String.format` and `Math.round` are
   half-up.
+- A Java `finally` that throws **replaces** the pending exception, where Python's re-raises the
+  original. The reference's hook wrapper goes out of its way to stop a failing end hook masking
+  the failure it was observing, so the end-hook stage here is written out longhand rather than
+  put in a `finally`, and the hook's failure is attached with `addSuppressed` where the
+  reference chains it onto `__context__`.
 
 [0.1.0]: https://github.com/NandhaKishorM/laya

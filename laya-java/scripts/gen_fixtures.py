@@ -3069,6 +3069,712 @@ def confidence_gate():
             " the three states and the no-op" % (gated, len(GATE_STATES)))
     return {"states": list(GATE_STATES), "cases": cases, "refusals": refusals}
 
+# ---------------------------------------------------------------------------
+# laya.hooks: composition order, what a hook sees, and what it can change.
+# ---------------------------------------------------------------------------
+
+#: Results carry a usage block only, so a case's provenance is readable from one number:
+#: inference returns 110+, a start hook's `ctx.skip()` returns 10+, an end hook's rewrite 510+.
+def _hook_result(i):
+    """One result dict in the shape `predict_batch` returns, with a usage block to aggregate."""
+    return {"model": "laya-rl-agent-onnx", "answers": {},
+            "usage": {"input_tokens": 10 + i, "output_tokens": i, "state_tokens": 7,
+                      "state_tokens_dropped": 0, "truncated": False,
+                      "truncated_questions": []}}
+
+
+def _hook_questions(ids):
+    """A question mapping with those ids: one noul each, which is all these cases need asked."""
+    return {qid: {"noul": "is this %s" % qid} for qid in ids}
+
+
+def _apply_hook_behaviour(spec, ctx, name):
+    """The one behaviour a stub hook performs, named by a string the port reconstructs.
+
+    A behaviour is data rather than a closure so the Java side can build the same chain from the
+    fixture. Anything a hook is allowed to do to a call is one of these.
+    """
+    if spec is None or spec == "record":
+        return
+    verb, _, argument = spec.partition(":")
+    if verb == "raise":
+        raise ValueError("boom from %s" % name)
+    if verb == "skip":
+        ctx.skip([_hook_result(i) for i in range(int(argument))])
+        return
+    if verb == "states":
+        ctx.states = argument.split(",") if argument else []
+        return
+    if verb == "questions":
+        ctx.questions = _hook_questions(argument.split(",") if argument else [])
+        return
+    if verb == "results":
+        ctx.results = [_hook_result(500 + i) for i in range(int(argument))]
+        return
+    if verb == "max_len":
+        ctx.max_len = int(argument)
+        return
+    if verb == "head_max_len":
+        ctx.head_max_len = int(argument)
+        return
+    if verb == "sleep":
+        import time as _time
+        _time.sleep(float(argument))
+        return
+    raise AssertionError("unknown hook behaviour %r" % (spec,))
+
+
+def _stub_hook(log, name, events, behaviour=None, observe=False):
+    """A hook implementing exactly `events`, appending to `log` and then doing `behaviour`.
+
+    The class is called `StubHook` whatever the instance is named, because `dispatch`'s
+    `raise_errors=False` warning quotes `type(hook).__name__` and that text is part of what this
+    family pins -- so the port's stub has to be able to produce the same string.
+    """
+    def make(event):
+        def method(self, ctx):
+            if observe:
+                log.append(_observation(name, event, ctx))
+            else:
+                log.append("%s.%s" % (name, event))
+            spec = behaviour.get(event) if isinstance(behaviour, dict) else behaviour
+            _apply_hook_behaviour(spec, ctx, name)
+        method.__name__ = event
+        method.__qualname__ = "StubHook.%s" % event
+        return method
+
+    namespace = {event: make(event) for event in events}
+    namespace["stub_name"] = name
+    return type("StubHook", (object,), namespace)()
+
+
+def _observation(name, event, ctx):
+    """Everything one hook can read off the context, as the fixture records it."""
+    states = ctx.states
+    if isinstance(states, (list, tuple)):
+        states = list(states)
+    questions = ctx.questions
+    return {
+        "call": "%s.%s" % (name, event),
+        "states": states,
+        "questions": list(questions) if isinstance(questions, dict) else questions,
+        "model": ctx.model,
+        "max_len": ctx.max_len,
+        "head_max_len": ctx.head_max_len,
+        # `None` is not `[]`: "inference has not run" and "inference returned nothing" are
+        # different states of the call, and a start hook distinguishes them to decide whether an
+        # earlier hook has already answered.
+        "results": None if ctx.results is None else [r["usage"]["input_tokens"]
+                                                     for r in ctx.results],
+        "usage": ctx.usage,
+        "error": None if ctx.error is None else str(ctx.error),
+        # Popped before the fixture is written -- it is a fresh uuid4 per call, so recording
+        # the value would make the file differ on every run. What IS recorded is that one call's
+        # hooks all saw the SAME one, and how long it is.
+        "run_id": ctx.run_id,
+        "elapsed_ms_set": ctx.elapsed_ms is not None,
+    }
+
+
+#: (case, default hook names, installed names, per-call `hooks=` names, `on_predict_start=`
+#: names, `on_predict_end=` names, whether the call runs under `_SKIP_DEFAULTS`).
+HOOK_COMPOSITION_CASES = [
+    ("nothing-installed", [], [], [], [], [], False),
+    ("defaults-only", ["d1", "d2"], [], [], [], [], False),
+    ("installed-only", [], ["i1", "i2"], [], [], [], False),
+    ("per-call-only", [], [], ["p1", "p2"], [], [], False),
+    # THE order contract: defaults, then installed, then per-call.
+    ("defaults-then-installed-then-per-call", ["d1"], ["i1"], ["p1"], [], [], False),
+    # The two convenience callables are appended AFTER the per-call hook objects, starts before
+    # ends, so a `on_predict_end=` callable never runs before a `hooks=` entry's end method.
+    ("callables-come-after-hook-objects", ["d1"], ["i1"], ["p1"], ["s1"], ["e1"], False),
+    ("several-start-callables-keep-their-order", [], [], [], ["s1", "s2", "s3"], [], False),
+    ("start-callables-before-end-callables", [], [], [], ["s1"], ["e1"], False),
+    # Defaults are read at CALL time, and a scope can switch them off without unsetting them.
+    ("skip-defaults-drops-only-the-defaults", ["d1", "d2"], ["i1"], ["p1"], [], [], True),
+    ("skip-defaults-with-nothing-else", ["d1"], [], [], [], [], True),
+]
+
+
+#: (case, chain of (name, implemented events, behaviour), event dispatched, raise_errors).
+HOOK_DISPATCH_CASES = [
+    ("every-hook-in-order", [("a", ["on_predict_start"], None), ("b", ["on_predict_start"], None),
+                             ("c", ["on_predict_start"], None)], "on_predict_start", True),
+    # A hook implementing a different subset is SKIPPED for this event, not an error.
+    ("a-hook-that-does-not-implement-the-event-is-skipped",
+     [("a", ["on_predict_start"], None), ("b", ["on_predict_end"], None),
+      ("c", ["on_predict_start"], None)], "on_predict_start", True),
+    ("no-hook-implements-the-event",
+     [("a", ["on_predict_end"], None)], "on_route", True),
+    # Under `raise_errors` the chain STOPS at the first failure; the hooks after it never run.
+    ("raising-stops-the-chain",
+     [("a", ["on_predict_start"], None), ("b", ["on_predict_start"], "raise"),
+      ("c", ["on_predict_start"], None)], "on_predict_start", True),
+    # With it off the failure is a warning and the rest of the chain still runs, which is what a
+    # telemetry hook needs: it must not be able to fail the request.
+    ("raise-errors-false-warns-and-continues",
+     [("a", ["on_predict_start"], None), ("b", ["on_predict_start"], "raise"),
+      ("c", ["on_predict_start"], None)], "on_predict_start", False),
+    ("raise-errors-false-with-every-hook-failing",
+     [("a", ["on_predict_start"], "raise"), ("b", ["on_predict_start"], "raise")],
+     "on_predict_start", False),
+    # `ctx.skip()` does NOT short-circuit the chain. It assigns `ctx.results`, and it is
+    # `predict_batch` that reads it afterwards -- so every later start hook still runs and can
+    # see, and overwrite, what the earlier one answered.
+    ("skip-does-not-stop-the-chain",
+     [("a", ["on_predict_start"], "skip:1"), ("b", ["on_predict_start"], None)],
+     "on_predict_start", True),
+    ("the-other-four-events-dispatch-the-same-way",
+     [("a", ["on_route", "on_load", "on_evict", "on_error"], None),
+      ("b", ["on_route"], None)], "on_route", True),
+    ("on-error-dispatches-over-the-same-chain",
+     [("a", ["on_error"], None), ("b", ["on_error"], "raise")], "on_error", False),
+    ("on-predict-end-dispatches-over-the-same-chain",
+     [("a", ["on_predict_end"], None), ("b", ["on_predict_end"], None)], "on_predict_end", True),
+]
+
+
+#: (case, state count, result count handed to `ctx.skip`).
+HOOK_SKIP_CASES = [
+    ("one-result-per-state", 3, 3),
+    ("one-result-for-the-whole-call", 3, 1),
+    ("one-state-one-result", 1, 1),
+    # Two results for one state is neither shape, and it is the shape that silently dropped rows
+    # the caller was about to zip against.
+    ("two-results-for-one-state", 1, 2),
+    ("too-few-results", 3, 2),
+    ("no-results-at-all", 3, 0),
+    ("too-many-results", 2, 5),
+    # An empty call: zero is both "one per state" and "none", so it is accepted.
+    ("no-states-no-results", 0, 0),
+    ("no-states-one-result", 0, 1),
+    ("no-states-two-results", 0, 2),
+]
+
+
+#: (case, per-result usage blocks).
+HOOK_USAGE_CASES = [
+    ("one-result", [{"input_tokens": 11, "output_tokens": 0}]),
+    ("several-results-sum", [{"input_tokens": 11, "output_tokens": 1},
+                             {"input_tokens": 22, "output_tokens": 2},
+                             {"input_tokens": 33, "output_tokens": 3}]),
+    ("no-results-at-all", []),
+    ("zeroes", [{"input_tokens": 0, "output_tokens": 0}]),
+    # The reference coerces, because a result dict is a plain dict a hook may have rewritten.
+    ("a-missing-usage-block", [{}]),
+    ("a-null-usage-block", [{"__usage_is_none__": True}]),
+    ("a-missing-key", [{"input_tokens": 7}]),
+    ("a-null-value", [{"input_tokens": 7, "output_tokens": None}]),
+    ("a-float-is-truncated", [{"input_tokens": 7.9, "output_tokens": 0}]),
+]
+
+
+#: Values offered to `validate_timeout`.
+HOOK_TIMEOUT_VALUES = [None, 1, 1.5, 0.05, "0.5", 0, 0.0, -1, -0.5,
+                       float("nan"), float("inf"), float("-inf")]
+
+
+#: (case, scripted registry operations). `enter`/`exit` bracket a `hooks_installed` block.
+HOOK_REGISTRY_CASES = [
+    ("add-keeps-insertion-order", ["add:a", "add:b", "add:c"]),
+    ("add-a-sequence-at-once", ["add:[a,b]", "add:c"]),
+    # The same instance twice is two installations, and removing by identity takes both.
+    ("the-same-hook-twice", ["add:a", "add:a"]),
+    ("remove-by-identity", ["add:a", "add:b", "remove:a"]),
+    ("remove-takes-every-copy", ["add:a", "add:a", "add:b", "remove:a"]),
+    ("remove-something-never-installed", ["add:a", "remove:b"]),
+    ("a-block-installs-and-restores", ["enter:1:[t]", "exit:1"]),
+    # The rule `_remove_instances` exists for: the application had already installed `a`, so the
+    # block's exit must take ONE copy -- its own, the most recent -- and leave the other.
+    ("a-block-over-an-already-installed-hook", ["add:a", "enter:1:[a]", "exit:1"]),
+    # Two overlapping blocks. Restoring a snapshot would make the first exit remove the second
+    # block's hook; taking one occurrence each does not.
+    ("overlapping-blocks", ["enter:1:[x]", "enter:2:[y]", "exit:2", "exit:1"]),
+    ("overlapping-blocks-exited-outermost-first",
+     ["enter:1:[x]", "enter:2:[y]", "exit:1", "exit:2"]),
+    # A hook added with add_hook INSIDE a block is not in any snapshot and must survive the exit.
+    ("add-inside-a-block-survives-the-exit", ["enter:1:[t]", "add:d", "exit:1"]),
+    ("a-block-with-several-arguments", ["enter:1:[x],[y,z]", "exit:1"]),
+    ("a-block-with-nothing-in-it", ["enter:1:", "exit:1"]),
+]
+
+
+#: (case, default hooks, installed hooks, per-call hooks, states, question ids, hooks_raise,
+#: whether the stubbed inference itself raises). Each hook is `(name, {event: behaviour})` and
+#: implements EVERY event, so the log says exactly which events fired and in which order --
+#: which event a hook implements is the dispatch section's subject, not this one's.
+HOOK_PREDICT_CASES = [
+    ("no-hooks", [], [], [], ["s0"], ["q"], True, False),
+    # Question ids that are NOT in alphabetical order, deliberately: a choice's options are
+    # positional and a question map is iterated, so a port that re-sorts the mapping on the way
+    # into the context asks a different question than the caller wrote -- and with ids like
+    # "q", "r" it would still compare clean.
+    ("a-start-hook-sees-the-call", [], [], [("p", {})], ["s0", "s1"], ["urgent", "intent"],
+     True, False),
+    # Order end to end: a default, an installed and a per-call hook all fire, in that order, for
+    # both events -- and `compose_hooks` reads the defaults at CALL time, not at construction.
+    ("default-installed-and-per-call-all-fire", [("d", {})], [("i", {})], [("p", {})], ["s0"],
+     ["q"], True, False),
+    # A start hook rewrites the call, and it is the REWRITTEN value inference is handed.
+    ("a-start-hook-rewrites-the-states", [], [], [("p", {"on_predict_start": "states:x,y,z"})],
+     ["s0"], ["q"], True, False),
+    # Two ids, out of alphabetical order, so a port that re-sorts the rewritten mapping on the
+    # way back onto the context differs here rather than passing on a one-question rewrite.
+    ("a-start-hook-rewrites-the-questions", [], [],
+     [("p", {"on_predict_start": "questions:urgent,intent"})], ["s0"], ["q", "r"], True, False),
+    ("a-start-hook-sets-the-token-budget", [], [], [("p", {"on_predict_start": "max_len:128"})],
+     ["s0"], ["q"], True, False),
+    ("a-start-hook-sets-the-head-budget", [], [],
+     [("p", {"on_predict_start": "head_max_len:64"})], ["s0"], ["q"], True, False),
+    # `ctx.skip()` short-circuits inference: the stub is never called and the hook's own payload
+    # is what comes back.
+    ("skip-answers-the-call", [], [], [("p", {"on_predict_start": "skip:1"})], ["s0"], ["q"],
+     True, False),
+    ("skip-one-per-state", [], [], [("p", {"on_predict_start": "skip:2"})], ["s0", "s1"], ["q"],
+     True, False),
+    ("skip-one-for-the-whole-call", [], [], [("p", {"on_predict_start": "skip:1"})],
+     ["s0", "s1"], ["q"], True, False),
+    ("skip-with-a-count-that-fits-nothing", [], [], [("p", {"on_predict_start": "skip:3"})],
+     ["s0", "s1"], ["q"], True, False),
+    # A later start hook can overwrite what an earlier one answered, because `ctx.skip` assigns
+    # and dispatch does not stop.
+    ("the-last-skip-wins", [], [], [("p", {"on_predict_start": "skip:1"}),
+                                    ("p2", {"on_predict_start": "skip:2"})],
+     ["s0", "s1"], ["q"], True, False),
+    # An end hook may replace the whole result list, and that is the return value.
+    ("an-end-hook-rewrites-the-results", [], [], [("p", {"on_predict_end": "results:1"})],
+     ["s0"], ["q"], True, False),
+    # A throwing hook, under each policy and at each end of the call.
+    ("a-raising-start-hook-fails-the-call", [], [], [("p", {"on_predict_start": "raise"}),
+                                                     ("p2", {})], ["s0"], ["q"], True, False),
+    ("a-raising-start-hook-is-only-a-warning", [], [], [("p", {"on_predict_start": "raise"}),
+                                                        ("p2", {})], ["s0"], ["q"], False, False),
+    ("a-raising-end-hook-fails-the-call", [], [], [("p", {"on_predict_end": "raise"})], ["s0"],
+     ["q"], True, False),
+    ("a-raising-end-hook-is-only-a-warning", [], [], [("p", {"on_predict_end": "raise"})],
+     ["s0"], ["q"], False, False),
+    # Inference itself fails: on_error runs, then on_predict_end runs ANYWAY, with the error on
+    # the context and `ctx.results` still None.
+    ("inference-fails", [], [], [("p", {})], ["s0"], ["q"], True, True),
+    # A failing on_error hook must not replace the failure that triggered it.
+    ("inference-fails-with-a-raising-error-hook", [], [], [("p", {"on_error": "raise"})], ["s0"],
+     ["q"], True, True),
+    # A failing end hook on the FAILURE path must not mask the real error either.
+    ("inference-fails-with-a-raising-end-hook", [], [], [("p", {"on_predict_end": "raise"})],
+     ["s0"], ["q"], True, True),
+    # The empty call: no inference, an empty result list, and the end hook still sees it.
+    ("no-states", [], [], [("p", {})], [], ["q"], True, False),
+]
+
+
+#: The lifecycle event names, in the reference's own order, asserted against `HOOK_EVENTS` rather
+#: than imported: the ORDER is what a port's enum has to agree with, and importing it would make
+#: a reordering invisible here.
+HOOK_EVENT_NAMES = ["on_predict_start", "on_predict_end", "on_route", "on_load", "on_evict",
+                    "on_error"]
+
+
+def _hook_name_of(entry):
+    """The label the fixture gives one entry of a composed hook list."""
+    kind = type(entry).__name__
+    if kind in ("_StartAdapter", "_EndAdapter"):
+        return ("start:" if kind == "_StartAdapter" else "end:") + entry.fn.laya_stub_name
+    return getattr(entry, "stub_name", kind)
+
+
+def _named_callable(name):
+    """A plain `on_predict_start=` / `on_predict_end=` callable, labelled for the fixture."""
+    def fn(ctx):
+        return None
+    fn.laya_stub_name = name
+    return fn
+
+
+def hook_dispatch():
+    """`laya.hooks`: what runs, in what order, and what each hook is allowed to change.
+
+    Hooks are the one place a caller's own code runs inside a prediction, so every observable
+    here is a contract a port has to reproduce exactly. The sections below are chosen so a port
+    that gets any of them wrong differs somewhere:
+
+      * ORDER. `compose_hooks` is defaults, then installed, then per-call, and `dispatch` calls
+        them in that order. A port that composes the other way round still runs every hook, so
+        nothing fails -- except that the tracer a caller installed to see what the per-call hook
+        did now runs first and sees nothing.
+      * `ctx.skip()` assigns `ctx.results` and does NOT stop the chain. The short-circuit is
+        `predict_batch` reading `ctx.results` afterwards, so a later start hook still runs and
+        can overwrite the answer. A port that returns early from dispatch loses that.
+      * `hooks_raise`. True fails the request at the first throwing hook and the rest of the
+        chain never runs; False warns, with a message quoting the hook's class and event, and
+        continues. Both ends of the call, and the failure path, are recorded.
+      * what a hook SEES. The states, the questions, the model, the token-budget overrides, the
+        run id shared across one call's hooks, and -- at the end -- the aggregated usage, the
+        elapsed time and the error. A port that builds the context late, or rebuilds it per
+        event, breaks the identity those depend on.
+      * `ctx.skip()`'s count check. One result for the whole call or one per state, nothing else,
+        refused INSIDE the hook under the caller's own `hooks_raise` rather than downstream --
+        where it had been an `IndexError` the server mapped to a 500, and a short list
+        `predict_batch` returned while the caller zipped it against their states.
+
+    Inference is stubbed, so this family needs no checkpoint and no graph: `ONNXAgent.predict_batch`
+    is driven unbound over a stub that carries only what it touches. That is also what makes the
+    "skip answers the call" cases legible -- whether the model ran is recorded, not inferred.
+    """
+    import threading
+    import warnings
+
+    from laya.hooks import (
+        HOOK_EVENTS, HookRegistry, PredictContext, _as_sequence, add_default_hook,
+        aggregate_usage, clear_default_hooks, compose_hooks, default_hooks, dispatch,
+        normalise_hooks, set_default_hooks, validate_timeout,
+    )
+    from laya.hooks import _SKIP_DEFAULTS
+
+    assert list(HOOK_EVENTS) == HOOK_EVENT_NAMES, (
+        "the lifecycle events moved: %r" % (HOOK_EVENTS,))
+
+    # -- composition order ---------------------------------------------------
+    composition = []
+    for (cid, defaults, installed, per_call, starts, ends, skip_defaults) in \
+            HOOK_COMPOSITION_CASES:
+        log = []
+        clear_default_hooks()
+        set_default_hooks([_stub_hook(log, n, HOOK_EVENT_NAMES) for n in defaults])
+        token = _SKIP_DEFAULTS.set(True) if skip_defaults else None
+        try:
+            active = compose_hooks(
+                [_stub_hook(log, n, HOOK_EVENT_NAMES) for n in installed],
+                [_stub_hook(log, n, HOOK_EVENT_NAMES) for n in per_call],
+                [_named_callable(n) for n in starts],
+                [_named_callable(n) for n in ends])
+        finally:
+            if token is not None:
+                _SKIP_DEFAULTS.reset(token)
+            clear_default_hooks()
+        composition.append({
+            "case": cid, "defaults": defaults, "installed": installed, "hooks": per_call,
+            "on_predict_start": starts, "on_predict_end": ends,
+            "skip_defaults": skip_defaults,
+            "order": [_hook_name_of(entry) for entry in active],
+        })
+
+    # `default_hooks()` hands back a COPY: a caller that mutates it must not be editing the
+    # process-wide list, which is the difference between a read and a handle.
+    clear_default_hooks()
+    probe = _stub_hook([], "probe", HOOK_EVENT_NAMES)
+    set_default_hooks([probe])
+    defaults_api = {"after_set": [_hook_name_of(h) for h in default_hooks()]}
+    borrowed = default_hooks()
+    borrowed.append(_stub_hook([], "intruder", HOOK_EVENT_NAMES))
+    defaults_api["mutating_the_returned_list_changes_nothing"] = [
+        _hook_name_of(h) for h in default_hooks()]
+    add_default_hook(_stub_hook([], "added", HOOK_EVENT_NAMES))
+    defaults_api["after_add"] = [_hook_name_of(h) for h in default_hooks()]
+    clear_default_hooks()
+    defaults_api["after_clear"] = [_hook_name_of(h) for h in default_hooks()]
+
+    # -- what normalise_hooks refuses ---------------------------------------
+    class _NotAHook(object):
+        pass
+
+    class _NotCallable(object):
+        on_predict_start = "not a function"
+
+    refusals = []
+    for label, argument in (("a class rather than an instance", _NotAHook),
+                            ("an object implementing no event", _NotAHook()),
+                            ("an event attribute that is not callable", _NotCallable()),
+                            ("a plain object", object())):
+        try:
+            normalise_hooks(argument)
+            refusals.append({"input": label, "error": None})
+        except TypeError as problem:
+            refusals.append({"input": label, "error": str(problem)})
+    for label, argument in (("a non-callable on_predict_start", 7),
+                            ("a non-callable on_predict_end", "nope")):
+        try:
+            if "start" in label:
+                normalise_hooks(None, argument, None)
+            else:
+                normalise_hooks(None, None, argument)
+            refusals.append({"input": label, "error": None})
+        except TypeError as problem:
+            refusals.append({"input": label, "error": str(problem)})
+
+    # `_as_sequence`: one hook, a list of them, or nothing, flattened the same way.
+    as_sequence = [
+        {"input": "none", "length": len(_as_sequence(None))},
+        {"input": "one", "length": len(_as_sequence(probe))},
+        {"input": "list-of-two", "length": len(_as_sequence([probe, probe]))},
+        {"input": "tuple-of-three", "length": len(_as_sequence((probe, probe, probe)))},
+        {"input": "empty-list", "length": len(_as_sequence([]))},
+    ]
+
+    # -- dispatch ------------------------------------------------------------
+    dispatched = []
+    for cid, chain, event, raise_errors in HOOK_DISPATCH_CASES:
+        log = []
+        hooks = [_stub_hook(log, name, events, behaviour) for name, events, behaviour in chain]
+        ctx = PredictContext(states=["s0"], questions=_hook_questions(["q"]))
+        raised = None
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            try:
+                dispatch(hooks, event, ctx, raise_errors=raise_errors)
+            except BaseException as problem:
+                raised = {"type": type(problem).__name__, "message": str(problem)}
+        dispatched.append({
+            "case": cid, "event": event, "raise_errors": raise_errors,
+            "chain": [{"name": name, "events": events, "behaviour": behaviour}
+                      for name, events, behaviour in chain],
+            "calls": log, "raised": raised,
+            "warnings": [str(w.message) for w in caught],
+            "results": None if ctx.results is None else len(ctx.results),
+        })
+
+    # -- ctx.skip() ----------------------------------------------------------
+    skips = []
+    for cid, n_states, n_results in HOOK_SKIP_CASES:
+        ctx = PredictContext(states=["s%d" % i for i in range(n_states)],
+                             questions=_hook_questions(["q"]))
+        try:
+            ctx.skip([_hook_result(i) for i in range(n_results)])
+            skips.append({"case": cid, "states": n_states, "results": n_results,
+                          "accepted": True, "error": None,
+                          "assigned": [r["usage"]["input_tokens"] for r in ctx.results]})
+        except ValueError as problem:
+            skips.append({"case": cid, "states": n_states, "results": n_results,
+                          "accepted": False, "error": str(problem),
+                          "assigned": None})
+
+    # -- aggregate_usage -----------------------------------------------------
+    usages = []
+    for cid, blocks in HOOK_USAGE_CASES:
+        results = []
+        for block in blocks:
+            if block.get("__usage_is_none__"):
+                results.append({"usage": None})
+            elif block:
+                results.append({"usage": dict(block)})
+            else:
+                results.append({})
+        usages.append({"case": cid, "results": blocks, "total": aggregate_usage(results)})
+
+    # -- validate_timeout ----------------------------------------------------
+    timeouts = []
+    for value in HOOK_TIMEOUT_VALUES:
+        entry = {"input": repr(value)}
+        try:
+            accepted = validate_timeout(value)
+            entry["accepted"] = True
+            entry["value"] = accepted
+            entry["error"] = None
+        except (ValueError, OverflowError) as problem:
+            entry["accepted"] = False
+            entry["value"] = None
+            entry["error"] = str(problem)
+        timeouts.append(entry)
+
+    # -- HookRegistry --------------------------------------------------------
+    registries = []
+    for cid, script in HOOK_REGISTRY_CASES:
+        class _Registry(HookRegistry):
+            def __init__(self):
+                self.hooks = ()
+                self._hooks_mutex = threading.Lock()
+
+        registry = _Registry()
+        pool = {}
+
+        def named(label):
+            if label not in pool:
+                pool[label] = _stub_hook([], label, HOOK_EVENT_NAMES)
+            return pool[label]
+
+        blocks = {}
+        steps = []
+        for op in script:
+            verb, _, rest = op.partition(":")
+            returned = None
+            if verb == "add":
+                if rest.startswith("["):
+                    registry.add_hook([named(x) for x in rest[1:-1].split(",") if x])
+                else:
+                    registry.add_hook(named(rest))
+            elif verb == "remove":
+                returned = registry.remove_hook(named(rest))
+            elif verb == "enter":
+                block, _, arguments = rest.partition(":")
+                groups = []
+                for group in ([] if not arguments else arguments.split("],[")):
+                    labels = [x for x in group.strip("[]").split(",") if x]
+                    groups.append([named(x) for x in labels])
+                manager = registry.hooks_installed(*groups)
+                blocks[block] = manager
+                manager.__enter__()
+            elif verb == "exit":
+                blocks.pop(rest).__exit__(None, None, None)
+            else:
+                raise AssertionError("unknown registry op %r" % (op,))
+            steps.append({"op": op, "returned": returned,
+                          "hooks": [_hook_name_of(h) for h in registry.hooks]})
+        for leftover in list(blocks.values()):
+            leftover.__exit__(None, None, None)
+        registries.append({"case": cid, "script": list(script), "steps": steps,
+                           "final": [_hook_name_of(h) for h in registry.hooks]})
+
+    predicted = _hook_predict_cases()
+
+    # The branches have to be REACHED. Every case below compares clean against a port that never
+    # runs a hook at all, so a case list that stopped constructing a short-circuit, a refusal or
+    # a failure would still be green -- which is the one outcome this family must not produce.
+    reached = {
+        "three-tier order": sum(1 for c in composition
+                                if c["defaults"] and c["installed"] and c["hooks"]
+                                and c["order"][:len(c["defaults"])] == c["defaults"]),
+        "defaults skipped": sum(1 for c in composition if c["skip_defaults"] and c["defaults"]
+                                and not set(c["defaults"]) & set(c["order"])),
+        "dispatch stopped early": sum(1 for c in dispatched if c["raised"]),
+        "dispatch warned and continued": sum(1 for c in dispatched
+                                             if c["warnings"] and not c["raised"]),
+        "dispatch skipped a hook": sum(1 for c in dispatched
+                                       if len(c["calls"]) < len(c["chain"])
+                                       and not c["raised"]),
+        "skip refused": sum(1 for c in skips if not c["accepted"]),
+        "skip accepted": sum(1 for c in skips if c["accepted"]),
+        "timeout refused": sum(1 for t in timeouts if not t["accepted"]),
+        "block left a hook behind": sum(1 for r in registries if r["final"]),
+        "block restored": sum(1 for r in registries if not r["final"]),
+        "inference short-circuited": sum(1 for c in predicted if c["inference"] is None
+                                         and c["raised"] is None),
+        "inference saw a rewrite": sum(1 for c in predicted if c["inference"]
+                                       and (c["inference"]["states"] != c["states"]
+                                            or c["inference"]["questions"] != c["questions"]
+                                            or c["inference"]["overrides"])),
+        "call failed": sum(1 for c in predicted if c["raised"]),
+        "call warned": sum(1 for c in predicted if c["warnings"]),
+        "on_error fired": sum(1 for c in predicted
+                              if any(e["call"].endswith(".on_error") for e in c["calls"])),
+        "a hook failure was attached, not substituted": sum(
+            1 for c in predicted if c["raised"] and c["raised"]["context"]),
+        "an end hook saw the aggregated usage": sum(
+            1 for c in predicted
+            if any(e["call"].endswith(".on_predict_end") and e["usage"] for e in c["calls"])),
+    }
+    thin = {name: count for name, count in reached.items() if count < 1}
+    if thin or reached["skip refused"] < 4 or reached["inference short-circuited"] < 3:
+        raise AssertionError(
+            "the hook cases do not reach every branch this family exists to pin: %s"
+            % ", ".join("%s=%d" % pair for pair in sorted(reached.items())))
+
+    return {
+        "events": HOOK_EVENT_NAMES,
+        "composition": composition,
+        "default_hooks_api": defaults_api,
+        "normalise_refusals": refusals,
+        "as_sequence": as_sequence,
+        "dispatch": dispatched,
+        "skip": skips,
+        "usage": usages,
+        "timeouts": timeouts,
+        "registry": registries,
+        "predict_batch": predicted,
+    }
+
+
+def _hook_predict_cases():
+    """`ONNXAgent.predict_batch` driven over a stubbed inference, one case per contract.
+
+    Unbound over a stub that carries only what the method touches -- the hook list, the three
+    policy fields, the model id and `_infer_batch` -- so this needs no checkpoint and no graph,
+    and so the fixture can record whether the model was reached at all. That last part is the
+    point of the `skip` cases: "inference did not run" is the observable, and inferring it from
+    the payload would not distinguish a short-circuit from a model that happened to agree.
+    """
+    import warnings
+
+    from laya.hooks import clear_default_hooks, set_default_hooks
+
+    from laya.onnx_agent import ONNXAgent
+
+    cases = []
+    for (cid, defaults, installed, per_call, states, qids, hooks_raise,
+         inference_raises) in HOOK_PREDICT_CASES:
+        log = []
+        seen = {}
+
+        class Stub(object):
+            """Everything `predict_batch` touches on `self`, and nothing else."""
+
+            model_id = "stub-checkpoint"
+            hooks_concurrent = True
+            _hooks_lock = None
+
+            def __init__(self):
+                self.hooks = [_stub_hook(log, n, HOOK_EVENT_NAMES, b, observe=True)
+                              for n, b in installed]
+                self.hooks_raise = hooks_raise
+                self.hooks_timeout = None
+
+            def _infer_batch(self, inner_states, inner_questions, lang=None, batch_size=None,
+                             sort_by_length=False, **overrides):
+                seen["states"] = list(inner_states)
+                seen["questions"] = list(inner_questions)
+                seen["overrides"] = dict(overrides)
+                if inference_raises:
+                    raise RuntimeError("the graph refused this batch")
+                return [_hook_result(100 + i) for i in range(len(inner_states))]
+
+        clear_default_hooks()
+        if defaults:
+            set_default_hooks([_stub_hook(log, n, HOOK_EVENT_NAMES, b, observe=True)
+                               for n, b in defaults])
+        questions = _hook_questions(qids)
+        raised = None
+        results = None
+        try:
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                results = ONNXAgent.predict_batch(
+                    Stub(), list(states), questions,
+                    hooks=[_stub_hook(log, n, HOOK_EVENT_NAMES, b, observe=True)
+                           for n, b in per_call])
+        except BaseException as problem:
+            raised = {"type": type(problem).__name__, "message": str(problem),
+                      # The reference attaches a failing end/error hook to the real failure
+                      # rather than letting it replace it, so the original is still what the
+                      # caller catches and the hook's is reachable underneath.
+                      "context": None if problem.__context__ is None
+                                 else type(problem.__context__).__name__}
+        finally:
+            clear_default_hooks()
+
+        run_ids = {entry["run_id"] for entry in log}
+        for entry in log:
+            del entry["run_id"]
+        cases.append({
+            "case": cid,
+            "defaults": [{"name": n, "behaviour": b} for n, b in defaults],
+            "installed": [{"name": n, "behaviour": b} for n, b in installed],
+            "hooks": [{"name": n, "behaviour": b} for n, b in per_call],
+            "states": list(states), "questions": qids, "hooks_raise": hooks_raise,
+            "inference_raises": inference_raises,
+            # What the model was handed, or null when a hook answered before it ran.
+            "inference": None if "states" not in seen else {
+                "states": seen["states"], "questions": seen["questions"],
+                "overrides": seen["overrides"]},
+            "calls": log,
+            "result": None if results is None else [r["usage"]["input_tokens"] for r in results],
+            "raised": raised,
+            "warnings": [str(w.message) for w in caught],
+            # One context per call, shared by every hook of it: that is what lets a tracer
+            # correlate a start with its end without threading state of its own.
+            "one_run_id_per_call": len(run_ids) <= 1,
+            "run_id_hex_length": len(next(iter(run_ids))) if run_ids else None,
+        })
+    return cases
+
+
 def _decoder_shape(tokenizer_json):
     """The decoder section's type chain, flattened, so the fixture says what it was recorded on."""
     import io
@@ -3091,6 +3797,7 @@ def _decoder_shape(tokenizer_json):
 
 FAMILIES = {
     "confidence_gate.json": confidence_gate,
+    "hooks.json": hook_dispatch,
     "predict_long.json": predict_long_scan,
     "window_plan.json": window_plan,
     "lang_tables.json": lang_tables,

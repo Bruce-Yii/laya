@@ -156,11 +156,18 @@ jobs:
       - name: Tests that need no model
         working-directory: laya-java
         run: ./gradlew --no-daemon test
+      # Measured locally: 812 registered, 798 RUN -- the floor counts what ran, so the 14
+      # checkpoint-backed cases this lane aborts are not in it. The margin is 4, the same shape
+      # as the 685/680 it replaces, and for the reason the `tokenizer` parity cell gives: a
+      # floor below the total minus the SMALLEST class does not bind that class. `AgentHooksTest`
+      # is 8 tests, so at the old 680 the whole of it could be deleted with this step still
+      # green. Verified both ways: with `AgentHooksTest` dropped 790 run and this exits 1; with
+      # `HooksTest` dropped 693 run and it exits 1.
       - name: Model-free suite was not vacuous
         if: ${{ !cancelled() }}
         run: >
           python laya-java/scripts/check_test_results.py
-          laya-java/laya-java/build/test-results/test --min-tests 680 --allow-aborted
+          laya-java/laya-java/build/test-results/test --min-tests 794 --allow-aborted
 
       # The samples are single-file source programs, deliberately NOT a Gradle module: a
       # `samples` subproject would inherit the root build's MavenPublication and
@@ -319,7 +326,7 @@ jobs:
         if: ${{ !cancelled() }}
         run: >
           python laya-java/scripts/check_test_results.py
-          laya-java/laya-java/build/test-results/test --min-tests 680 --allow-aborted
+          laya-java/laya-java/build/test-results/test --min-tests 794 --allow-aborted
           --require-passed TestJvmVersionTest
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: ${{ failure() }}
