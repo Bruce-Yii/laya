@@ -1817,6 +1817,493 @@ def predict_golden():
             "single": single, "batch": batches}
 
 
+# -- the typed-decisions checkpoint ---------------------------------------------------------
+#
+# `laya-typed-decisions` is fine-tuned from the ENGLISH checkpoint, which is what makes a
+# fixture family for it worth its weight. It ships the same `tokenizer.json` byte for byte
+# (diffed: identical) and the same `answerdotai/ModernBERT-large` encoder, and nothing in a
+# `.onnx` file says which checkpoint traced it. Measured, with the english checkpoint symlinked
+# in as `typed-decisions/`: opening it against the typed graph raises nothing and reproduces the
+# probabilities recorded below inside the Java test's tolerance -- `off-workflow` answers
+# {billing: 0.8967, other: 0.1033}, which is what this file records for the right pairing, because
+# the weights are entirely the graph's and the two configs agree on the `choice:2` temperature.
+# `model` does not separate them either: the ONNX path reports `laya-rl-agent-onnx` whichever
+# checkpoint it opened. Only the multilingual checkpoint fails loudly, and for an unrelated
+# reason -- a 235292 token id against a 50368-row embedding, which ONNX Runtime rejects at the
+# `node_embedding` Gather.
+#
+# So the discriminator has to come from `rl_agent_config.json`, and from a narrower part of it
+# than it looks: `max_len` 1024 against english's 512, `head_max_len` 256 against 192,
+# `model_name` `laya-typed-decisions` against `rl-agent`, and base temperatures
+# [1.0148, 1.0374, 1.0575] against [1.6369, 1.2514, 1.9834]. NOT `temperature_by_options`, which
+# the two ship identically, every key and every digit, `choice:11+` at 0.1006 included. Those are
+# recorded below as `config`, and the Java test asserts them on the shared agent as it opens it,
+# so a wrong pairing fails every case rather than being caught by one test among fourteen.
+#
+# The question ids are read from `laya.router` rather than retyped: an exact id-set match is the
+# entire signature `match_typed_decisions_workflow` tests, so a signature change has to move this
+# family rather than leave it asserting a workflow name the router no longer returns.
+
+# `invoice_processing` is the one workflow whose TRAINED schema is in this repository, in
+# `examples/32_typed_decisions_workflow.py` (dataset `LocalLLaMA/typed-decisions`, config
+# `invoice_processing`). It is duplicated here rather than imported because that example has a
+# module-level `agent = load("typed-decisions")`, so importing it would download 846 MB and run
+# the model; `_typed_questions` below fails the generator if the ids ever stop matching the
+# router's signature, which is the drift that would matter.
+TYPED_INVOICE_QUESTIONS = {
+    "disposition": {
+        "type": "choice",
+        "instructions": "How should this vendor invoice be dispositioned?",
+        "criteria": {
+            "approve": "Matches the order and delivery; approve for payment.",
+            "hold": "Something needs confirming before payment; hold pending clarification.",
+            "manual_review": "A human in finance must review the discrepancy.",
+            "reject": "Should not be paid: duplicate, unauthorised or materially wrong.",
+        },
+    },
+    "matches_order": {
+        "type": "noul",
+        "instructions": "The invoice reconciles with the purchase order and the recorded delivery.",
+        "criteria": {
+            "false": "There is a discrepancy against the order or the delivery.",
+            "true": "Line items, quantities and amounts reconcile.",
+        },
+    },
+    "duplicate": {
+        "type": "noul",
+        "instructions": "This invoice appears to duplicate an invoice already submitted.",
+    },
+    "discrepancy_severity": {
+        "type": "score",
+        "instructions": "How material is any discrepancy between the invoice, the order "
+                        "and the delivery?",
+        "criteria": [
+            "None: everything reconciles.",
+            "Trivial: rounding or a cosmetic difference.",
+            "Moderate: a real difference worth confirming.",
+            "Material: a large or unexplained difference.",
+        ],
+    },
+    "urgency": {
+        "type": "score",
+        "instructions": "How time-sensitive is processing this invoice?",
+        "criteria": [
+            "No time pressure; can wait indefinitely.",
+            "Routine; handle within the normal queue.",
+            "Elevated; should be handled within the same week.",
+            "Critical; requires action within the same day.",
+        ],
+    },
+}
+
+# The other three workflows' TRAINED instruction text is not in this repository -- only their id
+# signatures are, in `laya.router._TYPED_DECISION_WORKFLOWS`. These schemas therefore carry the
+# real ids and instruction text written here, which is stated rather than glossed over: what the
+# fixture gates is the forward pass and the routing decision that reaches it, and both are real
+# for any schema whose ids match. The text is recorded verbatim in the fixture, so a port renders
+# the identical prompt and must reproduce the identical answer.
+TYPED_CUSTOMER_SERVICE_QUESTIONS = {
+    "action": {
+        "type": "choice",
+        "instructions": "What should the support team do next?",
+        "criteria": {
+            "refund": "Return the money and close the ticket.",
+            "replace": "Ship a replacement unit.",
+            "explain": "Answer the question; nothing to send.",
+            "escalate": "Hand to a senior agent.",
+        },
+    },
+    "category": {
+        "type": "choice",
+        "instructions": "Which queue does this ticket belong in?",
+        "criteria": {
+            "billing": "Charges, invoices and refunds.",
+            "shipping": "Delivery, tracking and damage in transit.",
+            "account": "Login, access and account settings.",
+        },
+    },
+    "churn_risk": {
+        "type": "score",
+        "instructions": "How likely is this customer to leave over this?",
+        "criteria": [
+            "Not at risk; routine contact.",
+            "Mildly annoyed.",
+            "Considering alternatives.",
+            "Explicitly threatening to cancel.",
+        ],
+    },
+    "needs_human": {
+        "type": "noul",
+        "instructions": "This ticket needs a human agent rather than an automated reply.",
+    },
+    "urgency": {
+        "type": "score",
+        "instructions": "How quickly must this be answered?",
+        "criteria": [
+            "No time pressure.",
+            "Within the normal queue.",
+            "Same week.",
+            "Same day.",
+        ],
+    },
+}
+
+TYPED_SECURITY_QUESTIONS = {
+    "credential_compromise": {
+        "type": "noul",
+        "instructions": "Credentials belonging to this account were exposed or reused.",
+        "criteria": {
+            "false": "No sign that a secret left the organisation.",
+            "true": "A password, token or key is in the wrong hands.",
+        },
+    },
+    "disposition": {
+        "type": "choice",
+        "instructions": "How should this alert be dispositioned?",
+        "criteria": {
+            "close": "Benign; close with no action.",
+            "monitor": "Watch for a repeat before acting.",
+            "contain": "Isolate the host or revoke the credential now.",
+            "escalate": "Wake an incident responder.",
+        },
+    },
+    "severity": {
+        "type": "score",
+        "instructions": "How severe is the impact if this is real?",
+        "criteria": [
+            "Informational.",
+            "Low: one account, no data.",
+            "High: production data or lateral movement.",
+            "Critical: active, spreading, or customer data.",
+        ],
+    },
+    "true_positive": {
+        "type": "noul",
+        "instructions": "This alert describes genuine malicious activity rather than noise.",
+    },
+    "urgency": {
+        "type": "score",
+        "instructions": "How quickly must someone respond?",
+        "criteria": [
+            "No time pressure.",
+            "Next business day.",
+            "Within the hour.",
+            "Immediately.",
+        ],
+    },
+}
+
+TYPED_AGENT_TRACE_QUESTIONS = {
+    "action": {
+        "type": "choice",
+        "instructions": "What should be done with this agent run?",
+        "criteria": {
+            "accept": "The run did what was asked; accept it.",
+            "retry": "Transient failure; run it again.",
+            "rollback": "Undo what it changed.",
+            "escalate": "A person must look at this.",
+        },
+    },
+    "needs_review": {
+        "type": "noul",
+        "instructions": "A human should read this trace before the result is used.",
+    },
+    "outcome": {
+        "type": "choice",
+        "instructions": "How did the run end?",
+        "criteria": {
+            "success": "Completed the task.",
+            "partial": "Completed some of it.",
+            "failure": "Did not complete the task.",
+        },
+    },
+    "risk": {
+        "type": "score",
+        "instructions": "How much damage could this run's actions have caused?",
+        "criteria": [
+            "Read-only; no effect.",
+            "Reversible writes.",
+            "Irreversible writes to internal systems.",
+            "Irreversible, customer-visible, or spending money.",
+        ],
+    },
+    "urgency": {
+        "type": "score",
+        "instructions": "How quickly must this be looked at?",
+        "criteria": [
+            "No time pressure.",
+            "Next business day.",
+            "Within the hour.",
+            "Immediately.",
+        ],
+    },
+}
+
+# The two states from `examples/32_typed_decisions_workflow.py`: one with a 40% unit-price
+# variance against the purchase order, one that reconciles exactly. They are a pair on purpose --
+# the same schema on two states that differ only in the numbers is what shows the forward pass is
+# reading the state rather than the questions.
+TYPED_INVOICE_VARIANCE = {
+    "invoice": {
+        "id": "INV-2026-8842", "vendor": "Northwind Castings", "currency": "USD",
+        "total_usd": 300020.0,
+        "lines": [{"sku": "SKU-940", "qty": 1000, "unit_usd": 300.02, "total_usd": 300020.0}],
+    },
+    "purchase_order": {
+        "id": "PO-3392", "total_usd": 214300.0,
+        "lines": [{"qty": 1000, "unit_usd": 214.3}],
+        "freight_terms": "freight prepaid by vendor, not separately billable",
+    },
+    "delivery": {"date": "2026-03-18", "received_qty": 1000,
+                 "condition": "accepted with exceptions"},
+    "payment": {"terms": "net 45", "status": "overdue", "days_until_due": -3},
+    "vendor_history": {
+        "invoices_12m": 40, "disputes_12m": 0,
+        "prior_invoice_ids": ["INV-2026-6633", "INV-2026-9563", "INV-2026-7939"],
+    },
+}
+
+TYPED_INVOICE_CLEAN = {
+    "invoice": {
+        "id": "INV-2026-9107", "vendor": "Cedar Freight", "currency": "USD",
+        "total_usd": 18450.0,
+        "lines": [{"sku": "SKU-221", "qty": 300, "unit_usd": 61.5, "total_usd": 18450.0}],
+    },
+    "purchase_order": {
+        "id": "PO-3477", "total_usd": 18450.0,
+        "lines": [{"qty": 300, "unit_usd": 61.5}],
+        "freight_terms": "freight prepaid by vendor, not separately billable",
+    },
+    "delivery": {"date": "2026-03-20", "received_qty": 300, "condition": "accepted in full"},
+    "payment": {"terms": "net 30", "status": "current", "days_until_due": 18},
+    "vendor_history": {"invoices_12m": 12, "disputes_12m": 0,
+                       "prior_invoice_ids": ["INV-2026-7781"]},
+}
+
+# 14 options, which is what puts the `choice:11+` temperature bucket in play. This checkpoint
+# ships that bucket at 0.1006 -- outside the [0.5, 5] band `laya.common` accepts, so it is clamped
+# to 0.5 and the answer is published uncalibrated. A port that reads the bucket and skips the
+# clamp sharpens this distribution by ~5x and still returns a plausible-looking argmax, so the
+# probabilities here are the only thing that tells the two apart.
+TYPED_MANY_OPTION_QUESTIONS = {
+    "band": {"type": "choice", "instructions": "Which spend band does this invoice fall in?",
+             "criteria": {("band%02d" % i): ("tier number %d" % i) for i in range(14)}},
+}
+
+# `max_len` is 1024 here against the english checkpoint's 512, so a state that truncates on one
+# does not truncate on the other. This one is long enough to drop tokens at 1024, which is what
+# makes `state_tokens_dropped` and `truncated` non-zero rather than decorative.
+TYPED_OVER_BUDGET_STATE = ("line item number one, unit price 300.02 against a purchase order at "
+                           "214.30, delivery accepted with exceptions. ") * 90
+
+# A score question with SIX levels, which `common.temp_bucket` maps to `score:6-10` -- a bucket
+# NEITHER this checkpoint nor the english one it is fine-tuned from ships. Their
+# `temperature_by_options` tables are identical, every key and every digit, `choice:11+` at
+# 0.10058280825614929 included, so the bucket lookup and the clamp cannot tell the two apart. The
+# miss is what makes the fitted `temperature[QTYPE_SCORE]` the scale actually applied here: 1.0374
+# on this checkpoint against 1.2514 on english. Without this case every recorded question landed in
+# a bucket both files ship, so the fitted triple was asserted in `config` and never once reached a
+# forward pass, and `over-budget` was the only case whose NUMBERS could tell the two apart.
+TYPED_UNBUCKETED_SCORE_QUESTIONS = {
+    "payment_priority": {
+        "type": "score",
+        "instructions": "How high a priority is settling this invoice this week?",
+        "criteria": [
+            "No priority; it can wait a quarter.",
+            "Low: settle within the month.",
+            "Normal: settle on the agreed terms.",
+            "Elevated: settle this week.",
+            "High: the vendor has threatened to stop shipping.",
+            "Critical: the line stops without it.",
+        ],
+    },
+}
+
+# A question set whose ids are NOT a workflow signature. The checkpoint still answers it -- being
+# fine-tuned on four schemas does not make it refuse a fifth -- and recording that is what stops
+# a port from special-casing the signatures somewhere in the forward pass, where they have no
+# business being. Routing is the only place the signature is read.
+TYPED_OFF_WORKFLOW_QUESTIONS = {
+    "department": {"type": "choice", "instructions": "Which team owns this?",
+                   "criteria": {"billing": "charges and refunds", "other": "anything else"}},
+}
+
+
+def _typed_questions(workflow, questions):
+    """`questions`, after checking its ids still are `workflow`'s signature.
+
+    The schemas above are literals, and the signatures they have to match live in `laya.router`.
+    Nothing else connects the two, so without this the router could gain a question id and this
+    family would carry on recording a forward pass under a workflow name
+    `match_typed_decisions_workflow` no longer returns -- a fixture that names a routing outcome
+    it does not produce, which is worse than no fixture.
+    """
+    from laya.router import _TYPED_DECISION_WORKFLOWS, match_typed_decisions_workflow
+
+    expected = _TYPED_DECISION_WORKFLOWS[workflow]
+    got = match_typed_decisions_workflow(questions)
+    if got != workflow:
+        raise SystemExit(
+            "gen_fixtures: the %s schema's ids are %s, but laya.router's signature is %s "
+            "(match_typed_decisions_workflow returned %r)"
+            % (workflow, sorted(questions), sorted(expected), got))
+    return questions
+
+
+# (case id, state, lang, workflow or None, questions). `workflow` is recorded so the Java test can
+# assert the routing decision and the forward pass on the SAME object: MODELS.md's gap was that
+# `Router` resolving `typed-decisions` was tested while nothing ever ran the checkpoint, so a
+# fixture that records one without the other leaves half of it open.
+TYPED_CASES = [
+    ("invoice-variance", TYPED_INVOICE_VARIANCE, None, "invoice_processing",
+     TYPED_INVOICE_QUESTIONS),
+    ("invoice-clean", TYPED_INVOICE_CLEAN, None, "invoice_processing", TYPED_INVOICE_QUESTIONS),
+    ("customer-service", "We were billed twice for March. Third time this year -- refund it "
+                         "today or we are moving to a competitor.", None, "customer_service",
+     TYPED_CUSTOMER_SERVICE_QUESTIONS),
+    ("security-incident", {"alert": "impossible travel", "user": "ana@example.com",
+                           "signins": [{"city": "Lagos", "at": "2026-03-18T09:02Z"},
+                                       {"city": "Vilnius", "at": "2026-03-18T09:41Z"}],
+                           "mfa": "satisfied by push, approved on the second prompt",
+                           "prior_alerts_30d": 0}, None, "security_incidents",
+     TYPED_SECURITY_QUESTIONS),
+    ("agent-trace", {"run": "agt-7741", "tool_calls": 14, "wrote": ["s3://prod-reports/q1.csv"],
+                     "errors": ["RateLimit on call 9, retried"],
+                     "final": "uploaded the report, but the row count is 0"},
+     None, "agent_trace_observability", TYPED_AGENT_TRACE_QUESTIONS),
+    ("many-options", "The invoice totals 300,020 USD against a 214,300 USD order.", None, None,
+     TYPED_MANY_OPTION_QUESTIONS),
+    # Same ids as the two invoice cases, so the same workflow -- recording this as "no workflow"
+    # because the state is different was the first thing the Java test caught.
+    ("over-budget", TYPED_OVER_BUDGET_STATE, None, "invoice_processing",
+     TYPED_INVOICE_QUESTIONS),
+    ("off-workflow", "We were billed twice for March and want a refund today.", "en", None,
+     TYPED_OFF_WORKFLOW_QUESTIONS),
+    ("unbucketed-score", "Invoice INV-2026-8842 for 300,020 USD is three days overdue and the "
+                         "vendor has put the next casting run on hold until it clears.", None,
+     None, TYPED_UNBUCKETED_SCORE_QUESTIONS),
+]
+
+
+def _graph_revision(graph):
+    """The `.laya-revision` stamp `prepare_checkpoint.py` wrote beside `graph`, or None.
+
+    `graph` is recorded as a basename, which is the same string at every revision, so nothing in
+    this file used to say WHICH revision traced the weights it was recorded from. The stamp is the
+    only thing on disk that does. With it recorded, a `HF_REVISION` bump is caught by `--check`:
+    the regenerated `revision` differs from the committed one and the parity cell goes red naming
+    the bump, rather than a golden being re-recorded from new weights in silence.
+    """
+    # Imported rather than re-spelled: the stamp name and its layout belong to the script that
+    # writes them, and a second copy here would be a constant that can drift from the only code
+    # that produces the file it names.
+    if HERE not in sys.path:
+        sys.path.insert(0, HERE)
+    from prepare_checkpoint import STAMP
+
+    marker = (os.path.join(graph, STAMP) if os.path.isdir(graph) else graph + STAMP)
+    try:
+        with open(marker, "r", encoding="utf-8") as handle:
+            recorded = handle.read().strip().split()
+    except OSError:
+        return None
+    return recorded[0] if recorded else None
+
+
+def typed_decisions_golden():
+    """`ONNXAgent.predict` and `predict_batch` on the `typed-decisions` checkpoint.
+
+    The sibling of `predict_golden`, against the third checkpoint. It is a separate family and a
+    separate graph because a graph is traced from ONE checkpoint and `LAYA_ONNX_GRAPH` names one
+    directory: pointing that at the typed graph while `predict.json` expects the multilingual one
+    would re-record `predict.json` from the wrong weights, and both sides of that comparison come
+    from the same mistake, so it passes. `LAYA_TYPED_ONNX_GRAPH` keeps the two unable to collide.
+
+    Records `skipped` when the graph OR the checkpoint is absent, so `unverifiable` leaves the
+    committed file alone rather than replacing it with a marker.
+
+    Platform-sensitive in the last reported digit, as `predict_golden` is; the Java test's
+    tolerance is the gate, not byte equality of this file.
+    """
+    import os
+
+    graph = os.environ.get("LAYA_TYPED_ONNX_GRAPH")
+    rig = os.environ.get("LAYA_FIXTURE_CHECKPOINTS", DEFAULT_CHECKPOINT_ROOT)
+    model = "typed-decisions"
+    if not graph or not os.path.exists(graph):
+        return {"skipped": "set LAYA_TYPED_ONNX_GRAPH to a laya.onnx exported from the "
+                           "typed-decisions checkpoint to record this family"}
+    # The graph is not enough on its own: `ONNXAgent` reads the budgets, the fitted temperatures
+    # and the tokenizer out of the checkpoint directory. Checked here because without it "graph
+    # present, checkpoint absent" was the one mode of this family that raised a bare
+    # `FileNotFoundError` from inside `laya/onnx_agent.py` instead of writing the marker every
+    # sibling builder writes -- loud, but naming a path rather than the command to run.
+    if not os.path.isfile(os.path.join(rig, model, "rl_agent_config.json")):
+        return {"skipped": "no rl_agent_config.json for %s under %s: run "
+                           "prepare_checkpoint.py --checkpoint %s" % (model, rig, model)}
+    from laya.onnx_agent import ONNXAgent
+    from laya.router import _TYPED_DECISION_WORKFLOWS
+
+    agent = ONNXAgent(os.path.join(rig, model), onnx_path=graph)
+    cfg = agent.cfg
+    single = {}
+    for cid, state, lang, workflow, questions in TYPED_CASES:
+        if workflow is not None:
+            questions = _typed_questions(workflow, questions)
+        result = agent.predict(state, questions, lang=lang)
+        single[cid] = {"state": state, "lang": lang, "workflow": workflow,
+                       "questions": questions, "model": result["model"],
+                       "answers": result["answers"], "usage": result["usage"]}
+
+    # Batched over the real invoice schema, including the empty state and two short ones, so
+    # collation and padding are exercised here too. The empty state is the one that matters: it
+    # contributes 0 state tokens and still costs 296 input tokens of rendered questions, so a
+    # port that skips an empty member rather than padding it gets a different batch shape.
+    batch_states = [TYPED_INVOICE_VARIANCE, TYPED_INVOICE_CLEAN,
+                    "INV-2026-1004, 980 USD, matches PO-3100 and delivery.",
+                    "duplicate of INV-2026-1004", ""]
+    batch_questions = _typed_questions("invoice_processing", TYPED_INVOICE_QUESTIONS)
+    batches = []
+    for batch_size, sort_by_length in ((None, False), (2, False), (3, True)):
+        kwargs = {"sort_by_length": sort_by_length}
+        if batch_size is not None:
+            kwargs["batch_size"] = batch_size
+        results = agent.predict_batch(batch_states, batch_questions, **kwargs)
+        batches.append({"batch_size": batch_size, "sort_by_length": sort_by_length,
+                        "states": batch_states, "questions": batch_questions,
+                        "results": [{"model": r["model"], "answers": r["answers"],
+                                     "usage": r["usage"]} for r in results]})
+
+    return {
+        "checkpoint": model,
+        "graph": os.path.basename(graph),
+        "revision": _graph_revision(graph),
+        # What tells this checkpoint from the english one it was fine-tuned from, which ships the
+        # identical tokenizer and the identical encoder. Asserted on the shared agent as it is
+        # opened, so it gates every case below rather than being one more test among them: a
+        # mismatch here means those numbers were produced by the wrong weights and comparing them
+        # is worse than not running.
+        "config": {
+            "model_name": cfg["model_name"],
+            "encoder": cfg["encoder"],
+            "max_len": cfg["max_len"],
+            "head_max_len": cfg["head_max_len"],
+            # `agent.temperature*`, not `cfg[...]`: the agent clamps on load and the config
+            # dict keeps the file's value, so the two disagree here and a port exposes only the
+            # clamped one. Recording both is what makes the clamp visible -- a lone 0.5 cannot
+            # be told from a temperature that was fitted at 0.5, and this checkpoint's
+            # `choice:11+` is 0.1006 in the file and 0.5 in use.
+            "temperature": list(agent.temperature),
+            "temperature_by_options": dict(agent.temperature_by_options),
+            "temperature_raw": list(agent.temperature_raw),
+            "temperature_by_options_raw": dict(agent.temperature_by_options_raw),
+        },
+        "workflows": {name: sorted(ids) for name, ids in sorted(_TYPED_DECISION_WORKFLOWS.items())},
+        "single": single,
+        "batch": batches,
+    }
+
+
 def email_clean():
     """`laya.email`'s cleaner and state builder, over a corpus built from its own reasoning.
 
@@ -3069,6 +3556,645 @@ def confidence_gate():
             " the three states and the no-op" % (gated, len(GATE_STATES)))
     return {"states": list(GATE_STATES), "cases": cases, "refusals": refusals}
 
+#: Mirrored from `laya.structured` so the case lists below can be built at import time, which
+#: keeping this script's `laya` imports inside the builders requires. `structured()` asserts them
+#: against the reference, so a change there fails the generator rather than silently recording a
+#: boundary case that is no longer on the boundary.
+STRUCTURED_MAX_PROPERTIES = 32
+STRUCTURED_MAX_OPTIONS = 32
+STRUCTURED_MAX_SCORE_LEVELS = 10
+
+
+def _sd_answer(kind, **kw):
+    """One answer dict in the shape `predict` returns, with only the fields `_project` reads.
+
+    `action` and `legend` are carried because the Java side's typed `Answer` records require
+    them, not because the projection looks at either.
+    """
+    answer = {"type": kind,
+              "confidence": kw.get("confidence", 0.6),
+              "answer_confidence": kw.get("answer_confidence", 0.7),
+              "action": {"act_probability": kw.get("act", 0.2)}}
+    if kind == "choice":
+        answer["choice"] = kw["choice"]
+        answer["probabilities"] = kw.get("probabilities", {})
+    elif kind == "score":
+        answer["score"] = kw["score"]
+        answer["probabilities"] = kw.get("probabilities", {})
+        answer["legend"] = kw.get("legend", {})
+    else:
+        answer["noul"] = kw["noul"]
+    if kw.get("low_confidence"):
+        answer["low_confidence"] = True
+    return answer
+
+
+def _sd_enum(values, **extra):
+    prop = {"enum": list(values)}
+    prop.update(extra)
+    return prop
+
+
+#: `schema -> questions`. Each case is the schema and nothing else: what is recorded is what
+#: `questions_from_json_schema` makes of it, including the generated instruction wording and the
+#: criteria ORDER, which is positional in laya and therefore part of the question.
+STRUCTURED_SCHEMAS = [
+    ("enum-is-a-choice",
+     {"type": "object", "properties": {"dept": _sd_enum(["billing", "support", "sales"])}}),
+    ("enum-of-numbers-keeps-its-values",
+     {"type": "object", "properties": {"code": _sd_enum([10, 20, 30])}}),
+    ("enum-with-a-null-branch",
+     {"type": "object", "properties": {"tier": _sd_enum(["gold", None])}}),
+    ("const-is-a-one-option-choice",
+     {"type": "object", "properties": {"kind": {"const": "refund"}}}),
+    # `{"const": None}` is a KEY THAT IS PRESENT WITH A NULL VALUE, not an absent key. A port
+    # testing `prop.get("const") is not None` drops this field into the "unsupported schema"
+    # branch instead of asking about it.
+    ("const-null-is-still-a-const",
+     {"type": "object", "properties": {"kind": {"const": None}}}),
+    ("boolean-is-a-noul",
+     {"type": "object", "properties": {"needs_human": {"type": "boolean"}}}),
+    # An enum whose values are ALL bools is a noul, not a two-option choice: the labels would be
+    # "True"/"False" and the head would be asked a choice question about a boolean.
+    ("enum-of-booleans-is-a-noul",
+     {"type": "object", "properties": {"flag": _sd_enum([True, False])}}),
+    ("integer-is-a-score",
+     {"type": "object", "properties": {"urgency": {"type": "integer",
+                                                   "minimum": 1, "maximum": 5}}}),
+    ("number-with-integer-bounds-is-a-score",
+     {"type": "object", "properties": {"n": {"type": "number", "minimum": 0, "maximum": 2}}}),
+    ("score-from-zero",
+     {"type": "object", "properties": {"n": {"type": "integer", "minimum": 0, "maximum": 3}}}),
+    ("score-with-a-negative-minimum",
+     {"type": "object", "properties": {"n": {"type": "integer", "minimum": -2, "maximum": 2}}}),
+    ("score-of-one-level",
+     {"type": "object", "properties": {"n": {"type": "integer", "minimum": 7, "maximum": 7}}}),
+    # An EMPTY description means "generate one", matching the reference's `description or ...`.
+    # A port returning it unchanged asks a question with no instructions at all -- and a port
+    # that returned the generated text for a NON-empty one would be caught by the case below,
+    # not by this one. Measured: a mutant dropping the emptiness test survived.
+    ("an-empty-description-generates-the-instruction",
+     {"type": "object", "properties": {
+         "dept": _sd_enum(["billing", "support"], description=""),
+         "ok": {"type": "boolean", "description": ""},
+         "n": {"type": "integer", "minimum": 1, "maximum": 3, "description": ""}}}),
+    ("description-replaces-the-generated-instruction",
+     {"type": "object", "properties": {
+         "dept": _sd_enum(["billing", "support"], description="Which desk owns this?"),
+         "ok": {"type": "boolean", "description": "Is the customer satisfied?"},
+         "n": {"type": "integer", "minimum": 1, "maximum": 3,
+               "description": "How loud is the complaint?"}}}),
+    # pydantic v2 renders `Optional[X]` as a two-branch anyOf with no top-level type.
+    ("anyof-optional-is-unwrapped",
+     {"type": "object", "properties": {
+         "dept": {"anyOf": [_sd_enum(["billing", "support"]), {"type": "null"}],
+                  "description": "pick a desk"}}}),
+    ("oneof-optional-is-unwrapped",
+     {"type": "object", "properties": {
+         "n": {"oneOf": [{"type": "integer", "minimum": 1, "maximum": 4}, {"type": "null"}]}}}),
+    # `anyOf or oneOf`, so a FALSY `anyOf` falls through to `oneOf` -- and in Python falsy is
+    # not "absent": an empty list, an empty object, an empty string and a zero are all falsy and
+    # all fall through. A port spelling the test as a null check, or as "not a list", sends the
+    # empty-list case to `oneOf` by accident and the empty-OBJECT case there too while refusing
+    # a truthy non-array that should have reached `got 0`. Measured: a mutant that dropped the
+    # emptiness test survived the whole suite, because nothing asked.
+    ("falsy-anyof-falls-through-to-oneof",
+     {"type": "object", "properties": {
+         "a": {"anyOf": [], "oneOf": [{"type": "boolean"}, {"type": "null"}]},
+         "b": {"anyOf": {}, "oneOf": [_sd_enum(["x", "y"]), {"type": "null"}]},
+         "c": {"anyOf": "", "oneOf": [{"type": "integer", "minimum": 2, "maximum": 4},
+                                      {"type": "null"}]},
+         "d": {"anyOf": 0, "oneOf": [{"type": "boolean"}, {"type": "null"}]},
+         "e": {"anyOf": False, "oneOf": [{"type": "boolean"}, {"type": "null"}]},
+         "f": {"anyOf": None, "oneOf": [{"type": "boolean"}, {"type": "null"}]}}}),
+    # The outer description is carried onto the branch only when the branch has none.
+    ("anyof-branch-keeps-its-own-description",
+     {"type": "object", "properties": {
+         "dept": {"anyOf": [_sd_enum(["a", "b"], description="the branch's"), {"type": "null"}],
+                  "description": "the outer one"}}}),
+    ("nullable-type-list-is-unwrapped",
+     {"type": "object", "properties": {"dept": {"type": ["string", "null"],
+                                                "enum": ["billing", "support"]}}}),
+    ("nullable-integer-type-list",
+     {"type": "object", "properties": {"n": {"type": ["integer", "null"],
+                                             "minimum": 0, "maximum": 3}}}),
+    # pydantic v1 wraps a described `$ref` in a one-item allOf; the outer keys win.
+    ("allof-of-one-is-unwrapped-outer-keys-on-top",
+     {"type": "object",
+      "properties": {"dept": {"allOf": [{"$ref": "#/$defs/Desk"}], "description": "the field's"}},
+      "$defs": {"Desk": _sd_enum(["billing", "support"], description="An enumeration.")}}),
+    # "Outer keys on top" is only observable when the one-item `allOf` member and the outer
+    # object SHARE a key. With a bare `$ref` member they never do, so a port that let the member
+    # win passed that case -- measured, by a mutant that swapped the two and survived.
+    ("allof-of-one-inline-outer-keys-win",
+     {"type": "object", "properties": {
+         "dept": {"allOf": [_sd_enum(["a", "b"], description="the branch's")],
+                  "description": "the field's"}}}),
+    # The same rule for `$ref`: the property's own keys sit on top of the definition's, so a
+    # sibling `maximum` narrows the definition's range rather than being ignored.
+    ("ref-sibling-keys-beat-the-definition",
+     {"type": "object", "properties": {"n": {"$ref": "#/$defs/Scale", "maximum": 1}},
+      "$defs": {"Scale": {"type": "integer", "minimum": 0, "maximum": 3}}}),
+    # The definition's own description is DROPPED: pydantic fills it from the enum's docstring,
+    # which describes the type rather than asking about this field.
+    ("ref-into-defs-drops-the-definition-description",
+     {"type": "object", "properties": {"dept": {"$ref": "#/$defs/Desk"}},
+      "$defs": {"Desk": _sd_enum(["billing", "support"], description="An enumeration.")}}),
+    ("ref-into-definitions-draft-07",
+     {"type": "object", "properties": {"dept": {"$ref": "#/definitions/Desk"}},
+      "definitions": {"Desk": _sd_enum([1, 2, 3])}}),
+    ("ref-with-a-sibling-description",
+     {"type": "object",
+      "properties": {"dept": {"$ref": "#/$defs/Desk", "description": "the field's"}},
+      "$defs": {"Desk": _sd_enum(["billing", "support"])}}),
+    # A `$ref` the definition itself carries is an alias, followed by the caller's loop.
+    ("ref-alias-chain",
+     {"type": "object", "properties": {"dept": {"$ref": "#/$defs/Alias"}},
+      "$defs": {"Alias": {"$ref": "#/$defs/Desk"}, "Desk": _sd_enum(["billing", "support"])}}),
+    ("top-level-type-may-be-absent",
+     {"properties": {"ok": {"type": "boolean"}}}),
+    # Property order is the question order, and the criteria order is the option order.
+    ("property-order-is-preserved",
+     {"type": "object", "properties": {
+         "zebra": {"type": "boolean"}, "alpha": _sd_enum(["z", "a", "m"]),
+         "middle": {"type": "integer", "minimum": 0, "maximum": 1}}}),
+    ("max-options-boundary",
+     {"type": "object", "properties": {"c": _sd_enum([str(i) for i in range(STRUCTURED_MAX_OPTIONS)])}}),
+    ("max-score-levels-boundary",
+     {"type": "object", "properties": {"n": {"type": "integer", "minimum": 1,
+                                             "maximum": STRUCTURED_MAX_SCORE_LEVELS}}}),
+    ("max-properties-boundary",
+     {"type": "object",
+      "properties": {"p%02d" % i: {"type": "boolean"} for i in range(STRUCTURED_MAX_PROPERTIES)}}),
+]
+
+#: `answers -> schema values`. The schema is carried with each case because the projection is a
+#: function of BOTH: a choice maps back through its options and a score adds its `minimum`.
+STRUCTURED_PROJECTIONS = [
+    # The schema VALUE, not the label the model answered with. A port returning the label is
+    # indistinguishable here for a string enum and wrong for every other value type.
+    ("choice-returns-the-value-not-the-label",
+     {"type": "object", "properties": {"code": _sd_enum([10, 20, 30])}},
+     {"code": _sd_answer("choice", choice="20",
+                         probabilities={"10": 0.1, "20": 0.8, "30": 0.1})}),
+    ("choice-value-and-label-coincide-for-a-string-enum",
+     {"type": "object", "properties": {"dept": _sd_enum(["billing", "support"])}},
+     {"dept": _sd_answer("choice", choice="support",
+                         probabilities={"billing": 0.3, "support": 0.7})}),
+    ("const-projects-to-the-const-value",
+     {"type": "object", "properties": {"kind": {"const": 7}}},
+     {"kind": _sd_answer("choice", choice="7", probabilities={"7": 1.0})}),
+    ("choice-null-value",
+     {"type": "object", "properties": {"tier": _sd_enum(["gold", None])}},
+     {"tier": _sd_answer("choice", choice="null",
+                         probabilities={"gold": 0.2, "null": 0.8})}),
+    # A label no option carries comes back as the label itself rather than raising -- the model
+    # is constrained to the options, so this is a contract for a hand-built answer.
+    ("choice-unknown-label-falls-back-to-the-label",
+     {"type": "object", "properties": {"code": _sd_enum([10, 20])}},
+     {"code": _sd_answer("choice", choice="99", probabilities={"10": 0.5, "20": 0.5})}),
+    # argmax over the probabilities, plus `minimum`. `score` itself is ignored when they exist,
+    # and it is set here to a level that disagrees so a port reading it is caught.
+    ("score-is-argmax-plus-minimum",
+     {"type": "object", "properties": {"urgency": {"type": "integer",
+                                                   "minimum": 1, "maximum": 5}}},
+     {"urgency": _sd_answer("score", score=0.9,
+                            probabilities={"0": 0.1, "1": 0.1, "2": 0.6, "3": 0.1, "4": 0.1})}),
+    ("score-argmax-with-a-zero-minimum",
+     {"type": "object", "properties": {"n": {"type": "integer", "minimum": 0, "maximum": 3}}},
+     {"n": _sd_answer("score", score=0.0,
+                      probabilities={"0": 0.1, "1": 0.2, "2": 0.1, "3": 0.6})}),
+    ("score-argmax-with-a-negative-minimum",
+     {"type": "object", "properties": {"n": {"type": "integer", "minimum": -2, "maximum": 2}}},
+     {"n": _sd_answer("score", score=4.0,
+                      probabilities={"0": 0.6, "1": 0.1, "2": 0.1, "3": 0.1, "4": 0.1})}),
+    # A tie takes the FIRST level, because `max` over the index range keeps the earliest.
+    ("score-argmax-tie-takes-the-first-level",
+     {"type": "object", "properties": {"n": {"type": "integer", "minimum": 1, "maximum": 3}}},
+     {"n": _sd_answer("score", score=2.0, probabilities={"0": 0.4, "1": 0.4, "2": 0.2})}),
+    # With no probabilities the fallback rounds `score`, which is already a 0-based LEVEL INDEX
+    # -- so `minimum` is added once and never subtracted first.
+    ("score-without-probabilities-rounds",
+     {"type": "object", "properties": {"n": {"type": "integer", "minimum": 3, "maximum": 7}}},
+     {"n": _sd_answer("score", score=2.4, probabilities={})}),
+    # Python's `round` is half to EVEN. `Math.round` is half up and gives 3 here.
+    ("score-without-probabilities-rounds-half-to-even",
+     {"type": "object", "properties": {"n": {"type": "integer", "minimum": -2, "maximum": 2}}},
+     {"n": _sd_answer("score", score=2.5, probabilities={})}),
+    ("score-without-probabilities-rounds-half-to-even-odd-case",
+     {"type": "object", "properties": {"n": {"type": "integer", "minimum": -2, "maximum": 2}}},
+     {"n": _sd_answer("score", score=1.5, probabilities={})}),
+    # Exactly 0.5 is TRUE: the comparison is `>=`, so a port spelling it `>` flips this one case
+    # and no other.
+    ("noul-exactly-half-is-true",
+     {"type": "object", "properties": {"ok": {"type": "boolean"}}},
+     {"ok": _sd_answer("noul", noul=0.5)}),
+    ("noul-just-below-half-is-false",
+     {"type": "object", "properties": {"ok": {"type": "boolean"}}},
+     {"ok": _sd_answer("noul", noul=0.49999999999999994)}),
+    ("noul-true",
+     {"type": "object", "properties": {"ok": {"type": "boolean"}}},
+     {"ok": _sd_answer("noul", noul=0.93)}),
+    # A flagged answer is NULL, whatever it said. Null, not absent: the field was asked.
+    ("low-confidence-choice-is-null",
+     {"type": "object", "properties": {"dept": _sd_enum(["billing", "support"])}},
+     {"dept": _sd_answer("choice", choice="support", low_confidence=True,
+                         probabilities={"billing": 0.3, "support": 0.7})}),
+    ("low-confidence-score-is-null",
+     {"type": "object", "properties": {"n": {"type": "integer", "minimum": 1, "maximum": 3}}},
+     {"n": _sd_answer("score", score=1.0, low_confidence=True,
+                      probabilities={"0": 0.2, "1": 0.7, "2": 0.1})}),
+    ("low-confidence-noul-is-null",
+     {"type": "object", "properties": {"ok": {"type": "boolean"}}},
+     {"ok": _sd_answer("noul", noul=0.93, low_confidence=True)}),
+    # An ABSENT answer is absent from the values. Different from a flagged one, which is null:
+    # "the model was not asked" and "the model was not believed" are not the same outcome.
+    ("an-unanswered-field-is-omitted-not-null",
+     {"type": "object", "properties": {"dept": _sd_enum(["billing", "support"]),
+                                       "ok": {"type": "boolean"}}},
+     {"ok": _sd_answer("noul", noul=0.8)}),
+    ("every-kind-at-once",
+     {"type": "object", "properties": {
+         "dept": _sd_enum(["billing", "support"]),
+         "urgency": {"type": "integer", "minimum": 1, "maximum": 5},
+         "needs_human": {"type": "boolean"}}},
+     {"dept": _sd_answer("choice", choice="billing",
+                         probabilities={"billing": 0.9, "support": 0.1}),
+      "urgency": _sd_answer("score", score=3.0,
+                            probabilities={"0": 0.0, "1": 0.1, "2": 0.1, "3": 0.7, "4": 0.1}),
+      "needs_human": _sd_answer("noul", noul=0.2)}),
+]
+
+#: Every schema the mapping refuses, and the message a caller reads. The message is the contract
+#: here: it names the path, which is the only thing that makes a 32-field schema debuggable.
+STRUCTURED_REFUSALS = [
+    ("free-string", {"type": "object", "properties": {"note": {"type": "string"}}}),
+    ("array", {"type": "object",
+               "properties": {"tags": {"type": "array", "items": {"type": "string"}}}}),
+    ("nested-object", {"type": "object",
+                       "properties": {"inner": {"type": "object",
+                                                "properties": {"a": {"type": "boolean"}}}}}),
+    ("union-of-two-real-types",
+     {"type": "object", "properties": {"x": {"anyOf": [{"type": "string"},
+                                                       {"type": "integer"}]}}}),
+    ("union-of-null-only",
+     {"type": "object", "properties": {"x": {"anyOf": [{"type": "null"}]}}}),
+    ("oneof-of-two-real-types",
+     {"type": "object", "properties": {"x": {"oneOf": [{"type": "boolean"},
+                                                       {"type": "integer"}]}}}),
+    ("type-list-with-two-non-null-types",
+     {"type": "object", "properties": {"x": {"type": ["string", "integer"]}}}),
+    ("top-level-is-an-array", {"type": "array", "items": {"type": "string"}}),
+    ("top-level-has-no-properties", {"type": "object"}),
+    # Both halves of the top-level test, separately. Every other case here is missing
+    # `properties` as well as having the wrong `type`, so a port that dropped the type check
+    # entirely still refused all of them -- measured, by a mutant that did exactly that.
+    ("top-level-type-is-wrong-but-properties-is-there",
+     {"type": "array", "properties": {"ok": {"type": "boolean"}}}),
+    ("top-level-is-a-string-schema", {"type": "string"}),
+    ("empty-properties", {"type": "object", "properties": {}}),
+    ("properties-is-not-an-object", {"type": "object", "properties": []}),
+    ("too-many-properties",
+     {"type": "object",
+      "properties": {"p%02d" % i: {"type": "boolean"} for i in range(STRUCTURED_MAX_PROPERTIES + 1)}}),
+    ("too-many-options",
+     {"type": "object",
+      "properties": {"c": _sd_enum([str(i) for i in range(STRUCTURED_MAX_OPTIONS + 1)])}}),
+    ("empty-enum", {"type": "object", "properties": {"c": _sd_enum([])}}),
+    ("duplicate-choice-labels", {"type": "object", "properties": {"c": _sd_enum(["1", 1])}}),
+    ("numeric-without-bounds", {"type": "object", "properties": {"n": {"type": "integer"}}}),
+    ("numeric-with-float-bounds",
+     {"type": "object", "properties": {"n": {"type": "number",
+                                             "minimum": 0.5, "maximum": 1.5}}}),
+    ("maximum-below-minimum",
+     {"type": "object", "properties": {"n": {"type": "integer",
+                                             "minimum": 5, "maximum": 1}}}),
+    ("too-many-score-levels",
+     {"type": "object", "properties": {"n": {"type": "integer", "minimum": 0,
+                                             "maximum": STRUCTURED_MAX_SCORE_LEVELS}}}),
+    ("empty-property-schema", {"type": "object", "properties": {"c": {}}}),
+    ("property-is-not-an-object", {"type": "object", "properties": {"c": "nope"}}),
+    ("unresolvable-ref",
+     {"type": "object", "properties": {"c": {"$ref": "#/$defs/Missing"}}, "$defs": {}}),
+    ("remote-ref",
+     {"type": "object", "properties": {"c": {"$ref": "https://example.test/Desk"}}}),
+    ("recursive-ref",
+     {"type": "object", "properties": {"c": {"$ref": "#/$defs/Node"}},
+      "$defs": {"Node": {"$ref": "#/$defs/Node"}}}),
+    # A TRUTHY non-array `anyOf` does NOT fall through to `oneOf`: it is iterated, yields no
+    # mapping branch, and lands here. The other side of `falsy-anyof-falls-through-to-oneof`,
+    # and the case a port testing "is it a list" gets wrong in the opposite direction -- it
+    # falls through and, with nothing to fall through to, refuses with "unsupported schema"
+    # instead of this.
+    ("truthy-non-array-anyof-is-not-a-fallthrough",
+     {"type": "object", "properties": {"x": {"anyOf": "abc"}}}),
+    ("truthy-non-array-anyof-with-a-oneof-to-shadow",
+     {"type": "object", "properties": {"x": {"anyOf": {"a": 1},
+                                             "oneOf": [{"type": "boolean"},
+                                                       {"type": "null"}]}}}),
+    # The one case of the reference's top-level `isinstance(schema, dict)` check that is
+    # reachable on a side where the argument is typed: a list, a string or a number cannot be
+    # passed at all, and null can.
+    ("top-level-is-null", None),
+]
+
+
+def _structured_runner(results):
+    """A runner that answers from a script, so `decide` is exercised without a checkpoint.
+
+    It accepts and records `**kwargs`, which is how the reference's `min_confidence` forwarding
+    stays visible: `decide` passes it down to `predict` and `decide_batch` does not.
+    """
+    import copy
+
+    class _Scripted:
+        def __init__(self):
+            self.predict_kwargs = []
+            self.batch_kwargs = []
+
+        def predict(self, state, questions, **kwargs):
+            self.predict_kwargs.append(sorted(kwargs))
+            return copy.deepcopy(results[0])
+
+        def predict_batch(self, states, questions, **kwargs):
+            self.batch_kwargs.append(sorted(kwargs))
+            return [copy.deepcopy(results[i]) for i in range(len(states))]
+
+    return _Scripted()
+
+
+def _structured_result(answers):
+    return {"model": "laya-rl-agent-onnx", "answers": answers,
+            "usage": {"input_tokens": 12, "output_tokens": 0, "state_tokens": 9,
+                      "state_tokens_dropped": 0, "truncated": False,
+                      "truncated_questions": []}}
+
+
+#: End-to-end `decide` / `decide_batch`: the answers a runner returns, and the decision that
+#: comes back. `min_confidence` is the wiring these pin -- the gate decides which fields are
+#: nulled, and the port must read the gate rather than re-implementing the rule.
+STRUCTURED_CALLS = [
+    ("decide-ungated", False,
+     {"type": "object", "properties": {"dept": _sd_enum(["billing", "support"]),
+                                       "ok": {"type": "boolean"}}}, None,
+     [{"dept": _sd_answer("choice", choice="support", answer_confidence=0.9,
+                          probabilities={"billing": 0.3, "support": 0.7}),
+       "ok": _sd_answer("noul", noul=0.9, answer_confidence=0.55)}]),
+    # One field below the bar and one above it, in the same decision: the gate is per answer,
+    # so a port that nulls all or nothing passes neither half of this.
+    ("decide-gated-nulls-only-the-field-below-the-bar", False,
+     {"type": "object", "properties": {"dept": _sd_enum(["billing", "support"]),
+                                       "ok": {"type": "boolean"}}}, 0.6,
+     [{"dept": _sd_answer("choice", choice="support", answer_confidence=0.9,
+                          probabilities={"billing": 0.3, "support": 0.7}),
+       "ok": _sd_answer("noul", noul=0.9, answer_confidence=0.55)}]),
+    ("decide-gated-nulls-everything", False,
+     {"type": "object", "properties": {"dept": _sd_enum(["billing", "support"]),
+                                       "ok": {"type": "boolean"}}}, 0.95,
+     [{"dept": _sd_answer("choice", choice="support", answer_confidence=0.9,
+                          probabilities={"billing": 0.3, "support": 0.7}),
+       "ok": _sd_answer("noul", noul=0.9, answer_confidence=0.55)}]),
+    # A scalar 0.0 IS a gate: states are reported and nothing is nulled.
+    ("decide-gated-at-zero-nulls-nothing", False,
+     {"type": "object", "properties": {"dept": _sd_enum(["billing", "support"])}}, 0.0,
+     [{"dept": _sd_answer("choice", choice="billing", answer_confidence=0.1,
+                          probabilities={"billing": 0.6, "support": 0.4})}]),
+    # A noul reports the two-sided distribution it implies, ROUNDED to four decimals as every
+    # other number in an answer is. 0.123456 is chosen so the rounding is visible: unrounded the
+    # sides are 0.876544 and 0.123456, which differ from the recorded 0.8765 and 0.1235 by 4.4e-5
+    # -- a gap a tolerance can see, where 0.9 would hide it at 1e-17.
+    ("decide-rounds-the-nouls-two-sided-distribution", False,
+     {"type": "object", "properties": {"ok": {"type": "boolean"}}}, None,
+     [{"ok": _sd_answer("noul", noul=0.123456, answer_confidence=0.88)}]),
+    ("decide-batch-keeps-input-order", True,
+     {"type": "object", "properties": {"n": {"type": "integer", "minimum": 1, "maximum": 3}}},
+     None,
+     [{"n": _sd_answer("score", score=0.0, probabilities={"0": 0.8, "1": 0.1, "2": 0.1})},
+      {"n": _sd_answer("score", score=1.0, probabilities={"0": 0.1, "1": 0.8, "2": 0.1})},
+      {"n": _sd_answer("score", score=2.0, probabilities={"0": 0.1, "1": 0.1, "2": 0.8})}]),
+    ("decide-batch-gates-each-state-on-its-own", True,
+     {"type": "object", "properties": {"dept": _sd_enum(["billing", "support"]),
+                                       "ok": {"type": "boolean"}}}, 0.5,
+     [{"dept": _sd_answer("choice", choice="support", answer_confidence=0.9,
+                          probabilities={"billing": 0.3, "support": 0.7}),
+       "ok": _sd_answer("noul", noul=0.9, answer_confidence=0.55)},
+      {"dept": _sd_answer("choice", choice="billing", answer_confidence=0.4,
+                          probabilities={"billing": 0.6, "support": 0.4}),
+       "ok": _sd_answer("noul", noul=0.2, answer_confidence=0.55)}]),
+]
+
+
+def structured():
+    """`laya.structured`: a JSON schema as questions, and the answers projected back onto it.
+
+    Four things a port gets wrong by default, and each has cases chosen so that getting it wrong
+    changes something here:
+
+      * a `choice` projects to the schema VALUE, not the label the model answered with. For a
+        string enum the two coincide, so `enum: [10, 20, 30]` is what tells them apart.
+      * a `score` is `minimum + argmax(probabilities)`. `score` itself is the probability-weighted
+        LEVEL INDEX, so the fallback for an answer with no probabilities rounds it and adds
+        `minimum` once -- subtracting `minimum` first and adding it back cancels out and silently
+        drops it. Python's `round` is half to EVEN, which `Math.round` is not.
+      * a `noul` is `>= 0.5`, so exactly 0.5 is TRUE and a port spelling it `>` differs on that
+        one value and no other.
+      * a low-confidence answer projects to NULL, and an UNANSWERED field is absent instead.
+        "not believed" and "not asked" are different outcomes and a port that conflates them
+        reports a decision nobody made.
+
+    The pydantic half of the module is deliberately NOT recorded: there is no pydantic on the
+    JVM, and `_schema_of` is the only thing between a model and the JSON-schema path this
+    records.
+    """
+    import copy
+
+    from laya import structured as reference
+    from laya.structured import (SchemaError, answers_to_json, decide, decide_batch,
+                                 plan_from_json_schema, questions_from_json_schema)
+
+    # The mirrored limits above are only safe if they are still the reference's.
+    limits = {"max_properties": reference.MAX_PROPERTIES,
+              "max_options": reference.MAX_OPTIONS,
+              "max_score_levels": reference.MAX_SCORE_LEVELS}
+    mirrored = {"max_properties": STRUCTURED_MAX_PROPERTIES,
+                "max_options": STRUCTURED_MAX_OPTIONS,
+                "max_score_levels": STRUCTURED_MAX_SCORE_LEVELS}
+    if limits != mirrored:
+        raise AssertionError(
+            "the mirrored limits %r are no longer laya.structured's %r, so every boundary case"
+            " below is recorded off the boundary" % (mirrored, limits))
+
+    schemas = []
+    for cid, schema in STRUCTURED_SCHEMAS:
+        plan = plan_from_json_schema(schema)
+        schemas.append({
+            "case": cid,
+            "schema": schema,
+            "questions": questions_from_json_schema(schema),
+            # The plan as well as the questions: the OPTION VALUES and the score `minimum` never
+            # reach a question, and they are exactly what the projection needs. A fixture that
+            # recorded only the questions would leave both unpinned until a projection case
+            # happened to cover them.
+            "plan": [{"name": f.name, "kind": f.kind,
+                      "options": [[label, value] for label, value in f.options],
+                      "minimum": f.minimum} for f in plan],
+        })
+
+    projections = []
+    for cid, schema, answers in STRUCTURED_PROJECTIONS:
+        projections.append({"case": cid, "schema": schema, "answers": answers,
+                            "values": answers_to_json(answers, schema)})
+
+    refusals = []
+    for cid, schema in STRUCTURED_REFUSALS:
+        try:
+            questions_from_json_schema(schema)
+        except SchemaError as problem:
+            refusals.append({"case": cid, "schema": schema, "error": str(problem)})
+        else:
+            raise AssertionError("%s was supposed to be refused and was not" % cid)
+
+    # `decide` itself: exactly one of schema/questions, and a batch over a real sequence.
+    arguments = []
+    for cid, call in (
+            ("decide-with-both", lambda: decide(None, "s", schema={"type": "object"},
+                                                questions={})),
+            ("decide-with-neither", lambda: decide(None, "s")),
+            ("decide-batch-with-both",
+             lambda: decide_batch(None, ["s"], schema={"type": "object"}, questions={})),
+            ("decide-batch-with-neither", lambda: decide_batch(None, ["s"])),
+            ("decide-batch-over-a-string",
+             lambda: decide_batch(None, "not a list", schema={"type": "object"})),
+            ("decide-batch-without-a-batching-runner",
+             lambda: decide_batch(object(), ["s"],
+                                  schema={"type": "object",
+                                          "properties": {"ok": {"type": "boolean"}}})),
+    ):
+        try:
+            call()
+        except (ValueError, TypeError) as problem:
+            arguments.append({"case": cid, "error": str(problem)})
+        else:
+            raise AssertionError("%s was supposed to be refused and was not" % cid)
+
+    calls = []
+    for cid, batch, schema, threshold, scripted in STRUCTURED_CALLS:
+        runner = _structured_runner([_structured_result(a) for a in scripted])
+        states = ["state %d" % i for i in range(len(scripted))]
+        if batch:
+            decisions = decide_batch(runner, states, schema=schema, return_details=True,
+                                     min_confidence=threshold)
+        else:
+            decisions = [decide(runner, states[0], schema=schema, return_details=True,
+                                min_confidence=threshold)]
+        calls.append({
+            "case": cid,
+            "batch": batch,
+            "schema": schema,
+            "min_confidence": threshold,
+            # The answers the runner HANDED BACK, before the gate wrote anything into them --
+            # which is what a port has to feed its own runner stub.
+            "predictions": copy.deepcopy(scripted),
+            "decisions": [{"values": d.values,
+                           "confidence": d.confidence,
+                           "answer_confidence": d.answer_confidence,
+                           "probabilities": d.probabilities} for d in decisions],
+            # `decide` forwards `min_confidence` to `predict`; `decide_batch` applies the gate
+            # itself and forwards nothing. Recorded because a port whose runner has no such
+            # keyword must take the second path for both, and this is what says so.
+            "forwarded": sorted(set(sum(runner.predict_kwargs + runner.batch_kwargs, []))),
+        })
+
+    # Coverage. Each of these is a branch of the mapping, and a case list that stops reaching one
+    # leaves that branch asserted by nothing -- which is how a fixture family quietly stops being
+    # a gate.
+    kinds = {f["kind"] for case in schemas for f in case["plan"]}
+    missing_kinds = {"choice", "score", "noul"} - kinds
+    if missing_kinds:
+        raise AssertionError("no schema case produces a %s question"
+                             % ", ".join(sorted(missing_kinds)))
+    required_messages = [
+        "a free string cannot be a fixed option set",
+        "arrays are not supported",
+        "nested objects are not supported",
+        "only 'Optional[...]' unions (one non-null branch) are supported",
+        "'type' has multiple non-null types",
+        "expected a JSON schema object",
+        "the top level must be an object with 'properties'",
+        "'properties' must be a non-empty object",
+        "exceeds MAX_PROPERTIES=%d" % STRUCTURED_MAX_PROPERTIES,
+        "exceeds MAX_OPTIONS=%d" % STRUCTURED_MAX_OPTIONS,
+        "exceeds MAX_SCORE_LEVELS=%d" % STRUCTURED_MAX_SCORE_LEVELS,
+        "'enum' must not be empty",
+        "duplicate choice labels",
+        "needs integer 'minimum' and 'maximum'",
+        "is below 'minimum'",
+        "unsupported schema",
+        "property must be an object",
+        "is recursive",
+        "does not resolve to an entry",
+    ]
+    recorded = [r["error"] for r in refusals]
+    unreached = [m for m in required_messages if not any(m in e for e in recorded)]
+    if unreached:
+        raise AssertionError("no refusal case reaches: %s" % "; ".join(unreached))
+
+    projected = [v for case in projections for v in case["values"].values()]
+    omitted = sum(1 for case in projections
+                  if set(case["schema"]["properties"]) - set(case["values"]))
+    # A null from a FLAG and a null that is the schema's own value are different branches.
+    nulled = sum(1 for case in projections for name, value in case["values"].items()
+                 if value is None and case["answers"][name].get("low_confidence"))
+    null_valued = sum(1 for case in projections for name, value in case["values"].items()
+                      if value is None and not case["answers"][name].get("low_confidence"))
+    booleans = sum(1 for v in projected if isinstance(v, bool))
+    integers = sum(1 for v in projected if isinstance(v, int) and not isinstance(v, bool))
+    relabelled = sum(1 for case in projections
+                     for name, value in case["values"].items()
+                     if isinstance(value, int) and not isinstance(value, bool)
+                     and case["answers"][name]["type"] == "choice")
+    no_probability_scores = sum(1 for case in projections
+                                for answer in case["answers"].values()
+                                if answer["type"] == "score" and not answer["probabilities"])
+    shifted = sum(1 for case in projections
+                  for name in case["values"]
+                  if case["answers"][name]["type"] == "score"
+                  and case["schema"]["properties"][name].get("minimum") not in (0, None))
+    half = sum(1 for case in projections
+               for answer in case["answers"].values()
+               if answer.get("noul") == 0.5)
+    shortfalls = [name for name, count, floor in (
+        ("a null from a low-confidence answer", nulled, 3),
+        ("an omitted field", omitted, 1),
+        ("a schema whose own value is null", null_valued, 1),
+        ("a boolean", booleans, 4),
+        ("an integer level", integers, 7),
+        ("a choice whose VALUE is not its label", relabelled, 2),
+        ("a score with no probabilities", no_probability_scores, 3),
+        ("a score whose minimum is not zero", shifted, 4),
+        ("a noul of exactly 0.5", half, 1),
+    ) if count < floor]
+    if shortfalls:
+        raise AssertionError("the projection cases no longer reach: %s" % "; ".join(shortfalls))
+
+    gated_nulls = sum(1 for case in calls for d in case["decisions"]
+                      for v in d["values"].values() if v is None)
+    batched = sum(1 for case in calls if case["batch"])
+    if gated_nulls < 3 or batched < 2 or len(arguments) < 4:
+        raise AssertionError(
+            "the end-to-end cases no longer pin the wiring: %d gated null(s), %d batch case(s),"
+            " %d argument refusal(s)" % (gated_nulls, batched, len(arguments)))
+
+    return {
+        "limits": limits,
+        "schemas": schemas,
+        "projections": projections,
+        "refusals": refusals,
+        "arguments": arguments,
+        "calls": calls,
+    }
+
+
 def _decoder_shape(tokenizer_json):
     """The decoder section's type chain, flattened, so the fixture says what it was recorded on."""
     import io
@@ -3089,7 +4215,720 @@ def _decoder_shape(tokenizer_json):
     return shape(node)
 
 
+#: Results carry a usage block only, so a case's provenance is readable from one number:
+#: inference returns 110+, a start hook's `ctx.skip()` returns 10+, an end hook's rewrite 510+.
+def _hook_result(i):
+    """One result dict in the shape `predict_batch` returns, with a usage block to aggregate."""
+    return {"model": "laya-rl-agent-onnx", "answers": {},
+            "usage": {"input_tokens": 10 + i, "output_tokens": i, "state_tokens": 7,
+                      "state_tokens_dropped": 0, "truncated": False,
+                      "truncated_questions": []}}
+
+
+def _hook_questions(ids):
+    """A question mapping with those ids: one noul each, which is all these cases need asked."""
+    return {qid: {"noul": "is this %s" % qid} for qid in ids}
+
+
+def _apply_hook_behaviour(spec, ctx, name):
+    """The one behaviour a stub hook performs, named by a string the port reconstructs.
+
+    A behaviour is data rather than a closure so the Java side can build the same chain from the
+    fixture. Anything a hook is allowed to do to a call is one of these.
+    """
+    if spec is None or spec == "record":
+        return
+    verb, _, argument = spec.partition(":")
+    if verb == "raise":
+        raise ValueError("boom from %s" % name)
+    if verb == "skip":
+        ctx.skip([_hook_result(i) for i in range(int(argument))])
+        return
+    if verb == "states":
+        ctx.states = argument.split(",") if argument else []
+        return
+    if verb == "questions":
+        ctx.questions = _hook_questions(argument.split(",") if argument else [])
+        return
+    if verb == "results":
+        ctx.results = [_hook_result(500 + i) for i in range(int(argument))]
+        return
+    if verb == "max_len":
+        ctx.max_len = int(argument)
+        return
+    if verb == "head_max_len":
+        ctx.head_max_len = int(argument)
+        return
+    if verb == "sleep":
+        import time as _time
+        _time.sleep(float(argument))
+        return
+    raise AssertionError("unknown hook behaviour %r" % (spec,))
+
+
+def _stub_hook(log, name, events, behaviour=None, observe=False):
+    """A hook implementing exactly `events`, appending to `log` and then doing `behaviour`.
+
+    The class is called `StubHook` whatever the instance is named, because `dispatch`'s
+    `raise_errors=False` warning quotes `type(hook).__name__` and that text is part of what this
+    family pins -- so the port's stub has to be able to produce the same string.
+    """
+    def make(event):
+        def method(self, ctx):
+            if observe:
+                log.append(_observation(name, event, ctx))
+            else:
+                log.append("%s.%s" % (name, event))
+            spec = behaviour.get(event) if isinstance(behaviour, dict) else behaviour
+            _apply_hook_behaviour(spec, ctx, name)
+        method.__name__ = event
+        method.__qualname__ = "StubHook.%s" % event
+        return method
+
+    namespace = {event: make(event) for event in events}
+    namespace["stub_name"] = name
+    return type("StubHook", (object,), namespace)()
+
+
+def _observation(name, event, ctx):
+    """Everything one hook can read off the context, as the fixture records it."""
+    states = ctx.states
+    if isinstance(states, (list, tuple)):
+        states = list(states)
+    questions = ctx.questions
+    return {
+        "call": "%s.%s" % (name, event),
+        "states": states,
+        "questions": list(questions) if isinstance(questions, dict) else questions,
+        "model": ctx.model,
+        "max_len": ctx.max_len,
+        "head_max_len": ctx.head_max_len,
+        # `None` is not `[]`: "inference has not run" and "inference returned nothing" are
+        # different states of the call, and a start hook distinguishes them to decide whether an
+        # earlier hook has already answered.
+        "results": None if ctx.results is None else [r["usage"]["input_tokens"]
+                                                     for r in ctx.results],
+        "usage": ctx.usage,
+        "error": None if ctx.error is None else str(ctx.error),
+        # Popped before the fixture is written -- it is a fresh uuid4 per call, so recording
+        # the value would make the file differ on every run. What IS recorded is that one call's
+        # hooks all saw the SAME one, and how long it is.
+        "run_id": ctx.run_id,
+        "elapsed_ms_set": ctx.elapsed_ms is not None,
+    }
+
+
+#: (case, default hook names, installed names, per-call `hooks=` names, `on_predict_start=`
+#: names, `on_predict_end=` names, whether the call runs under `_SKIP_DEFAULTS`).
+HOOK_COMPOSITION_CASES = [
+    ("nothing-installed", [], [], [], [], [], False),
+    ("defaults-only", ["d1", "d2"], [], [], [], [], False),
+    ("installed-only", [], ["i1", "i2"], [], [], [], False),
+    ("per-call-only", [], [], ["p1", "p2"], [], [], False),
+    # THE order contract: defaults, then installed, then per-call.
+    ("defaults-then-installed-then-per-call", ["d1"], ["i1"], ["p1"], [], [], False),
+    # The two convenience callables are appended AFTER the per-call hook objects, starts before
+    # ends, so a `on_predict_end=` callable never runs before a `hooks=` entry's end method.
+    ("callables-come-after-hook-objects", ["d1"], ["i1"], ["p1"], ["s1"], ["e1"], False),
+    ("several-start-callables-keep-their-order", [], [], [], ["s1", "s2", "s3"], [], False),
+    ("start-callables-before-end-callables", [], [], [], ["s1"], ["e1"], False),
+    # Defaults are read at CALL time, and a scope can switch them off without unsetting them.
+    ("skip-defaults-drops-only-the-defaults", ["d1", "d2"], ["i1"], ["p1"], [], [], True),
+    ("skip-defaults-with-nothing-else", ["d1"], [], [], [], [], True),
+]
+
+
+#: (case, chain of (name, implemented events, behaviour), event dispatched, raise_errors).
+HOOK_DISPATCH_CASES = [
+    ("every-hook-in-order", [("a", ["on_predict_start"], None), ("b", ["on_predict_start"], None),
+                             ("c", ["on_predict_start"], None)], "on_predict_start", True),
+    # A hook implementing a different subset is SKIPPED for this event, not an error.
+    ("a-hook-that-does-not-implement-the-event-is-skipped",
+     [("a", ["on_predict_start"], None), ("b", ["on_predict_end"], None),
+      ("c", ["on_predict_start"], None)], "on_predict_start", True),
+    ("no-hook-implements-the-event",
+     [("a", ["on_predict_end"], None)], "on_route", True),
+    # Under `raise_errors` the chain STOPS at the first failure; the hooks after it never run.
+    ("raising-stops-the-chain",
+     [("a", ["on_predict_start"], None), ("b", ["on_predict_start"], "raise"),
+      ("c", ["on_predict_start"], None)], "on_predict_start", True),
+    # With it off the failure is a warning and the rest of the chain still runs, which is what a
+    # telemetry hook needs: it must not be able to fail the request.
+    ("raise-errors-false-warns-and-continues",
+     [("a", ["on_predict_start"], None), ("b", ["on_predict_start"], "raise"),
+      ("c", ["on_predict_start"], None)], "on_predict_start", False),
+    ("raise-errors-false-with-every-hook-failing",
+     [("a", ["on_predict_start"], "raise"), ("b", ["on_predict_start"], "raise")],
+     "on_predict_start", False),
+    # `ctx.skip()` does NOT short-circuit the chain. It assigns `ctx.results`, and it is
+    # `predict_batch` that reads it afterwards -- so every later start hook still runs and can
+    # see, and overwrite, what the earlier one answered.
+    ("skip-does-not-stop-the-chain",
+     [("a", ["on_predict_start"], "skip:1"), ("b", ["on_predict_start"], None)],
+     "on_predict_start", True),
+    ("the-other-four-events-dispatch-the-same-way",
+     [("a", ["on_route", "on_load", "on_evict", "on_error"], None),
+      ("b", ["on_route"], None)], "on_route", True),
+    ("on-error-dispatches-over-the-same-chain",
+     [("a", ["on_error"], None), ("b", ["on_error"], "raise")], "on_error", False),
+    ("on-predict-end-dispatches-over-the-same-chain",
+     [("a", ["on_predict_end"], None), ("b", ["on_predict_end"], None)], "on_predict_end", True),
+]
+
+
+#: (case, state count, result count handed to `ctx.skip`).
+HOOK_SKIP_CASES = [
+    ("one-result-per-state", 3, 3),
+    ("one-result-for-the-whole-call", 3, 1),
+    ("one-state-one-result", 1, 1),
+    # Two results for one state is neither shape, and it is the shape that silently dropped rows
+    # the caller was about to zip against.
+    ("two-results-for-one-state", 1, 2),
+    ("too-few-results", 3, 2),
+    ("no-results-at-all", 3, 0),
+    ("too-many-results", 2, 5),
+    # An empty call: zero is both "one per state" and "none", so it is accepted.
+    ("no-states-no-results", 0, 0),
+    ("no-states-one-result", 0, 1),
+    ("no-states-two-results", 0, 2),
+]
+
+
+#: (case, per-result usage blocks).
+HOOK_USAGE_CASES = [
+    ("one-result", [{"input_tokens": 11, "output_tokens": 0}]),
+    ("several-results-sum", [{"input_tokens": 11, "output_tokens": 1},
+                             {"input_tokens": 22, "output_tokens": 2},
+                             {"input_tokens": 33, "output_tokens": 3}]),
+    ("no-results-at-all", []),
+    ("zeroes", [{"input_tokens": 0, "output_tokens": 0}]),
+    # The reference coerces, because a result dict is a plain dict a hook may have rewritten.
+    ("a-missing-usage-block", [{}]),
+    ("a-null-usage-block", [{"__usage_is_none__": True}]),
+    ("a-missing-key", [{"input_tokens": 7}]),
+    ("a-null-value", [{"input_tokens": 7, "output_tokens": None}]),
+    ("a-float-is-truncated", [{"input_tokens": 7.9, "output_tokens": 0}]),
+]
+
+
+#: Values offered to `validate_timeout`.
+#:
+#: The whole seconds -- 1, 2, 10, 60 -- and 1e-07 are here for the RENDERING, not the validation:
+#: `_call_hook` reports an overrun with `%g`, which prints `1` where a naive port prints `1.0`
+#: and `1e-07` where it prints `1.0E-7`. A whole number of seconds is the common case for a
+#: deadline, so it is the common case for that line, and `laya-java` compares its own formatter
+#: against the `seconds` field below rather than against a string somebody typed.
+HOOK_TIMEOUT_VALUES = [None, 1, 2, 10, 60, 1.5, 0.05, 1e-07, "0.5", 0, 0.0, -1, -0.5,
+                       float("nan"), float("inf"), float("-inf")]
+
+
+#: (case, scripted registry operations). `enter`/`exit` bracket a `hooks_installed` block.
+HOOK_REGISTRY_CASES = [
+    ("add-keeps-insertion-order", ["add:a", "add:b", "add:c"]),
+    ("add-a-sequence-at-once", ["add:[a,b]", "add:c"]),
+    # The same instance twice is two installations, and removing by identity takes both.
+    ("the-same-hook-twice", ["add:a", "add:a"]),
+    ("remove-by-identity", ["add:a", "add:b", "remove:a"]),
+    ("remove-takes-every-copy", ["add:a", "add:a", "add:b", "remove:a"]),
+    ("remove-something-never-installed", ["add:a", "remove:b"]),
+    ("a-block-installs-and-restores", ["enter:1:[t]", "exit:1"]),
+    # The rule `_remove_instances` exists for: the application had already installed `a`, so the
+    # block's exit must take ONE copy -- its own, the most recent -- and leave the other.
+    ("a-block-over-an-already-installed-hook", ["add:a", "enter:1:[a]", "exit:1"]),
+    # Two overlapping blocks. Restoring a snapshot would make the first exit remove the second
+    # block's hook; taking one occurrence each does not.
+    ("overlapping-blocks", ["enter:1:[x]", "enter:2:[y]", "exit:2", "exit:1"]),
+    ("overlapping-blocks-exited-outermost-first",
+     ["enter:1:[x]", "enter:2:[y]", "exit:1", "exit:2"]),
+    # A hook added with add_hook INSIDE a block is not in any snapshot and must survive the exit.
+    ("add-inside-a-block-survives-the-exit", ["enter:1:[t]", "add:d", "exit:1"]),
+    ("a-block-with-several-arguments", ["enter:1:[x],[y,z]", "exit:1"]),
+    ("a-block-with-nothing-in-it", ["enter:1:", "exit:1"]),
+]
+
+
+#: (case, default hooks, installed hooks, per-call hooks, states, question ids, hooks_raise,
+#: whether the stubbed inference itself raises). Each hook is `(name, {event: behaviour})` and
+#: implements EVERY event, so the log says exactly which events fired and in which order --
+#: which event a hook implements is the dispatch section's subject, not this one's.
+HOOK_PREDICT_CASES = [
+    ("no-hooks", [], [], [], ["s0"], ["q"], True, False),
+    # Question ids that are NOT in alphabetical order, deliberately: a choice's options are
+    # positional and a question map is iterated, so a port that re-sorts the mapping on the way
+    # into the context asks a different question than the caller wrote -- and with ids like
+    # "q", "r" it would still compare clean.
+    ("a-start-hook-sees-the-call", [], [], [("p", {})], ["s0", "s1"], ["urgent", "intent"],
+     True, False),
+    # Order end to end: a default, an installed and a per-call hook all fire, in that order, for
+    # both events -- and `compose_hooks` reads the defaults at CALL time, not at construction.
+    ("default-installed-and-per-call-all-fire", [("d", {})], [("i", {})], [("p", {})], ["s0"],
+     ["q"], True, False),
+    # A start hook rewrites the call, and it is the REWRITTEN value inference is handed.
+    ("a-start-hook-rewrites-the-states", [], [], [("p", {"on_predict_start": "states:x,y,z"})],
+     ["s0"], ["q"], True, False),
+    # Two ids, out of alphabetical order, so a port that re-sorts the rewritten mapping on the
+    # way back onto the context differs here rather than passing on a one-question rewrite.
+    ("a-start-hook-rewrites-the-questions", [], [],
+     [("p", {"on_predict_start": "questions:urgent,intent"})], ["s0"], ["q", "r"], True, False),
+    ("a-start-hook-sets-the-token-budget", [], [], [("p", {"on_predict_start": "max_len:128"})],
+     ["s0"], ["q"], True, False),
+    ("a-start-hook-sets-the-head-budget", [], [],
+     [("p", {"on_predict_start": "head_max_len:64"})], ["s0"], ["q"], True, False),
+    # `ctx.skip()` short-circuits inference: the stub is never called and the hook's own payload
+    # is what comes back.
+    ("skip-answers-the-call", [], [], [("p", {"on_predict_start": "skip:1"})], ["s0"], ["q"],
+     True, False),
+    ("skip-one-per-state", [], [], [("p", {"on_predict_start": "skip:2"})], ["s0", "s1"], ["q"],
+     True, False),
+    ("skip-one-for-the-whole-call", [], [], [("p", {"on_predict_start": "skip:1"})],
+     ["s0", "s1"], ["q"], True, False),
+    ("skip-with-a-count-that-fits-nothing", [], [], [("p", {"on_predict_start": "skip:3"})],
+     ["s0", "s1"], ["q"], True, False),
+    # A later start hook can overwrite what an earlier one answered, because `ctx.skip` assigns
+    # and dispatch does not stop.
+    ("the-last-skip-wins", [], [], [("p", {"on_predict_start": "skip:1"}),
+                                    ("p2", {"on_predict_start": "skip:2"})],
+     ["s0", "s1"], ["q"], True, False),
+    # An end hook may replace the whole result list, and that is the return value.
+    ("an-end-hook-rewrites-the-results", [], [], [("p", {"on_predict_end": "results:1"})],
+     ["s0"], ["q"], True, False),
+    # A throwing hook, under each policy and at each end of the call.
+    ("a-raising-start-hook-fails-the-call", [], [], [("p", {"on_predict_start": "raise"}),
+                                                     ("p2", {})], ["s0"], ["q"], True, False),
+    ("a-raising-start-hook-is-only-a-warning", [], [], [("p", {"on_predict_start": "raise"}),
+                                                        ("p2", {})], ["s0"], ["q"], False, False),
+    ("a-raising-end-hook-fails-the-call", [], [], [("p", {"on_predict_end": "raise"})], ["s0"],
+     ["q"], True, False),
+    ("a-raising-end-hook-is-only-a-warning", [], [], [("p", {"on_predict_end": "raise"})],
+     ["s0"], ["q"], False, False),
+    # Inference itself fails: on_error runs, then on_predict_end runs ANYWAY, with the error on
+    # the context and `ctx.results` still None.
+    ("inference-fails", [], [], [("p", {})], ["s0"], ["q"], True, True),
+    # A failing on_error hook must not replace the failure that triggered it.
+    ("inference-fails-with-a-raising-error-hook", [], [], [("p", {"on_error": "raise"})], ["s0"],
+     ["q"], True, True),
+    # A failing end hook on the FAILURE path must not mask the real error either.
+    ("inference-fails-with-a-raising-end-hook", [], [], [("p", {"on_predict_end": "raise"})],
+     ["s0"], ["q"], True, True),
+    # The empty call: no inference, an empty result list, and the end hook still sees it.
+    ("no-states", [], [], [("p", {})], [], ["q"], True, False),
+]
+
+
+#: The lifecycle event names, in the reference's own order, asserted against `HOOK_EVENTS` rather
+#: than imported: the ORDER is what a port's enum has to agree with, and importing it would make
+#: a reordering invisible here.
+HOOK_EVENT_NAMES = ["on_predict_start", "on_predict_end", "on_route", "on_load", "on_evict",
+                    "on_error"]
+
+
+def _hook_name_of(entry):
+    """The label the fixture gives one entry of a composed hook list."""
+    kind = type(entry).__name__
+    if kind in ("_StartAdapter", "_EndAdapter"):
+        return ("start:" if kind == "_StartAdapter" else "end:") + entry.fn.laya_stub_name
+    return getattr(entry, "stub_name", kind)
+
+
+def _named_callable(name):
+    """A plain `on_predict_start=` / `on_predict_end=` callable, labelled for the fixture."""
+    def fn(ctx):
+        return None
+    fn.laya_stub_name = name
+    return fn
+
+
+def hook_dispatch():
+    """`laya.hooks`: what runs, in what order, and what each hook is allowed to change.
+
+    Hooks are the one place a caller's own code runs inside a prediction, so every observable
+    here is a contract a port has to reproduce exactly. The sections below are chosen so a port
+    that gets any of them wrong differs somewhere:
+
+      * ORDER. `compose_hooks` is defaults, then installed, then per-call, and `dispatch` calls
+        them in that order. A port that composes the other way round still runs every hook, so
+        nothing fails -- except that the tracer a caller installed to see what the per-call hook
+        did now runs first and sees nothing.
+      * `ctx.skip()` assigns `ctx.results` and does NOT stop the chain. The short-circuit is
+        `predict_batch` reading `ctx.results` afterwards, so a later start hook still runs and
+        can overwrite the answer. A port that returns early from dispatch loses that.
+      * `hooks_raise`. True fails the request at the first throwing hook and the rest of the
+        chain never runs; False warns, with a message quoting the hook's class and event, and
+        continues. Both ends of the call, and the failure path, are recorded.
+      * what a hook SEES. The states, the questions, the model, the token-budget overrides, the
+        run id shared across one call's hooks, and -- at the end -- the aggregated usage, the
+        elapsed time and the error. A port that builds the context late, or rebuilds it per
+        event, breaks the identity those depend on.
+      * `ctx.skip()`'s count check. One result for the whole call or one per state, nothing else,
+        refused INSIDE the hook under the caller's own `hooks_raise` rather than downstream --
+        where it had been an `IndexError` the server mapped to a 500, and a short list
+        `predict_batch` returned while the caller zipped it against their states.
+
+    Inference is stubbed, so this family needs no checkpoint and no graph: `ONNXAgent.predict_batch`
+    is driven unbound over a stub that carries only what it touches. That is also what makes the
+    "skip answers the call" cases legible -- whether the model ran is recorded, not inferred.
+    """
+    import threading
+    import warnings
+
+    from laya.hooks import (
+        HOOK_EVENTS, HookRegistry, PredictContext, _as_sequence, add_default_hook,
+        aggregate_usage, clear_default_hooks, compose_hooks, default_hooks, dispatch,
+        normalise_hooks, set_default_hooks, validate_timeout,
+    )
+    from laya.hooks import _SKIP_DEFAULTS
+
+    assert list(HOOK_EVENTS) == HOOK_EVENT_NAMES, (
+        "the lifecycle events moved: %r" % (HOOK_EVENTS,))
+
+    # -- composition order ---------------------------------------------------
+    composition = []
+    for (cid, defaults, installed, per_call, starts, ends, skip_defaults) in \
+            HOOK_COMPOSITION_CASES:
+        log = []
+        clear_default_hooks()
+        set_default_hooks([_stub_hook(log, n, HOOK_EVENT_NAMES) for n in defaults])
+        token = _SKIP_DEFAULTS.set(True) if skip_defaults else None
+        try:
+            active = compose_hooks(
+                [_stub_hook(log, n, HOOK_EVENT_NAMES) for n in installed],
+                [_stub_hook(log, n, HOOK_EVENT_NAMES) for n in per_call],
+                [_named_callable(n) for n in starts],
+                [_named_callable(n) for n in ends])
+        finally:
+            if token is not None:
+                _SKIP_DEFAULTS.reset(token)
+            clear_default_hooks()
+        composition.append({
+            "case": cid, "defaults": defaults, "installed": installed, "hooks": per_call,
+            "on_predict_start": starts, "on_predict_end": ends,
+            "skip_defaults": skip_defaults,
+            "order": [_hook_name_of(entry) for entry in active],
+        })
+
+    # `default_hooks()` hands back a COPY: a caller that mutates it must not be editing the
+    # process-wide list, which is the difference between a read and a handle.
+    clear_default_hooks()
+    probe = _stub_hook([], "probe", HOOK_EVENT_NAMES)
+    set_default_hooks([probe])
+    defaults_api = {"after_set": [_hook_name_of(h) for h in default_hooks()]}
+    borrowed = default_hooks()
+    borrowed.append(_stub_hook([], "intruder", HOOK_EVENT_NAMES))
+    defaults_api["mutating_the_returned_list_changes_nothing"] = [
+        _hook_name_of(h) for h in default_hooks()]
+    add_default_hook(_stub_hook([], "added", HOOK_EVENT_NAMES))
+    defaults_api["after_add"] = [_hook_name_of(h) for h in default_hooks()]
+    clear_default_hooks()
+    defaults_api["after_clear"] = [_hook_name_of(h) for h in default_hooks()]
+
+    # -- what normalise_hooks refuses ---------------------------------------
+    class _NotAHook(object):
+        pass
+
+    class _NotCallable(object):
+        on_predict_start = "not a function"
+
+    refusals = []
+    for label, argument in (("a class rather than an instance", _NotAHook),
+                            ("an object implementing no event", _NotAHook()),
+                            ("an event attribute that is not callable", _NotCallable()),
+                            ("a plain object", object())):
+        try:
+            normalise_hooks(argument)
+            refusals.append({"input": label, "error": None})
+        except TypeError as problem:
+            refusals.append({"input": label, "error": str(problem)})
+    for label, argument in (("a non-callable on_predict_start", 7),
+                            ("a non-callable on_predict_end", "nope")):
+        try:
+            if "start" in label:
+                normalise_hooks(None, argument, None)
+            else:
+                normalise_hooks(None, None, argument)
+            refusals.append({"input": label, "error": None})
+        except TypeError as problem:
+            refusals.append({"input": label, "error": str(problem)})
+
+    # `_as_sequence`: one hook, a list of them, or nothing, flattened the same way.
+    as_sequence = [
+        {"input": "none", "length": len(_as_sequence(None))},
+        {"input": "one", "length": len(_as_sequence(probe))},
+        {"input": "list-of-two", "length": len(_as_sequence([probe, probe]))},
+        {"input": "tuple-of-three", "length": len(_as_sequence((probe, probe, probe)))},
+        {"input": "empty-list", "length": len(_as_sequence([]))},
+    ]
+
+    # -- dispatch ------------------------------------------------------------
+    dispatched = []
+    for cid, chain, event, raise_errors in HOOK_DISPATCH_CASES:
+        log = []
+        hooks = [_stub_hook(log, name, events, behaviour) for name, events, behaviour in chain]
+        ctx = PredictContext(states=["s0"], questions=_hook_questions(["q"]))
+        raised = None
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            try:
+                dispatch(hooks, event, ctx, raise_errors=raise_errors)
+            except BaseException as problem:
+                raised = {"type": type(problem).__name__, "message": str(problem)}
+        dispatched.append({
+            "case": cid, "event": event, "raise_errors": raise_errors,
+            "chain": [{"name": name, "events": events, "behaviour": behaviour}
+                      for name, events, behaviour in chain],
+            "calls": log, "raised": raised,
+            "warnings": [str(w.message) for w in caught],
+            "results": None if ctx.results is None else len(ctx.results),
+        })
+
+    # -- ctx.skip() ----------------------------------------------------------
+    skips = []
+    for cid, n_states, n_results in HOOK_SKIP_CASES:
+        ctx = PredictContext(states=["s%d" % i for i in range(n_states)],
+                             questions=_hook_questions(["q"]))
+        try:
+            ctx.skip([_hook_result(i) for i in range(n_results)])
+            skips.append({"case": cid, "states": n_states, "results": n_results,
+                          "accepted": True, "error": None,
+                          "assigned": [r["usage"]["input_tokens"] for r in ctx.results]})
+        except ValueError as problem:
+            skips.append({"case": cid, "states": n_states, "results": n_results,
+                          "accepted": False, "error": str(problem),
+                          "assigned": None})
+
+    # -- aggregate_usage -----------------------------------------------------
+    usages = []
+    for cid, blocks in HOOK_USAGE_CASES:
+        results = []
+        for block in blocks:
+            if block.get("__usage_is_none__"):
+                results.append({"usage": None})
+            elif block:
+                results.append({"usage": dict(block)})
+            else:
+                results.append({})
+        usages.append({"case": cid, "results": blocks, "total": aggregate_usage(results)})
+
+    # -- validate_timeout ----------------------------------------------------
+    timeouts = []
+    for value in HOOK_TIMEOUT_VALUES:
+        entry = {"input": repr(value)}
+        try:
+            accepted = validate_timeout(value)
+            entry["accepted"] = True
+            entry["value"] = accepted
+            # Exactly the rendering `_call_hook` puts in its TimeoutError, which the port has to
+            # reproduce character for character -- see that function and `HOOK_TIMEOUT_VALUES`.
+            entry["seconds"] = None if accepted is None else "%g" % accepted
+            entry["error"] = None
+        except (ValueError, OverflowError) as problem:
+            entry["accepted"] = False
+            entry["value"] = None
+            entry["seconds"] = None
+            entry["error"] = str(problem)
+        timeouts.append(entry)
+
+    # -- HookRegistry --------------------------------------------------------
+    registries = []
+    for cid, script in HOOK_REGISTRY_CASES:
+        class _Registry(HookRegistry):
+            def __init__(self):
+                self.hooks = ()
+                self._hooks_mutex = threading.Lock()
+
+        registry = _Registry()
+        pool = {}
+
+        def named(label):
+            if label not in pool:
+                pool[label] = _stub_hook([], label, HOOK_EVENT_NAMES)
+            return pool[label]
+
+        blocks = {}
+        steps = []
+        for op in script:
+            verb, _, rest = op.partition(":")
+            returned = None
+            if verb == "add":
+                if rest.startswith("["):
+                    registry.add_hook([named(x) for x in rest[1:-1].split(",") if x])
+                else:
+                    registry.add_hook(named(rest))
+            elif verb == "remove":
+                returned = registry.remove_hook(named(rest))
+            elif verb == "enter":
+                block, _, arguments = rest.partition(":")
+                groups = []
+                for group in ([] if not arguments else arguments.split("],[")):
+                    labels = [x for x in group.strip("[]").split(",") if x]
+                    groups.append([named(x) for x in labels])
+                manager = registry.hooks_installed(*groups)
+                blocks[block] = manager
+                manager.__enter__()
+            elif verb == "exit":
+                blocks.pop(rest).__exit__(None, None, None)
+            else:
+                raise AssertionError("unknown registry op %r" % (op,))
+            steps.append({"op": op, "returned": returned,
+                          "hooks": [_hook_name_of(h) for h in registry.hooks]})
+        for leftover in list(blocks.values()):
+            leftover.__exit__(None, None, None)
+        registries.append({"case": cid, "script": list(script), "steps": steps,
+                           "final": [_hook_name_of(h) for h in registry.hooks]})
+
+    predicted = _hook_predict_cases()
+
+    # The branches have to be REACHED. Every case below compares clean against a port that never
+    # runs a hook at all, so a case list that stopped constructing a short-circuit, a refusal or
+    # a failure would still be green -- which is the one outcome this family must not produce.
+    reached = {
+        "three-tier order": sum(1 for c in composition
+                                if c["defaults"] and c["installed"] and c["hooks"]
+                                and c["order"][:len(c["defaults"])] == c["defaults"]),
+        "defaults skipped": sum(1 for c in composition if c["skip_defaults"] and c["defaults"]
+                                and not set(c["defaults"]) & set(c["order"])),
+        "dispatch stopped early": sum(1 for c in dispatched if c["raised"]),
+        "dispatch warned and continued": sum(1 for c in dispatched
+                                             if c["warnings"] and not c["raised"]),
+        "dispatch skipped a hook": sum(1 for c in dispatched
+                                       if len(c["calls"]) < len(c["chain"])
+                                       and not c["raised"]),
+        "skip refused": sum(1 for c in skips if not c["accepted"]),
+        "skip accepted": sum(1 for c in skips if c["accepted"]),
+        "timeout refused": sum(1 for t in timeouts if not t["accepted"]),
+        "block left a hook behind": sum(1 for r in registries if r["final"]),
+        "block restored": sum(1 for r in registries if not r["final"]),
+        "inference short-circuited": sum(1 for c in predicted if c["inference"] is None
+                                         and c["raised"] is None),
+        "inference saw a rewrite": sum(1 for c in predicted if c["inference"]
+                                       and (c["inference"]["states"] != c["states"]
+                                            or c["inference"]["questions"] != c["questions"]
+                                            or c["inference"]["overrides"])),
+        "call failed": sum(1 for c in predicted if c["raised"]),
+        "call warned": sum(1 for c in predicted if c["warnings"]),
+        "on_error fired": sum(1 for c in predicted
+                              if any(e["call"].endswith(".on_error") for e in c["calls"])),
+        "a hook failure was attached, not substituted": sum(
+            1 for c in predicted if c["raised"] and c["raised"]["context"]),
+        "an end hook saw the aggregated usage": sum(
+            1 for c in predicted
+            if any(e["call"].endswith(".on_predict_end") and e["usage"] for e in c["calls"])),
+    }
+    thin = {name: count for name, count in reached.items() if count < 1}
+    if thin or reached["skip refused"] < 4 or reached["inference short-circuited"] < 3:
+        raise AssertionError(
+            "the hook cases do not reach every branch this family exists to pin: %s"
+            % ", ".join("%s=%d" % pair for pair in sorted(reached.items())))
+
+    return {
+        "events": HOOK_EVENT_NAMES,
+        "composition": composition,
+        "default_hooks_api": defaults_api,
+        "normalise_refusals": refusals,
+        "as_sequence": as_sequence,
+        "dispatch": dispatched,
+        "skip": skips,
+        "usage": usages,
+        "timeouts": timeouts,
+        "registry": registries,
+        "predict_batch": predicted,
+    }
+
+
+def _hook_predict_cases():
+    """`ONNXAgent.predict_batch` driven over a stubbed inference, one case per contract.
+
+    Unbound over a stub that carries only what the method touches -- the hook list, the three
+    policy fields, the model id and `_infer_batch` -- so this needs no checkpoint and no graph,
+    and so the fixture can record whether the model was reached at all. That last part is the
+    point of the `skip` cases: "inference did not run" is the observable, and inferring it from
+    the payload would not distinguish a short-circuit from a model that happened to agree.
+    """
+    import warnings
+
+    from laya.hooks import clear_default_hooks, set_default_hooks
+
+    from laya.onnx_agent import ONNXAgent
+
+    cases = []
+    for (cid, defaults, installed, per_call, states, qids, hooks_raise,
+         inference_raises) in HOOK_PREDICT_CASES:
+        log = []
+        seen = {}
+
+        class Stub(object):
+            """Everything `predict_batch` touches on `self`, and nothing else."""
+
+            model_id = "stub-checkpoint"
+            hooks_concurrent = True
+            _hooks_lock = None
+
+            def __init__(self):
+                self.hooks = [_stub_hook(log, n, HOOK_EVENT_NAMES, b, observe=True)
+                              for n, b in installed]
+                self.hooks_raise = hooks_raise
+                self.hooks_timeout = None
+
+            def _infer_batch(self, inner_states, inner_questions, lang=None, batch_size=None,
+                             sort_by_length=False, **overrides):
+                seen["states"] = list(inner_states)
+                seen["questions"] = list(inner_questions)
+                seen["overrides"] = dict(overrides)
+                if inference_raises:
+                    raise RuntimeError("the graph refused this batch")
+                return [_hook_result(100 + i) for i in range(len(inner_states))]
+
+        clear_default_hooks()
+        if defaults:
+            set_default_hooks([_stub_hook(log, n, HOOK_EVENT_NAMES, b, observe=True)
+                               for n, b in defaults])
+        questions = _hook_questions(qids)
+        raised = None
+        results = None
+        try:
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                results = ONNXAgent.predict_batch(
+                    Stub(), list(states), questions,
+                    hooks=[_stub_hook(log, n, HOOK_EVENT_NAMES, b, observe=True)
+                           for n, b in per_call])
+        except BaseException as problem:
+            raised = {"type": type(problem).__name__, "message": str(problem),
+                      # The reference attaches a failing end/error hook to the real failure
+                      # rather than letting it replace it, so the original is still what the
+                      # caller catches and the hook's is reachable underneath.
+                      "context": None if problem.__context__ is None
+                                 else type(problem.__context__).__name__}
+        finally:
+            clear_default_hooks()
+
+        run_ids = {entry["run_id"] for entry in log}
+        for entry in log:
+            del entry["run_id"]
+        cases.append({
+            "case": cid,
+            "defaults": [{"name": n, "behaviour": b} for n, b in defaults],
+            "installed": [{"name": n, "behaviour": b} for n, b in installed],
+            "hooks": [{"name": n, "behaviour": b} for n, b in per_call],
+            "states": list(states), "questions": qids, "hooks_raise": hooks_raise,
+            "inference_raises": inference_raises,
+            # What the model was handed, or null when a hook answered before it ran.
+            "inference": None if "states" not in seen else {
+                "states": seen["states"], "questions": seen["questions"],
+                "overrides": seen["overrides"]},
+            "calls": log,
+            "result": None if results is None else [r["usage"]["input_tokens"] for r in results],
+            "raised": raised,
+            "warnings": [str(w.message) for w in caught],
+            # One context per call, shared by every hook of it: that is what lets a tracer
+            # correlate a start with its end without threading state of its own.
+            "one_run_id_per_call": len(run_ids) <= 1,
+            "run_id_hex_length": len(next(iter(run_ids))) if run_ids else None,
+        })
+    return cases
+
+
 FAMILIES = {
+    "structured.json": structured,
     "confidence_gate.json": confidence_gate,
     "predict_long.json": predict_long_scan,
     "window_plan.json": window_plan,
@@ -3105,6 +4944,8 @@ FAMILIES = {
     "python_json.json": python_json,
     "email.json": email_clean,
     "predict.json": predict_golden,
+    "typed_decisions.json": typed_decisions_golden,
+    "hooks.json": hook_dispatch,
 }
 
 

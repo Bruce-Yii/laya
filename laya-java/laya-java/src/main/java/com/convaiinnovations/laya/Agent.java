@@ -2,6 +2,10 @@ package com.convaiinnovations.laya;
 
 import com.convaiinnovations.laya.config.AgentConfig;
 import com.convaiinnovations.laya.decode.Decoder;
+import com.convaiinnovations.laya.hooks.HookCall;
+import com.convaiinnovations.laya.hooks.HookRegistry;
+import com.convaiinnovations.laya.hooks.Hooks;
+import com.convaiinnovations.laya.hooks.PredictContext;
 import com.convaiinnovations.laya.infer.InferenceSession;
 import com.convaiinnovations.laya.onnx.LayaSession;
 import com.convaiinnovations.laya.sequence.Collator;
@@ -41,12 +45,22 @@ import java.util.Map;
  * <p>One session is not safe for concurrent {@code predict} calls unless ONNX Runtime is
  * configured for it; hold one {@code Agent} per worker, or serialise access.
  */
-public final class Agent implements AutoCloseable, Predictor {
+public final class Agent implements AutoCloseable, Predictor, BatchPredictor {
 
     private final Tokenizer tokenizer;
     private final AgentConfig config;
     private final InferenceSession session;
     private final int padId;
+    private final String modelName;
+    /**
+     * This agent's hooks, which a caller may edit at any point in its life.
+     *
+     * <p>Final and never replaced: a call takes a snapshot of the list, so installing a hook
+     * mid-flight cannot disturb one, and handing out the registry rather than copying hook
+     * methods onto {@code Agent} keeps six lifecycle names off the surface of a class whose
+     * subject is prediction.
+     */
+    private final HookRegistry hooks = new HookRegistry();
     /**
      * This agent's own lifecycle, not the session's.
      *
@@ -57,11 +71,13 @@ public final class Agent implements AutoCloseable, Predictor {
      */
     private volatile boolean closed;
 
-    private Agent(Tokenizer tokenizer, AgentConfig config, InferenceSession session, int padId) {
+    private Agent(Tokenizer tokenizer, AgentConfig config, InferenceSession session, int padId,
+                  String modelName) {
         this.tokenizer = tokenizer;
         this.config = config;
         this.session = session;
         this.padId = padId;
+        this.modelName = modelName;
     }
 
     /**
@@ -79,9 +95,11 @@ public final class Agent implements AutoCloseable, Predictor {
     /** Opens a checkpoint with an explicit intra-op thread count. */
     public static Agent open(Path modelDirectory, Path graphDirectory, int threads)
             throws IOException {
+        Path name = modelDirectory.getFileName();
         return using(Tokenizer.fromModelDirectory(modelDirectory),
                 AgentConfig.fromModelDirectory(modelDirectory),
-                LayaSession.open(graphDirectory, threads));
+                LayaSession.open(graphDirectory, threads),
+                name == null ? null : name.toString());
     }
 
     /**
@@ -90,6 +108,19 @@ public final class Agent implements AutoCloseable, Predictor {
      * stub {@link InferenceSession} instead of a 1.2 GB graph.
      */
     public static Agent using(Tokenizer tokenizer, AgentConfig config, InferenceSession session) {
+        return using(tokenizer, config, session, null);
+    }
+
+    /**
+     * Assembles an agent from parts, naming the checkpoint.
+     *
+     * @param modelName what {@link PredictContext#model()} reports to a hook, or null. A router
+     *     serving several checkpoints through one tokenizer is the caller that needs it: without
+     *     a name, a hook watching every prediction in a process cannot say which checkpoint
+     *     answered
+     */
+    public static Agent using(Tokenizer tokenizer, AgentConfig config, InferenceSession session,
+                              String modelName) {
         // Padding is masked out of attention but still embedded, so it has to be a real id.
         // No silent fallback to the SEP id. The reference hands `tok.pad_token_id` straight to
         // the collator, so a checkpoint naming no pad_token fails the request outright -- and a
@@ -99,7 +130,29 @@ public final class Agent implements AutoCloseable, Predictor {
         int padId = tokenizer.padId().orElseThrow(() -> new IllegalStateException(
                 "this checkpoint names no pad_token, so a batch cannot be padded; the reference "
                 + "refuses the same checkpoint"));
-        return new Agent(tokenizer, config, session, padId);
+        return new Agent(tokenizer, config, session, padId, modelName);
+    }
+
+    /**
+     * The checkpoint name a hook sees, or null when the agent was assembled without one.
+     *
+     * <p>{@link #open} takes it from the model directory's own name; that is the only thing a
+     * checkpoint on disk is identified by here, since {@code rl_agent_config.json} does not
+     * carry one.
+     */
+    public String modelName() {
+        return modelName;
+    }
+
+    /**
+     * This agent's hooks: install, remove, and the policy for a throwing or slow one.
+     *
+     * <pre>{@code
+     * agent.hooks().addHook(tracer).raiseErrors(false);
+     * }</pre>
+     */
+    public HookRegistry hooks() {
+        return hooks;
     }
 
     /** The checkpoint's tokenizer, for callers that want to measure a state's token cost. */
@@ -140,6 +193,7 @@ public final class Agent implements AutoCloseable, Predictor {
      * answer -- it only cuts padding -- but leaving it off keeps the batched path's grouping
      * predictable, and a caller who wants the throughput can ask for it.
      */
+    @Override
     public List<Prediction> predictBatch(List<?> states, Map<String, Question> questions) {
         return predictBatch(states, questions, null, 0, false);
     }
@@ -156,10 +210,54 @@ public final class Agent implements AutoCloseable, Predictor {
      */
     public List<Prediction> predictBatch(List<?> states, Map<String, Question> questions,
                                          String language, int batchSize, boolean sortByLength) {
+        return predictBatch(states, questions, language, batchSize, sortByLength, HookCall.none());
+    }
+
+    /**
+     * Asks every question about every state, with hooks around the call.
+     *
+     * <p>The hooks are this agent's installed ones, after any process-wide defaults, with
+     * {@code call}'s own appended last — see {@link Hooks#compose}. A start hook may rewrite the
+     * states, the questions or the token budget, or answer the call outright with
+     * {@link PredictContext#skip}, in which case the model is never reached. An end hook may
+     * replace the results, and what it leaves is what this returns.
+     *
+     * <p>The checks on the states and the questions happen AFTER the start hooks, deliberately,
+     * and that is the reference's order too: only the value that survives the hooks is
+     * validated, so a hook that normalises a caller's loose input is allowed to do its job.
+     *
+     * @param call per-call hooks and policy overrides, or {@link HookCall#none()}
+     */
+    public List<Prediction> predictBatch(List<?> states, Map<String, Question> questions,
+                                         String language, int batchSize, boolean sortByLength,
+                                         HookCall call) {
+        // Before any hook: a closed agent cannot answer, and dispatching a start hook that then
+        // watched the call fail would report a prediction that was never going to happen.
         if (closed) {
             throw new IllegalStateException(
                     "this agent is closed; open a new one rather than reusing it");
         }
+        PredictContext ctx = new PredictContext(states, questions, modelName, this);
+        return Hooks.around(hooks.composeFor(call), ctx, hooks.policyFor(call),
+                (hooked, asked, maxLen, headMaxLen) ->
+                        infer(hooked, asked, language, batchSize, sortByLength, maxLen,
+                                headMaxLen));
+    }
+
+    /**
+     * The forward passes, over whatever the start hooks left to ask.
+     *
+     * <p>The reference's {@code _infer_batch}: everything a hook cannot change once it has run.
+     * Separate from {@link #predictBatch} so that {@link #predictLong} can reach it without
+     * dispatching a hook chain — see that method for why it must not — and so the hook wrapper
+     * itself is one shared, tested piece rather than a sequence repeated per entry point.
+     *
+     * @param maxLen     the per-call token budget a hook set, or null for the checkpoint's
+     * @param headMaxLen the per-call head budget a hook set, or null for the checkpoint's
+     */
+    private List<Prediction> infer(List<?> states, Map<String, Question> questions,
+                                   String language, int batchSize, boolean sortByLength,
+                                   Integer maxLen, Integer headMaxLen) {
         for (int i = 0; i < states.size(); i++) {
             // Refused, as both Python backends refuse it: `serialize_state(None)` is
             // `json.dumps(None)`, so a missing state would otherwise be answered as a decision
@@ -195,6 +293,8 @@ public final class Agent implements AutoCloseable, Predictor {
                 throw new IllegalArgumentException("question " + entry.getKey() + " is null");
             }
         }
+        int tokenBudget = maxLen == null ? config.maxLen() : maxLen;
+        int headBudget = headMaxLen == null ? config.headMaxLen() : headMaxLen;
         List<String> questionIds = new ArrayList<>(asked.keySet());
         int chunk = batchSize > 0 ? batchSize : states.size();
         // Sorting only pays off when it can actually reorder across more than one call, which
@@ -210,7 +310,8 @@ public final class Agent implements AutoCloseable, Predictor {
             int end = Math.min(states.size(), start + window);
             List<List<SequenceBuilder.Sequence>> encoded = new ArrayList<>(end - start);
             for (int i = start; i < end; i++) {
-                encoded.add(encodeState(states.get(i), questionIds, asked));
+                encoded.add(encodeState(states.get(i), questionIds, asked, tokenBudget,
+                        headBudget));
             }
             List<Integer> order = new ArrayList<>(encoded.size());
             for (int i = 0; i < encoded.size(); i++) {
@@ -269,8 +370,28 @@ public final class Agent implements AutoCloseable, Predictor {
      * does. The returned probability and confidence are the deciding window's, not a calibrated
      * number for the document; {@link LongPrediction.Window} says which window that was.
      *
-     * <p>A state that already fits one window is passed straight to {@link #predict}, with no
-     * window attribution and {@code windows == 1}.
+     * <p>A state that already fits one window is answered in one call, with no window
+     * attribution and {@code windows == 1}.
+     *
+     * <p><b>No hook runs here.</b> Not the per-call ones — there is no {@link HookCall}
+     * parameter — and not the installed or process-wide ones either: the scan reaches the
+     * forward passes through the same private path {@link #predictBatch} wraps, rather than
+     * through {@code predictBatch} itself. That is a decision, not an omission.
+     *
+     * <p>A hook's whole power is to rewrite what is asked, and a scan is SIZED before any hook
+     * could run. The reference lets hooks into {@code predict_long} and then spends four pieces
+     * of machinery keeping them honest: a probe appended after the caller's own start hooks to
+     * record what inference was actually handed, a budget check run after the chain to catch a
+     * hook that added options the windows were not sized for, and two separate reporting paths
+     * for a hook that answered the document outright and one that rewrote the states it was
+     * scanned over. Without those, a hook that adds one option silently re-truncates every
+     * window — the tail of each reaches no model while the reported span says it did — and a
+     * hook that answers the call leaves {@code windows} claiming a scan that never happened.
+     *
+     * <p>Running hooks here without that machinery would be worse than not running them, so
+     * this does not. Nothing is silently dropped: {@link #predictBatch} takes a {@link HookCall},
+     * and a caller who needs hooks over a long state can window it themselves and hand the
+     * windows to that.
      *
      * @param window     state tokens per window, or null for the per-question budget. Capped at
      *                   the room the questions leave -- see {@link WindowPlan}
@@ -311,7 +432,8 @@ public final class Agent implements AutoCloseable, Predictor {
         if (stateIds.length <= plan.window()) {
             // Identical to a plain call, with no windowing overhead and no window attribution --
             // nothing decided between windows because there was only one.
-            Prediction single = predict(state, questions, language);
+            Prediction single = infer(Collections.singletonList(state), questions, language, 0,
+                    false, null, null).get(0);
             Map<String, LongPrediction.Windowed> answers = new LinkedHashMap<>();
             for (Map.Entry<String, Answer> entry : single.answers().entrySet()) {
                 answers.put(entry.getKey(),
@@ -344,8 +466,8 @@ public final class Agent implements AutoCloseable, Predictor {
 
         Integer cap = WindowPlan.batchCap(scanned.size(), plan.window(),
                 Math.max(64, maxLen - headMaxLen - 8), batchSize > 0 ? batchSize : null);
-        List<Prediction> results = predictBatch(scanned, questions, language,
-                cap == null ? 0 : cap, false);
+        List<Prediction> results = infer(scanned, questions, language,
+                cap == null ? 0 : cap, false, null, null);
         if (results.size() != scanned.size()) {
             throw new IllegalStateException(String.format(
                     "the state was split into %d windows and the batch returned %d results",
@@ -445,9 +567,13 @@ public final class Agent implements AutoCloseable, Predictor {
      *
      * <p>Once, not once per question: that is what {@code build_sequence}'s pre-tokenized state
      * parameter exists for, and a document is usually far longer than the question asked about it.
+     *
+     * @param maxLen     the budget in force for this call, the checkpoint's unless a hook moved it
+     * @param headMaxLen the head budget in force for this call, likewise
      */
     private List<SequenceBuilder.Sequence> encodeState(Object state, List<String> questionIds,
-                                                       Map<String, Question> questions) {
+                                                       Map<String, Question> questions,
+                                                       int maxLen, int headMaxLen) {
         int[] stateIds = tokenizer.encode(
                 SequenceBuilder.serializeState(state).replace(maskToken(), " "), -1);
         List<SequenceBuilder.Sequence> built = new ArrayList<>(questionIds.size());
@@ -462,7 +588,7 @@ public final class Agent implements AutoCloseable, Predictor {
             // byte-identical, so nothing a caller can read revealed it.
             boolean truncateLeft = state instanceof List;
             SequenceBuilder.Sequence sequence = SequenceBuilder.build(tokenizer, state, question,
-                    config.maxLen(), config.headMaxLen(), null, truncateLeft, stateIds);
+                    maxLen, headMaxLen, null, truncateLeft, stateIds);
             int defined = question.renderOptions().size();
             if (sequence.markers().length != defined) {
                 // Markers sit at absolute positions and the sequence is then cut to `max_len`, so
@@ -475,8 +601,7 @@ public final class Agent implements AutoCloseable, Predictor {
                         "question %s: only %d of its %d option markers fit in max_len=%d with "
                         + "head_max_len=%d spent on the question; lower head_max_len, raise "
                         + "max_len, or use fewer options",
-                        id, sequence.markers().length, defined, config.maxLen(),
-                        config.headMaxLen()));
+                        id, sequence.markers().length, defined, maxLen, headMaxLen));
             }
             built.add(sequence);
         }

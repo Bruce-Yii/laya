@@ -13,12 +13,15 @@ four questions about a document cost one batched encode rather than four round t
 Implemented: tokenizer, sequence builder, config, ONNX inference (fused or split graph), answer
 decoding, `predict`, `predictBatch`, usage and truncation reporting, script and language detection
 (`lang.LanguageDetection`), the question presets (`Presets`), the checkpoint `Router` with its
-load-and-evict lifecycle, the embedding `Shortlist` with its LRU cache, and the email cleaner
-and state builder (`LayaEmail`).
+load-and-evict lifecycle, the embedding `Shortlist` with its LRU cache, the email cleaner and
+state builder (`LayaEmail`), the abstention gate (`ConfidenceGate`), scanning a state longer than
+the context window (`predictLong`), schema-driven decisions (`Decisions.decide` / `decideBatch`),
+and the prediction hooks (`hooks`).
 
-Not implemented yet: hooks, `predictLong`, structured `decide`, the
-`laya-java-client` HTTP module, Android. **Not published to Maven Central** — see
-[Installing](#installing).
+Not implemented yet: the `laya-java-client` HTTP module, Android. Hooks run on `predict` and
+`predictBatch`; `Router` and `predictLong` do not dispatch them, and there is no `AsyncHook` — see
+[Watching and shaping a call](#watching-and-shaping-a-call). **Not published to
+Maven Central** — see [Installing](#installing).
 
 ## Where to go next
 
@@ -321,6 +324,43 @@ c are correct" holds only after temperatures have been fitted and validated for 
 and question shape. Pass a `Map` instead of a scalar to gate each option-count bucket
 (`choice:2`, `score:6-10`, …) at the level its calibration actually earns.
 
+## Deciding against a JSON schema
+
+```java
+import com.convaiinnovations.laya.json.Json;
+
+Map<String, Object> schema = (Map<String, Object>) Json.parse("""
+    {"type": "object", "properties": {
+       "department":  {"enum": ["billing", "support", "sales"]},
+       "urgency":     {"type": "integer", "minimum": 1, "maximum": 5},
+       "needs_human": {"type": "boolean"}}}""");
+
+Decisions.Decision d = Decisions.decide(agent, ticket, schema, null, 0.8);
+Map<String, Object> values = d.values();      // {"department": "billing", "urgency": 4, ...}
+```
+
+An `enum` or a `const` becomes a `choice`, a `boolean` becomes a `noul`, a bounded `integer` or
+`number` becomes a `score`, and the answers come back as **the schema's own values**: the choice's
+value and not the label it was shown under, so `enum: [10, 20, 30]` decides to the integer `20`.
+`anyOf` / `oneOf` with one non-null branch is unwrapped (pydantic's `Optional`), a one-item
+`allOf` is unwrapped with the outer keys on top, and a local `$ref` is inlined.
+
+Anything that cannot be answered from a fixed option set — a free string, an array, a nested
+object, a union of two real types — is refused with a `SchemaException` **naming the path**, which
+is the only part of the message a caller holding a 32-property schema can act on.
+
+`minConfidence` wires straight into `ConfidenceGate`: a field whose answer falls below the bar
+comes back as `null`, and a field that was never answered is **absent** rather than null, because
+"not believed" and "not asked" are different outcomes. The gate's full report is on
+`d.gate()`. `Decisions.decideBatch(agent, states, schema)` does the same for many states in one
+batched call, in input order.
+
+`Decisions.questions(schema)` and `Decisions.answersToJson(answers, schema)` are the two halves on
+their own, for a caller that runs the model itself.
+
+There is no pydantic on the JVM, so only the JSON-schema path is ported; mapping Java records
+would be a new design rather than a port.
+
 ## A state longer than the context window
 
 ```java
@@ -350,6 +390,91 @@ every window of a long document tokenize differently from the reference, so the 
 `Agent.using(tokenizer, config, session)` assembles an agent from parts — for a caller that already
 holds them, or to drive the batching and usage accounting through a stub
 `infer.InferenceSession` instead of a 1.2 GB graph.
+
+## Watching and shaping a call
+
+```java
+agent.hooks().addHook(new Hook() {
+    @Override public void onPredictEnd(PredictContext ctx) {
+        metrics.record(ctx.model(), ctx.usage().inputTokens(), ctx.elapsedMs());
+    }
+});
+
+// Per call: answer from a cache without the model running at all.
+agent.predictBatch(states, questions, null, 0, false,
+        HookCall.of(Hooks.onPredictStart(ctx -> cache.lookup(ctx.states())
+                .ifPresent(ctx::skip))));
+```
+
+A hook is the one place your code runs **inside** a prediction. Implement any of the six methods
+on `Hook` — the rest default to doing nothing — and install it on the agent, on a single call, or
+process-wide with `Hooks.setDefaultHooks`.
+
+`PredictContext` is the call, and it is mutable on purpose. A start hook may rewrite
+`ctx.states(...)` or `ctx.questions(...)`, move the token budget with `ctx.maxLen(...)` /
+`ctx.headMaxLen(...)`, or answer outright with `ctx.skip(results)` — which skips inference while
+still running the end hooks. An end hook may replace `ctx.results(...)`, and sees `ctx.usage()`
+totalled over the call plus `ctx.elapsedMs()`. Every hook of one call gets the **same** context,
+so `ctx.runId()` pairs a start with its end without state of your own.
+
+The order is a contract: **process-wide defaults, then installed, then per-call**, and within a
+per-call `HookCall`, hook objects before the `onStart`/`onEnd` callbacks. A tracer installed to
+watch what a per-call hook did only sees it if it runs after it.
+
+`agent.hooks()` also carries the policy. `raiseErrors(false)` reports a throwing hook and carries
+on, which is what a telemetry hook needs — it must not be able to fail a request. An `Error` is
+rethrown whatever it says, which is the reference's rule in Java terms: it catches `Exception` and
+deliberately not `BaseException`. `concurrent(false)` serialises hooks that are not re-entrant.
+A `HookCall` can override `raiseErrors` and `timeout` for one call without touching the others.
+
+`timeout(Duration)` bounds **the wait** for each hook call — not the hook, and not the request. An
+overrunning hook fails the call and **keeps running**, since neither runtime can interrupt a thread
+that will not cooperate, so a hook that blocks forever leaks a daemon thread per call. That much is
+the reference's behaviour.
+
+Where this port diverges, deliberately: the abandoned thread is then **cut off from the call**.
+Once its deadline has passed, every `ctx` mutator it calls throws `IllegalStateException` instead
+of rewriting a call that moved on without it. The reference has the identical hazard and no cheap
+way to close it. Measured here before the guard, over 60 calls whose start hook overran a 50 ms
+deadline by 30 ms and then assigned results: 60 of 60 late writes were accepted, and `ctx.usage`
+ended up describing a different answer from `ctx.results` in 60 of 60 — in some runs the *caller*
+got the abandoned hook's answer. With the guard: 0 of 60. It is a narrowing and not a proof — a
+write already past its check when the deadline expires still lands, which happened in 2 to 17 of
+60 once the overrun was cut to 1–5 ms, so the window is a few instructions wide rather than the
+whole remainder of the call.
+
+Both lines dispatch reports — the swallowed failure and the overrun — name the hook as
+`<class>.<event>` and spell a deadline in seconds exactly as the reference's `%g` does, so
+`exceeded 1s` and not `exceeded 1.0s`, and one grep works against either runtime's logs.
+`Hooks.onPredictStart`/`onPredictEnd` return the reference's own `_StartAdapter`/`_EndAdapter`
+classes for the same reason: the name is what appears in that line, and an anonymous Java class
+has none. `Hooks.hookName(hook)` and `Hooks.seconds(duration)` are public, so your own
+`onFailure` sink can produce the same text.
+
+Two smaller divergences, both for the same reason — a number or a name that differed between the
+runtimes where the port claims they do not. `Hooks.Totals` counts in `long`, because summing
+per-state `int` usage into an `int` wrapped silently (three results of a billion input tokens
+totalled `-1294967296`), and a Python `int` cannot. And a `PredictContext` refuses a null `states`
+or `questions` by name rather than letting the copy throw a bare `NullPointerException`; before
+hooks were wired in, `predictBatch(List.of(), null)` returned an empty list, which the reference
+does not do either.
+
+Scope hooks to a block with `try (var scope = agent.hooks().hooksInstalled(tracer)) { ... }`. It
+removes one copy of each hook it added — not every copy by identity, which would take one the
+application had installed before the block, and not a snapshot, which would undo an overlapping
+block and discard anything added inside this one.
+
+`predictLong` runs **no** hooks — not per-call, not installed, not process-wide. A scan is sized
+before any hook could run, and the reference only lets hooks into `predict_long` by way of a start
+probe, a post-chain budget check and two separate "a hook answered the document" paths. None of
+those are ported, and without them a hook that adds one option silently re-truncates every window.
+Window the state yourself and hand the windows to `predictBatch` if you need hooks over a long
+document.
+
+There is no `AsyncHook`. It exists in the reference to finish a coroutine from synchronous code,
+and a JVM method call is already synchronous: a hook that wants asynchronous work composes it and
+blocks on it — `ship(ctx.results()).toCompletableFuture().join()` — bounded however your runtime
+wants, or by `timeout(Duration)`.
 
 ## Threads
 

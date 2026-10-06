@@ -153,14 +153,32 @@ jobs:
 
       # Without LAYA_CHECKPOINTS the checkpoint-backed factories abort by assumption and the rest
       # run. `--min-tests` is what stops an aborted suite from looking like a pass.
+      #
+      # Measured: 703 register here, 686 run, 17 abort on a checkpoint this lane does not have.
+      # Exact, not padded -- it stood at 680 long enough for the real figure to pass it by, which
+      # is how a floor stops being one. ONE below the JDK-matrix lane's floor on purpose: that
+      # lane passes `-PtestJavaVersion`, which is what makes `TestJvmVersionTest` run instead of
+      # skip, so it executes 687. Same suite, one more test, because the flag enables it.
       - name: Tests that need no model
         working-directory: laya-java
         run: ./gradlew --no-daemon test
+      # Measured on the merged tree, Corretto 17, no checkpoints: 934 registered, 17 abort,
+      # 917 RUN -- the floor counts what ran, so the aborted checkpoint-backed cases are not in
+      # it. The floor is EXACT, with no margin, which is a change from the margin-of-4 this
+      # replaced. A margin only binds classes larger than itself, and three classes in this lane
+      # run exactly ONE test (`DecoderTest`, `TypedDecisionsParityTest`, `WindowPlanTest`), so no
+      # positive margin can bind them -- any slack at all lets a whole class be deleted with this
+      # step still green. Four branches each raised this floor against their own base (779, 686,
+      # 813); every one of those would have left over a hundred tests of slack here, which is why
+      # the number is re-derived on the merge rather than reconciled from the four.
+      #
+      # This floor and the jdk-matrix one differ by one ON PURPOSE -- see that lane for why a
+      # shared number let a whole five-test class be deleted there.
       - name: Model-free suite was not vacuous
         if: ${{ !cancelled() }}
         run: >
           python laya-java/scripts/check_test_results.py
-          laya-java/laya-java/build/test-results/test --min-tests 680 --allow-aborted
+          laya-java/laya-java/build/test-results/test --min-tests 917 --allow-aborted
 
       # The samples are single-file source programs, deliberately NOT a Gradle module: a
       # `samples` subproject would inherit the root build's MavenPublication and
@@ -315,11 +333,22 @@ jobs:
       # checkpoint-backed factories abort here, would forgive it. Measured: with the flag
       # dropped, Gradle exits 0 and the floor alone exits 0 on 488 tests, having run JDK 17 twice
       # and reported it as two JDKs. With `--require-passed` it exits 1.
+      #
+      # 814, not the build lane's 813, and the one is the point. This lane runs one test MORE
+      # than that one -- `TestJvmVersionTest` is `@EnabledIfSystemProperty` and only enabled
+      # here -- so 818 run against a shared floor of 813 would be a margin of 5, and the
+      # smallest class this lane could lose whole is `PreTokenizerTablesTest` at exactly 5.
+      # That is not hypothetical. Measured on the previous shared floor of 794, with the
+      # smallest `hooks.json` section emptied and no per-section guard: the build lane ran 793
+      # and exited 1 by exactly one test, and this lane ran 794 -- exactly ON the floor, so
+      # `check_test_results` exited 0 and the vacuity was invisible in the one lane that had the
+      # margin to hide it. The emptiness guard inside `HooksTest.section` is the real fix for
+      # that case; this keeps the arithmetic from being what saved it.
       - name: Model-free suite was not vacuous, and ran on the right JVM
         if: ${{ !cancelled() }}
         run: >
           python laya-java/scripts/check_test_results.py
-          laya-java/laya-java/build/test-results/test --min-tests 680 --allow-aborted
+          laya-java/laya-java/build/test-results/test --min-tests 918 --allow-aborted
           --require-passed TestJvmVersionTest
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: ${{ failure() }}
@@ -333,15 +362,23 @@ jobs:
   # and is the whole runtime of this lane. Running them in one job made a 13-second check wait on
   # a 40-minute export.
   #
-  # NOT split per checkpoint, which is where the .NET lane splits. Two reasons, both measured.
-  # The fixtures are not per-checkpoint documents -- `tokenizer_ids.json`, `sequences.json` and
-  # `decode.json` each carry BOTH checkpoints' sections in one file, so a job holding one of them
-  # cannot regenerate any of the three and `--strict` fails by construction; that is what
-  # happened on the first run of this lane. And the Java tests assert that both checkpoints' cases
-  # are present, a floor that exists because a @TestFactory whose fixture key emptied used to
-  # generate zero assertions and still exit 0. Splitting per checkpoint would mean deleting that
-  # floor to buy nothing: the two tokenizers together are a few megabytes, so there is no export
-  # to parallelise away.
+  # The GRAPHLESS cell is not split per checkpoint, which is where the .NET lane splits. Two
+  # reasons, both measured. The fixtures it owns are not per-checkpoint documents --
+  # `tokenizer_ids.json`, `sequences.json` and `decode.json` each carry BOTH checkpoints'
+  # sections in one file, so a job holding one of them cannot regenerate any of the three and
+  # `--strict` fails by construction; that is what happened on the first run of this lane. And
+  # the Java tests assert that both checkpoints' cases are present, a floor that exists because a
+  # @TestFactory whose fixture key emptied used to generate zero assertions and still exit 0.
+  # Splitting it per checkpoint would mean deleting that floor to buy nothing: the two tokenizers
+  # together are a few megabytes, so there is no export to parallelise away.
+  #
+  # The WEIGHT-BEARING cells are one per checkpoint, and have to be. A graph is traced from
+  # exactly one checkpoint and carries its weights, so `predict.json` (multilingual) and
+  # `typed_decisions.json` (typed-decisions) need two graphs; a cell holding both would pay both
+  # exports serially, which is the cost this whole split exists to avoid. Each such cell declares
+  # the checkpoint it traces in `graph-model`, which is also what keys its export cache and which
+  # of the two graph variables gets a path -- so adding a third never silently reuses the second's
+  # graph.
   parity:
     name: jvm parity (${{ matrix.name }})
     runs-on: ubuntu-latest
@@ -359,7 +396,7 @@ jobs:
           # 40-minute export for nothing.
           - name: tokenizer
             checkpoints: english multilingual
-            graph: false
+            graph-model: ""   # nothing traced here
             families: >-
               --only tokenizer_ids.json --only sequences.json --only decode.json
               --only decode_text.json --only window_plan.json --only predict_long.json
@@ -385,14 +422,49 @@ jobs:
             # assertion in TokenDecoderTest and the `cases.size() >= 23` corpus floor beside it.
             min-tests: 489
             timeout: 25
-          # The one cell that needs the traced graph, and the only checkpoint the end-to-end
-          # golden was recorded from.
+          # Weight-bearing: the multilingual end-to-end golden, traced from that checkpoint.
           - name: predict
             checkpoints: multilingual
-            graph: true
+            graph-model: multilingual
             families: --only predict.json
             tests: --tests com.convaiinnovations.laya.PredictParityTest
             min-tests: 9
+            timeout: 75
+          # Weight-bearing, and a SEPARATE cell rather than a second family in the one above.
+          # Three reasons, in order of how much they cost:
+          #
+          #   * A graph is traced from one checkpoint. `predict.json` is recorded against
+          #     multilingual and `typed_decisions.json` against typed-decisions, so one cell
+          #     holding both would export two graphs and run two exports serially -- the 40
+          #     minutes this matrix was split to avoid, paid twice in one cell instead of once
+          #     in each of two that run in parallel.
+          #   * The export cache is keyed per checkpoint (`graph-model` is in the key), so a
+          #     restore brings back ONE graph and a miss re-exports one. A merged cell would key
+          #     two graphs under one entry and re-export both on any miss, including the 1.7 GB
+          #     it already had. Not "each checkpoint's graph is invalidated by its own revision
+          #     bump" -- there is no such thing: `prepare_checkpoint.py` pins a single
+          #     `HF_REVISION` for every checkpoint, and that file is inside this key's
+          #     `hashFiles(...)`, so a bump invalidates every cell at once. What stops a restored
+          #     pre-bump cache from being reused is the `.laya-revision` stamp `stamped()` reads,
+          #     not the key.
+          #   * These two goldens fail for unrelated reasons. A merged cell reports one status
+          #     for both, and the first thing a reader of a red parity lane needs to know is
+          #     which checkpoint moved.
+          #
+          # Cost, measured locally with the Hub blobs already cached: 846 MB of checkpoint, a
+          # 39 s ONNX export producing 3.6 MB of graph beside 1.7 GB of external weights, 103 s
+          # to record the family and 140-180 s for the 14 tests. On a cold runner the download is
+          # the open variable and is why this carries the same 75-minute ceiling as `predict`.
+          - name: typed-decisions
+            checkpoints: typed-decisions
+            graph-model: typed-decisions
+            families: --only typed_decisions.json
+            tests: --tests com.convaiinnovations.laya.TypedDecisionsParityTest
+            # Measured locally: 14 -- 9 single-state cases, 3 batch configs, the config identity
+            # check and the workflow-signature check. Exact rather than padded down, because the
+            # two non-factory tests are what catch a wrong checkpoint/graph pairing and a margin
+            # of 2 would let both be dropped with this floor still green.
+            min-tests: 14
             timeout: 75
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -435,16 +507,20 @@ jobs:
       # the revision stamp now makes safe) and accepting a multi-gigabyte entry for the
       # weight-bearing cell; neither is this change's call to make.
       - name: Cache the exported graph
-        if: ${{ matrix.graph }}
+        if: ${{ matrix.graph-model != '' }}
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: laya-java/.work/onnx
-          key: laya-java-onnx-${{ runner.os }}-${{ matrix.name }}-${{ hashFiles('laya-java/scripts/prepare_checkpoint.py', 'scripts/export_onnx.py', 'laya/common.py', 'laya-dotnet/tools/requirements-regen.txt') }}
+          key: laya-java-onnx-${{ runner.os }}-${{ matrix.graph-model }}-${{ hashFiles('laya-java/scripts/prepare_checkpoint.py', 'scripts/export_onnx.py', 'laya/common.py', 'laya-dotnet/tools/requirements-regen.txt') }}
 
+      # A graph is exported for the ONE checkpoint this cell's golden was recorded from, and
+      # every other checkpoint it needs is fetched `--no-graph`. Keyed on the name rather than on
+      # a boolean, because `graph: true` could not say WHICH checkpoint to trace, and a cell that
+      # names two would otherwise have traced both.
       - name: Prepare the checkpoints this cell owns
         run: |
           for c in ${{ matrix.checkpoints }}; do
-            if [ "${{ matrix.graph }}" = "true" ]; then
+            if [ "$c" = "${{ matrix.graph-model }}" ]; then
               python laya-java/scripts/prepare_checkpoint.py --checkpoint "$c"
             else
               python laya-java/scripts/prepare_checkpoint.py --checkpoint "$c" --no-graph
@@ -458,13 +534,19 @@ jobs:
       - name: Regenerate this cell's fixtures from Python
         env:
           LAYA_FIXTURE_CHECKPOINTS: ${{ github.workspace }}/laya-java/.work/checkpoints
-          LAYA_ONNX_GRAPH: ${{ matrix.graph && format('{0}/laya-java/.work/onnx/multilingual/laya.onnx', github.workspace) || '' }}
+          # One variable per golden, and only this cell's is populated. They cannot share one:
+          # a graph carries the weights and nothing in it says which checkpoint traced it, so
+          # `predict.json` pointed at the typed-decisions graph would re-record itself from the
+          # wrong weights and compare them against themselves. Measured: the english checkpoint
+          # against the typed graph raises nothing and answers to the same last digit.
+          LAYA_ONNX_GRAPH: ${{ matrix.graph-model == 'multilingual' && format('{0}/laya-java/.work/onnx/multilingual/laya.onnx', github.workspace) || '' }}
           LAYA_PREDICT_MODEL: multilingual
+          LAYA_TYPED_ONNX_GRAPH: ${{ matrix.graph-model == 'typed-decisions' && format('{0}/laya-java/.work/onnx/typed-decisions/laya.onnx', github.workspace) || '' }}
         run: python laya-java/scripts/gen_fixtures.py --strict ${{ matrix.families }}
       # The pre-tokenizer's letter and number classes are probed out of the reference tokenizer,
       # so this is the one generator gate that needs a checkpoint. It belongs to the cheap cell.
       - name: Pre-tokenizer class tables match the reference
-        if: ${{ !matrix.graph }}
+        if: ${{ matrix.graph-model == '' }}
         run: >
           python laya-java/scripts/gen_pretokenizer_tables.py --check
           --tokenizer laya-java/.work/checkpoints/english/tokenizer/tokenizer.json
@@ -479,7 +561,8 @@ jobs:
         working-directory: laya-java
         env:
           LAYA_CHECKPOINTS: ${{ github.workspace }}/laya-java/.work/checkpoints
-          LAYA_ONNX_GRAPH: ${{ matrix.graph && format('{0}/laya-java/.work/onnx/multilingual/laya.onnx', github.workspace) || '' }}
+          LAYA_ONNX_GRAPH: ${{ matrix.graph-model == 'multilingual' && format('{0}/laya-java/.work/onnx/multilingual/laya.onnx', github.workspace) || '' }}
+          LAYA_TYPED_ONNX_GRAPH: ${{ matrix.graph-model == 'typed-decisions' && format('{0}/laya-java/.work/onnx/typed-decisions/laya.onnx', github.workspace) || '' }}
         run: ./gradlew --no-daemon test ${{ matrix.tests }}
       # A checkpoint-backed factory that aborts is not a pass. With this cell's checkpoints present
       # nothing it runs may abort, and the floor catches a suite that silently stopped registering

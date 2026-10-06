@@ -17,10 +17,11 @@ import java.util.Map;
 /**
  * A checkpoint's {@code rl_agent_config.json}: sequence budgets and the fitted temperatures.
  *
- * <p>These must be read from the checkpoint and never defaulted. The two shipped checkpoints
+ * <p>These must be read from the checkpoint and never defaulted. The three shipped checkpoints
  * disagree on every one of them: english is {@code max_len 512 / head_max_len 192} with fitted
- * per-bucket temperatures, multilingual is {@code 1024/256} with none at all. A port that
- * hard-coded the library's own defaults would halve a multilingual state's budget.
+ * per-bucket temperatures, multilingual is {@code 1024/256} with none at all, and typed-decisions
+ * is {@code 1024/256} with a fitted table of its own. A port that hard-coded the library's own
+ * defaults would halve a multilingual state's budget.
  */
 public final class AgentConfig {
 
@@ -28,9 +29,12 @@ public final class AgentConfig {
      * A fitted temperature below 1 sharpens logits instead of softening them, and is refused.
      *
      * <p>Not a hypothetical: the english checkpoint ships {@code choice:11+} at <b>0.1006</b>, a
-     * ~10x sharpener that publishes a 0.24 top probability as 0.99. A caller gating on confidence
-     * would be told a coin flip is a certainty, so the runtime confines every temperature to
-     * {@code [0.5, 5.0]}.
+     * ~10x sharpener that publishes a 0.24 top probability as 0.99, and typed-decisions carries
+     * the same value through from the checkpoint it was fine-tuned from. A caller gating on
+     * confidence would be told a coin flip is a certainty, so the runtime confines every
+     * temperature to {@code [0.5, 5.0]}. {@code TypedDecisionsParityTest} asserts the clamp
+     * end to end on a 14-option question, where skipping it sharpens the recorded 0.3035 top
+     * probability by roughly 5x without changing the argmax.
      */
     public static final double TEMP_MIN = 0.5;
     public static final double TEMP_MAX = 5.0;
