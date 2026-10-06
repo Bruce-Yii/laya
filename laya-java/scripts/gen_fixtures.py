@@ -1817,6 +1817,429 @@ def predict_golden():
             "single": single, "batch": batches}
 
 
+# -- the typed-decisions checkpoint ---------------------------------------------------------
+#
+# `laya-typed-decisions` is fine-tuned from the ENGLISH checkpoint, which is what makes a
+# fixture family for it worth its weight. It ships the same `tokenizer.json` byte for byte
+# (diffed: identical) and the same `answerdotai/ModernBERT-large` encoder, and nothing in a
+# `.onnx` file says which checkpoint traced it. Measured: opening the ENGLISH checkpoint against
+# the typed graph raises nothing and answers {refund: 0.9077, replace: 0.0923} on a two-option
+# question -- the same digits, to the last one, as the typed checkpoint against its own graph,
+# because the weights are entirely the graph's and the two configs agree on the `choice:2`
+# temperature. `model` does not separate them either: the ONNX path reports
+# `laya-rl-agent-onnx` whichever checkpoint it opened. Only the multilingual checkpoint fails
+# loudly, and for an unrelated reason -- a 235292 token id against a 50368-row embedding, which
+# ONNX Runtime rejects at the `node_embedding` Gather.
+#
+# So the discriminator has to come from `rl_agent_config.json`, which is where the two do differ:
+# `max_len` 1024 against english's 512, `head_max_len` 256 against 192, `model_name`
+# `laya-typed-decisions` against `rl-agent`, and base temperatures [1.0148, 1.0374, 1.0575]
+# against [1.6369, 1.2514, 1.9834]. Those are recorded below as `config`, and the Java test
+# asserts them before it compares a single probability.
+#
+# The question ids are read from `laya.router` rather than retyped: an exact id-set match is the
+# entire signature `match_typed_decisions_workflow` tests, so a signature change has to move this
+# family rather than leave it asserting a workflow name the router no longer returns.
+
+# `invoice_processing` is the one workflow whose TRAINED schema is in this repository, in
+# `examples/32_typed_decisions_workflow.py` (dataset `LocalLLaMA/typed-decisions`, config
+# `invoice_processing`). It is duplicated here rather than imported because that example has a
+# module-level `agent = load("typed-decisions")`, so importing it would download 846 MB and run
+# the model; `_typed_questions` below fails the generator if the ids ever stop matching the
+# router's signature, which is the drift that would matter.
+TYPED_INVOICE_QUESTIONS = {
+    "disposition": {
+        "type": "choice",
+        "instructions": "How should this vendor invoice be dispositioned?",
+        "criteria": {
+            "approve": "Matches the order and delivery; approve for payment.",
+            "hold": "Something needs confirming before payment; hold pending clarification.",
+            "manual_review": "A human in finance must review the discrepancy.",
+            "reject": "Should not be paid: duplicate, unauthorised or materially wrong.",
+        },
+    },
+    "matches_order": {
+        "type": "noul",
+        "instructions": "The invoice reconciles with the purchase order and the recorded delivery.",
+        "criteria": {
+            "false": "There is a discrepancy against the order or the delivery.",
+            "true": "Line items, quantities and amounts reconcile.",
+        },
+    },
+    "duplicate": {
+        "type": "noul",
+        "instructions": "This invoice appears to duplicate an invoice already submitted.",
+    },
+    "discrepancy_severity": {
+        "type": "score",
+        "instructions": "How material is any discrepancy between the invoice, the order "
+                        "and the delivery?",
+        "criteria": [
+            "None: everything reconciles.",
+            "Trivial: rounding or a cosmetic difference.",
+            "Moderate: a real difference worth confirming.",
+            "Material: a large or unexplained difference.",
+        ],
+    },
+    "urgency": {
+        "type": "score",
+        "instructions": "How time-sensitive is processing this invoice?",
+        "criteria": [
+            "No time pressure; can wait indefinitely.",
+            "Routine; handle within the normal queue.",
+            "Elevated; should be handled within the same week.",
+            "Critical; requires action within the same day.",
+        ],
+    },
+}
+
+# The other three workflows' TRAINED instruction text is not in this repository -- only their id
+# signatures are, in `laya.router._TYPED_DECISION_WORKFLOWS`. These schemas therefore carry the
+# real ids and instruction text written here, which is stated rather than glossed over: what the
+# fixture gates is the forward pass and the routing decision that reaches it, and both are real
+# for any schema whose ids match. The text is recorded verbatim in the fixture, so a port renders
+# the identical prompt and must reproduce the identical answer.
+TYPED_CUSTOMER_SERVICE_QUESTIONS = {
+    "action": {
+        "type": "choice",
+        "instructions": "What should the support team do next?",
+        "criteria": {
+            "refund": "Return the money and close the ticket.",
+            "replace": "Ship a replacement unit.",
+            "explain": "Answer the question; nothing to send.",
+            "escalate": "Hand to a senior agent.",
+        },
+    },
+    "category": {
+        "type": "choice",
+        "instructions": "Which queue does this ticket belong in?",
+        "criteria": {
+            "billing": "Charges, invoices and refunds.",
+            "shipping": "Delivery, tracking and damage in transit.",
+            "account": "Login, access and account settings.",
+        },
+    },
+    "churn_risk": {
+        "type": "score",
+        "instructions": "How likely is this customer to leave over this?",
+        "criteria": [
+            "Not at risk; routine contact.",
+            "Mildly annoyed.",
+            "Considering alternatives.",
+            "Explicitly threatening to cancel.",
+        ],
+    },
+    "needs_human": {
+        "type": "noul",
+        "instructions": "This ticket needs a human agent rather than an automated reply.",
+    },
+    "urgency": {
+        "type": "score",
+        "instructions": "How quickly must this be answered?",
+        "criteria": [
+            "No time pressure.",
+            "Within the normal queue.",
+            "Same week.",
+            "Same day.",
+        ],
+    },
+}
+
+TYPED_SECURITY_QUESTIONS = {
+    "credential_compromise": {
+        "type": "noul",
+        "instructions": "Credentials belonging to this account were exposed or reused.",
+        "criteria": {
+            "false": "No sign that a secret left the organisation.",
+            "true": "A password, token or key is in the wrong hands.",
+        },
+    },
+    "disposition": {
+        "type": "choice",
+        "instructions": "How should this alert be dispositioned?",
+        "criteria": {
+            "close": "Benign; close with no action.",
+            "monitor": "Watch for a repeat before acting.",
+            "contain": "Isolate the host or revoke the credential now.",
+            "escalate": "Wake an incident responder.",
+        },
+    },
+    "severity": {
+        "type": "score",
+        "instructions": "How severe is the impact if this is real?",
+        "criteria": [
+            "Informational.",
+            "Low: one account, no data.",
+            "High: production data or lateral movement.",
+            "Critical: active, spreading, or customer data.",
+        ],
+    },
+    "true_positive": {
+        "type": "noul",
+        "instructions": "This alert describes genuine malicious activity rather than noise.",
+    },
+    "urgency": {
+        "type": "score",
+        "instructions": "How quickly must someone respond?",
+        "criteria": [
+            "No time pressure.",
+            "Next business day.",
+            "Within the hour.",
+            "Immediately.",
+        ],
+    },
+}
+
+TYPED_AGENT_TRACE_QUESTIONS = {
+    "action": {
+        "type": "choice",
+        "instructions": "What should be done with this agent run?",
+        "criteria": {
+            "accept": "The run did what was asked; accept it.",
+            "retry": "Transient failure; run it again.",
+            "rollback": "Undo what it changed.",
+            "escalate": "A person must look at this.",
+        },
+    },
+    "needs_review": {
+        "type": "noul",
+        "instructions": "A human should read this trace before the result is used.",
+    },
+    "outcome": {
+        "type": "choice",
+        "instructions": "How did the run end?",
+        "criteria": {
+            "success": "Completed the task.",
+            "partial": "Completed some of it.",
+            "failure": "Did not complete the task.",
+        },
+    },
+    "risk": {
+        "type": "score",
+        "instructions": "How much damage could this run's actions have caused?",
+        "criteria": [
+            "Read-only; no effect.",
+            "Reversible writes.",
+            "Irreversible writes to internal systems.",
+            "Irreversible, customer-visible, or spending money.",
+        ],
+    },
+    "urgency": {
+        "type": "score",
+        "instructions": "How quickly must this be looked at?",
+        "criteria": [
+            "No time pressure.",
+            "Next business day.",
+            "Within the hour.",
+            "Immediately.",
+        ],
+    },
+}
+
+# The two states from `examples/32_typed_decisions_workflow.py`: one with a 40% unit-price
+# variance against the purchase order, one that reconciles exactly. They are a pair on purpose --
+# the same schema on two states that differ only in the numbers is what shows the forward pass is
+# reading the state rather than the questions.
+TYPED_INVOICE_VARIANCE = {
+    "invoice": {
+        "id": "INV-2026-8842", "vendor": "Northwind Castings", "currency": "USD",
+        "total_usd": 300020.0,
+        "lines": [{"sku": "SKU-940", "qty": 1000, "unit_usd": 300.02, "total_usd": 300020.0}],
+    },
+    "purchase_order": {
+        "id": "PO-3392", "total_usd": 214300.0,
+        "lines": [{"qty": 1000, "unit_usd": 214.3}],
+        "freight_terms": "freight prepaid by vendor, not separately billable",
+    },
+    "delivery": {"date": "2026-03-18", "received_qty": 1000,
+                 "condition": "accepted with exceptions"},
+    "payment": {"terms": "net 45", "status": "overdue", "days_until_due": -3},
+    "vendor_history": {
+        "invoices_12m": 40, "disputes_12m": 0,
+        "prior_invoice_ids": ["INV-2026-6633", "INV-2026-9563", "INV-2026-7939"],
+    },
+}
+
+TYPED_INVOICE_CLEAN = {
+    "invoice": {
+        "id": "INV-2026-9107", "vendor": "Cedar Freight", "currency": "USD",
+        "total_usd": 18450.0,
+        "lines": [{"sku": "SKU-221", "qty": 300, "unit_usd": 61.5, "total_usd": 18450.0}],
+    },
+    "purchase_order": {
+        "id": "PO-3477", "total_usd": 18450.0,
+        "lines": [{"qty": 300, "unit_usd": 61.5}],
+        "freight_terms": "freight prepaid by vendor, not separately billable",
+    },
+    "delivery": {"date": "2026-03-20", "received_qty": 300, "condition": "accepted in full"},
+    "payment": {"terms": "net 30", "status": "current", "days_until_due": 18},
+    "vendor_history": {"invoices_12m": 12, "disputes_12m": 0,
+                       "prior_invoice_ids": ["INV-2026-7781"]},
+}
+
+# 14 options, which is what puts the `choice:11+` temperature bucket in play. This checkpoint
+# ships that bucket at 0.1006 -- outside the [0.5, 5] band `laya.common` accepts, so it is clamped
+# to 0.5 and the answer is published uncalibrated. A port that reads the bucket and skips the
+# clamp sharpens this distribution by ~5x and still returns a plausible-looking argmax, so the
+# probabilities here are the only thing that tells the two apart.
+TYPED_MANY_OPTION_QUESTIONS = {
+    "band": {"type": "choice", "instructions": "Which spend band does this invoice fall in?",
+             "criteria": {("band%02d" % i): ("tier number %d" % i) for i in range(14)}},
+}
+
+# `max_len` is 1024 here against the english checkpoint's 512, so a state that truncates on one
+# does not truncate on the other. This one is long enough to drop tokens at 1024, which is what
+# makes `state_tokens_dropped` and `truncated` non-zero rather than decorative.
+TYPED_OVER_BUDGET_STATE = ("line item number one, unit price 300.02 against a purchase order at "
+                           "214.30, delivery accepted with exceptions. ") * 90
+
+# A question set whose ids are NOT a workflow signature. The checkpoint still answers it -- being
+# fine-tuned on four schemas does not make it refuse a fifth -- and recording that is what stops
+# a port from special-casing the signatures somewhere in the forward pass, where they have no
+# business being. Routing is the only place the signature is read.
+TYPED_OFF_WORKFLOW_QUESTIONS = {
+    "department": {"type": "choice", "instructions": "Which team owns this?",
+                   "criteria": {"billing": "charges and refunds", "other": "anything else"}},
+}
+
+
+def _typed_questions(workflow, questions):
+    """`questions`, after checking its ids still are `workflow`'s signature.
+
+    The schemas above are literals, and the signatures they have to match live in `laya.router`.
+    Nothing else connects the two, so without this the router could gain a question id and this
+    family would carry on recording a forward pass under a workflow name
+    `match_typed_decisions_workflow` no longer returns -- a fixture that names a routing outcome
+    it does not produce, which is worse than no fixture.
+    """
+    from laya.router import _TYPED_DECISION_WORKFLOWS, match_typed_decisions_workflow
+
+    expected = _TYPED_DECISION_WORKFLOWS[workflow]
+    got = match_typed_decisions_workflow(questions)
+    if got != workflow:
+        raise SystemExit(
+            "gen_fixtures: the %s schema's ids are %s, but laya.router's signature is %s "
+            "(match_typed_decisions_workflow returned %r)"
+            % (workflow, sorted(questions), sorted(expected), got))
+    return questions
+
+
+# (case id, state, lang, workflow or None, questions). `workflow` is recorded so the Java test can
+# assert the routing decision and the forward pass on the SAME object: MODELS.md's gap was that
+# `Router` resolving `typed-decisions` was tested while nothing ever ran the checkpoint, so a
+# fixture that records one without the other leaves half of it open.
+TYPED_CASES = [
+    ("invoice-variance", TYPED_INVOICE_VARIANCE, None, "invoice_processing",
+     TYPED_INVOICE_QUESTIONS),
+    ("invoice-clean", TYPED_INVOICE_CLEAN, None, "invoice_processing", TYPED_INVOICE_QUESTIONS),
+    ("customer-service", "We were billed twice for March. Third time this year -- refund it "
+                         "today or we are moving to a competitor.", None, "customer_service",
+     TYPED_CUSTOMER_SERVICE_QUESTIONS),
+    ("security-incident", {"alert": "impossible travel", "user": "ana@example.com",
+                           "signins": [{"city": "Lagos", "at": "2026-03-18T09:02Z"},
+                                       {"city": "Vilnius", "at": "2026-03-18T09:41Z"}],
+                           "mfa": "satisfied by push, approved on the second prompt",
+                           "prior_alerts_30d": 0}, None, "security_incidents",
+     TYPED_SECURITY_QUESTIONS),
+    ("agent-trace", {"run": "agt-7741", "tool_calls": 14, "wrote": ["s3://prod-reports/q1.csv"],
+                     "errors": ["RateLimit on call 9, retried"],
+                     "final": "uploaded the report, but the row count is 0"},
+     None, "agent_trace_observability", TYPED_AGENT_TRACE_QUESTIONS),
+    ("many-options", "The invoice totals 300,020 USD against a 214,300 USD order.", None, None,
+     TYPED_MANY_OPTION_QUESTIONS),
+    # Same ids as the two invoice cases, so the same workflow -- recording this as "no workflow"
+    # because the state is different was the first thing the Java test caught.
+    ("over-budget", TYPED_OVER_BUDGET_STATE, None, "invoice_processing",
+     TYPED_INVOICE_QUESTIONS),
+    ("off-workflow", "We were billed twice for March and want a refund today.", "en", None,
+     TYPED_OFF_WORKFLOW_QUESTIONS),
+]
+
+
+def typed_decisions_golden():
+    """`ONNXAgent.predict` and `predict_batch` on the `typed-decisions` checkpoint.
+
+    The sibling of `predict_golden`, against the third checkpoint. It is a separate family and a
+    separate graph because a graph is traced from ONE checkpoint and `LAYA_ONNX_GRAPH` names one
+    directory: pointing that at the typed graph while `predict.json` expects the multilingual one
+    would re-record `predict.json` from the wrong weights, and both sides of that comparison come
+    from the same mistake, so it passes. `LAYA_TYPED_ONNX_GRAPH` keeps the two unable to collide.
+
+    Records `skipped` when the graph is absent, so `unverifiable` leaves the committed file alone
+    rather than replacing it with a marker.
+
+    Platform-sensitive in the last reported digit, as `predict_golden` is; the Java test's
+    tolerance is the gate, not byte equality of this file.
+    """
+    import os
+
+    graph = os.environ.get("LAYA_TYPED_ONNX_GRAPH")
+    rig = os.environ.get("LAYA_FIXTURE_CHECKPOINTS", DEFAULT_CHECKPOINT_ROOT)
+    model = "typed-decisions"
+    if not graph or not os.path.exists(graph):
+        return {"skipped": "set LAYA_TYPED_ONNX_GRAPH to a laya.onnx exported from the "
+                           "typed-decisions checkpoint to record this family"}
+    from laya.onnx_agent import ONNXAgent
+    from laya.router import _TYPED_DECISION_WORKFLOWS
+
+    agent = ONNXAgent(os.path.join(rig, model), onnx_path=graph)
+    cfg = agent.cfg
+    single = {}
+    for cid, state, lang, workflow, questions in TYPED_CASES:
+        if workflow is not None:
+            questions = _typed_questions(workflow, questions)
+        result = agent.predict(state, questions, lang=lang)
+        single[cid] = {"state": state, "lang": lang, "workflow": workflow,
+                       "questions": questions, "model": result["model"],
+                       "answers": result["answers"], "usage": result["usage"]}
+
+    # Batched over the real invoice schema, including the empty state and two short ones, so
+    # collation and padding are exercised here too. The empty state is the one that matters: it
+    # contributes 0 state tokens and still costs 296 input tokens of rendered questions, so a
+    # port that skips an empty member rather than padding it gets a different batch shape.
+    batch_states = [TYPED_INVOICE_VARIANCE, TYPED_INVOICE_CLEAN,
+                    "INV-2026-1004, 980 USD, matches PO-3100 and delivery.",
+                    "duplicate of INV-2026-1004", ""]
+    batch_questions = _typed_questions("invoice_processing", TYPED_INVOICE_QUESTIONS)
+    batches = []
+    for batch_size, sort_by_length in ((None, False), (2, False), (3, True)):
+        kwargs = {"sort_by_length": sort_by_length}
+        if batch_size is not None:
+            kwargs["batch_size"] = batch_size
+        results = agent.predict_batch(batch_states, batch_questions, **kwargs)
+        batches.append({"batch_size": batch_size, "sort_by_length": sort_by_length,
+                        "states": batch_states, "questions": batch_questions,
+                        "results": [{"model": r["model"], "answers": r["answers"],
+                                     "usage": r["usage"]} for r in results]})
+
+    return {
+        "checkpoint": model,
+        "graph": os.path.basename(graph),
+        # What tells this checkpoint from the english one it was fine-tuned from, which ships the
+        # identical tokenizer and the identical encoder. Asserted by the Java test before any
+        # probability is compared, because a mismatch here means the numbers below were produced
+        # by the wrong weights and comparing them is worse than not running.
+        "config": {
+            "model_name": cfg["model_name"],
+            "encoder": cfg["encoder"],
+            "max_len": cfg["max_len"],
+            "head_max_len": cfg["head_max_len"],
+            # `agent.temperature*`, not `cfg[...]`: the agent clamps on load and the config
+            # dict keeps the file's value, so the two disagree here and a port exposes only the
+            # clamped one. Recording both is what makes the clamp visible -- a lone 0.5 cannot
+            # be told from a temperature that was fitted at 0.5, and this checkpoint's
+            # `choice:11+` is 0.1006 in the file and 0.5 in use.
+            "temperature": list(agent.temperature),
+            "temperature_by_options": dict(agent.temperature_by_options),
+            "temperature_raw": list(agent.temperature_raw),
+            "temperature_by_options_raw": dict(agent.temperature_by_options_raw),
+        },
+        "workflows": {name: sorted(ids) for name, ids in sorted(_TYPED_DECISION_WORKFLOWS.items())},
+        "single": single,
+        "batch": batches,
+    }
+
+
 def email_clean():
     """`laya.email`'s cleaner and state builder, over a corpus built from its own reasoning.
 
@@ -3105,6 +3528,7 @@ FAMILIES = {
     "python_json.json": python_json,
     "email.json": email_clean,
     "predict.json": predict_golden,
+    "typed_decisions.json": typed_decisions_golden,
 }
 
 

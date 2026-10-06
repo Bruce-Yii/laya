@@ -54,11 +54,44 @@ checkpoint the Python package knows about is one this can fetch.
 `typed-decisions` is never selected automatically. `Router` knows it, and the aliases `typed`,
 `typed_decisions`, `decisions` and `laya-typed-decisions` all resolve to it, but reaching it takes
 an explicit `task` or `autoTaskDetection` — it is fine-tuned on four specific workflows and is the
-wrong silent default. **It has no recorded end-to-end fixtures in this port yet**: the routing
-decision is tested, the forward pass against that checkpoint is not.
+wrong silent default.
 
-A prepared checkpoint is about **680–810 MB** on disk, and the fused multilingual graph is
-**1.29 GB** (`laya.onnx` is a 2.8 MB graph beside a `laya.onnx.data` of external weights). Budget
+Its forward pass **is** recorded, in `fixtures/typed_decisions.json`, and asserted by
+`TypedDecisionsParityTest` in the `jvm parity (typed-decisions)` cell: eight single-state cases
+covering all four workflow signatures, three batch configurations, and the two checks that the
+weights under test are the right ones. Regenerate it with:
+
+```bash
+python laya-java/scripts/prepare_checkpoint.py --checkpoint typed-decisions
+LAYA_TYPED_ONNX_GRAPH=laya-java/.work/onnx/typed-decisions/laya.onnx \
+  python laya-java/scripts/gen_fixtures.py --only typed_decisions.json
+```
+
+`LAYA_TYPED_ONNX_GRAPH`, not `LAYA_ONNX_GRAPH`, and the two must never be crossed. A graph
+carries the weights and nothing in it names the checkpoint it was traced from, so a wrong pairing
+answers instead of failing — `typed-decisions` is fine-tuned **from** `english` and ships its
+`tokenizer.json` byte for byte and its ModernBERT-large encoder. Measured: the english checkpoint
+opened against the typed-decisions graph raises nothing and returns
+`{refund: 0.9077, replace: 0.0923}`, the same digits as the correct pairing, and `model` reads
+`laya-rl-agent-onnx` either way. Measured with the english checkpoint symlinked in as
+`typed-decisions/`: **seven of the eight** single-state cases still pass, and the eighth,
+`over-budget`, fails only because `max_len` is 512 there and 1024 here so the state truncates at
+a different point. What names the problem is the `config` section of the golden — `max_len` 1024
+against 512, `head_max_len` 256 against 192, base temperatures `[1.0148, 1.0374, 1.0575]` against
+`[1.6369, 1.2514, 1.9834]` — which the test asserts before it compares a probability. Only the
+multilingual checkpoint fails loudly against that graph, and for an unrelated reason: a 235292
+token id against a 50368-row embedding, which ONNX Runtime rejects at the `node_embedding` Gather.
+
+Of the four workflows, only `invoice_processing`'s trained question schema is in this repository
+(`examples/32_typed_decisions_workflow.py`). The other three are known by their question-id
+signatures alone, from `laya.router._TYPED_DECISION_WORKFLOWS`, so the golden carries those ids
+with instruction text written for the fixture. The ids are what the routing decision reads and the
+text is recorded verbatim, so both halves are real; the trained wording is not claimed.
+
+A prepared checkpoint is about **680–850 MB** on disk, and the fused multilingual graph is
+**1.29 GB** (`laya.onnx` is a 2.8 MB graph beside a `laya.onnx.data` of external weights). The
+typed-decisions checkpoint is **846 MB** and its graph is **1.69 GB** (3.6 MB beside the external
+weights); the export took **39 s** locally, and recording the family another **103 s**. Budget
 accordingly; the export is the slow part.
 
 ---
