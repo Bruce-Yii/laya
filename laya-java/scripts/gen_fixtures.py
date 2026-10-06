@@ -3142,6 +3142,15 @@ STRUCTURED_SCHEMAS = [
      {"type": "object", "properties": {"n": {"type": "integer", "minimum": -2, "maximum": 2}}}),
     ("score-of-one-level",
      {"type": "object", "properties": {"n": {"type": "integer", "minimum": 7, "maximum": 7}}}),
+    # An EMPTY description means "generate one", matching the reference's `description or ...`.
+    # A port returning it unchanged asks a question with no instructions at all -- and a port
+    # that returned the generated text for a NON-empty one would be caught by the case below,
+    # not by this one. Measured: a mutant dropping the emptiness test survived.
+    ("an-empty-description-generates-the-instruction",
+     {"type": "object", "properties": {
+         "dept": _sd_enum(["billing", "support"], description=""),
+         "ok": {"type": "boolean", "description": ""},
+         "n": {"type": "integer", "minimum": 1, "maximum": 3, "description": ""}}}),
     ("description-replaces-the-generated-instruction",
      {"type": "object", "properties": {
          "dept": _sd_enum(["billing", "support"], description="Which desk owns this?"),
@@ -3156,6 +3165,21 @@ STRUCTURED_SCHEMAS = [
     ("oneof-optional-is-unwrapped",
      {"type": "object", "properties": {
          "n": {"oneOf": [{"type": "integer", "minimum": 1, "maximum": 4}, {"type": "null"}]}}}),
+    # `anyOf or oneOf`, so a FALSY `anyOf` falls through to `oneOf` -- and in Python falsy is
+    # not "absent": an empty list, an empty object, an empty string and a zero are all falsy and
+    # all fall through. A port spelling the test as a null check, or as "not a list", sends the
+    # empty-list case to `oneOf` by accident and the empty-OBJECT case there too while refusing
+    # a truthy non-array that should have reached `got 0`. Measured: a mutant that dropped the
+    # emptiness test survived the whole suite, because nothing asked.
+    ("falsy-anyof-falls-through-to-oneof",
+     {"type": "object", "properties": {
+         "a": {"anyOf": [], "oneOf": [{"type": "boolean"}, {"type": "null"}]},
+         "b": {"anyOf": {}, "oneOf": [_sd_enum(["x", "y"]), {"type": "null"}]},
+         "c": {"anyOf": "", "oneOf": [{"type": "integer", "minimum": 2, "maximum": 4},
+                                      {"type": "null"}]},
+         "d": {"anyOf": 0, "oneOf": [{"type": "boolean"}, {"type": "null"}]},
+         "e": {"anyOf": False, "oneOf": [{"type": "boolean"}, {"type": "null"}]},
+         "f": {"anyOf": None, "oneOf": [{"type": "boolean"}, {"type": "null"}]}}}),
     # The outer description is carried onto the branch only when the branch has none.
     ("anyof-branch-keeps-its-own-description",
      {"type": "object", "properties": {
@@ -3370,6 +3394,21 @@ STRUCTURED_REFUSALS = [
     ("recursive-ref",
      {"type": "object", "properties": {"c": {"$ref": "#/$defs/Node"}},
       "$defs": {"Node": {"$ref": "#/$defs/Node"}}}),
+    # A TRUTHY non-array `anyOf` does NOT fall through to `oneOf`: it is iterated, yields no
+    # mapping branch, and lands here. The other side of `falsy-anyof-falls-through-to-oneof`,
+    # and the case a port testing "is it a list" gets wrong in the opposite direction -- it
+    # falls through and, with nothing to fall through to, refuses with "unsupported schema"
+    # instead of this.
+    ("truthy-non-array-anyof-is-not-a-fallthrough",
+     {"type": "object", "properties": {"x": {"anyOf": "abc"}}}),
+    ("truthy-non-array-anyof-with-a-oneof-to-shadow",
+     {"type": "object", "properties": {"x": {"anyOf": {"a": 1},
+                                             "oneOf": [{"type": "boolean"},
+                                                       {"type": "null"}]}}}),
+    # The one case of the reference's top-level `isinstance(schema, dict)` check that is
+    # reachable on a side where the argument is typed: a list, a string or a number cannot be
+    # passed at all, and null can.
+    ("top-level-is-null", None),
 ]
 
 
@@ -3593,6 +3632,7 @@ def structured():
         "nested objects are not supported",
         "only 'Optional[...]' unions (one non-null branch) are supported",
         "'type' has multiple non-null types",
+        "expected a JSON schema object",
         "the top level must be an object with 'properties'",
         "'properties' must be a non-empty object",
         "exceeds MAX_PROPERTIES=%d" % STRUCTURED_MAX_PROPERTIES,

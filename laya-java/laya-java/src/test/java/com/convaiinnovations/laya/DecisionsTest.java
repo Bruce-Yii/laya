@@ -210,15 +210,16 @@ final class DecisionsTest {
         BatchPredictor neverBatch = (states, asked) -> {
             throw new AssertionError("the runner must not be reached");
         };
+        // The ungated FOUR-argument form. Spelled with the five-argument one these four read
+        // `(Double) null`, because a bare null there matches both the `Double` and the `Map`
+        // threshold overload and does not compile -- and a cast is not an argument.
         Map<String, Runnable> calls = new LinkedHashMap<>();
-        calls.put("decide-with-both", () -> Decisions.decide(never, "s", schema, questions,
-                (Double) null));
-        calls.put("decide-with-neither", () -> Decisions.decide(never, "s", null, null,
-                (Double) null));
+        calls.put("decide-with-both", () -> Decisions.decide(never, "s", schema, questions));
+        calls.put("decide-with-neither", () -> Decisions.decide(never, "s", null, null));
         calls.put("decide-batch-with-both", () -> Decisions.decideBatch(neverBatch, List.of("s"),
-                schema, questions, (Double) null));
+                schema, questions));
         calls.put("decide-batch-with-neither", () -> Decisions.decideBatch(neverBatch,
-                List.of("s"), null, null, (Double) null));
+                List.of("s"), null, null));
 
         List<DynamicTest> tests = new ArrayList<>();
         int matched = 0;
@@ -360,8 +361,9 @@ final class DecisionsTest {
             return new Prediction(Prediction.MODEL, Map.of("ok", answer),
                     new Usage(1, 0, 1, 0, false, List.of(), Map.of()));
         };
-        Decisions.Decision decision = Decisions.decide(runner, "s", null, questions,
-                (Double) null);
+        // Ungated explicit questions, with no threshold type to pick: the entry point that did
+        // not exist, and the reason the four calls above had to be cast.
+        Decisions.Decision decision = Decisions.decide(runner, "s", null, questions);
         // No schema, so nothing is projected: the reference returns `dict(answers)` and so does
         // this. The values are the answers themselves, not a schema-shaped map.
         assertEquals(Map.of("ok", answer), decision.values());
@@ -399,6 +401,134 @@ final class DecisionsTest {
                 () -> Decisions.answersToJson(answers, schema));
         assertTrue(refused.getMessage().contains("score"), refused.getMessage());
         assertFalse(refused instanceof SchemaException, "the schema is fine; the answer is not");
+    }
+
+    @Test
+    @DisplayName("the reference forwards min_confidence from decide only, and nothing is "
+            + "forwarded here")
+    void forwardingIsPinned() {
+        // `forwarded` is the ONLY recorded datum for the documented forwarding divergence: the
+        // reference passes `min_confidence` down to `runner.predict` and falls back to gating
+        // the result itself when the runner does not take the keyword, while `decide_batch`
+        // always gates itself and forwards nothing. Here there is no such keyword on
+        // `Predictor`, so the fallback is the only path -- and that choice is only defensible
+        // while the reference's own behaviour is what the class note says it is. Asserted
+        // rather than merely recorded, because recorded-and-unasserted data reads as coverage
+        // and is not.
+        int gated = 0;
+        int batched = 0;
+        for (Object raw : section("calls")) {
+            Map<String, Object> one = map(raw);
+            String id = (String) one.get("case");
+            boolean batch = Boolean.TRUE.equals(one.get("batch"));
+            Object recorded = one.get("forwarded");
+            assertTrue(recorded instanceof List, id + " records what the reference forwarded");
+            List<?> forwarded = (List<?>) recorded;
+            if (!batch && one.get("min_confidence") != null) {
+                gated++;
+                assertEquals(List.of("min_confidence"), forwarded,
+                        id + ": the reference forwards the threshold from decide");
+            } else {
+                if (batch) {
+                    batched++;
+                }
+                assertEquals(List.of(), forwarded,
+                        id + ": nothing to forward, so nothing is forwarded on either side");
+            }
+        }
+        final int forwards = gated;
+        final int batches = batched;
+        assertTrue(forwards >= 3,
+                () -> "only " + forwards + " gated decide case(s) record a forward");
+        assertTrue(batches >= 2, () -> "only " + batches + " batch case(s) record no forward");
+
+        // And the structural half: the keyword the reference forwards has nowhere to go here.
+        // A `Predictor` takes the state and the questions and nothing else, so "forward
+        // nothing" is not a choice made at the call site that a later edit could quietly
+        // reverse -- it is the only thing the interface can express.
+        long shaped = java.util.Arrays.stream(Predictor.class.getMethods())
+                .filter(method -> "predict".equals(method.getName()))
+                .filter(method -> method.getParameterCount() == 2)
+                .count();
+        assertEquals(1, shaped,
+                "Predictor.predict(state, questions) is the whole interface; a third parameter "
+                        + "would be somewhere for min_confidence to go and the class note would "
+                        + "be out of date");
+    }
+
+    @Test
+    @DisplayName("a score answer that is not finite is refused, not narrowed into the range")
+    void nonFiniteScoreIsRefused() {
+        Map<String, Object> schema = Map.of("type", "object", "properties",
+                new LinkedHashMap<>(Map.of("n",
+                        Map.of("type", "integer", "minimum", 1L, "maximum", 3L))));
+        // `(long)` on a non-finite double is a silent narrowing that -Werror -Xlint:all cannot
+        // see: NaN becomes 0 and +Infinity becomes Long.MAX_VALUE, so `minimum + level`
+        // projected 1 for a NaN and -9223372036854775808 for an infinity onto a field declared
+        // 1..3 -- measured, and with no exception and nothing in the Decision saying so.
+        // CPython refuses both: `ValueError: cannot convert float NaN to integer` and
+        // `OverflowError: cannot convert float infinity to integer`. Reached only when
+        // `probabilities` is empty; otherwise the argmax path runs and the score is unused.
+        for (Map.Entry<String, Double> bad : new LinkedHashMap<>(Map.of(
+                "nan", Double.NaN,
+                "inf", Double.POSITIVE_INFINITY,
+                "-inf", Double.NEGATIVE_INFINITY)).entrySet()) {
+            Map<String, Answer> answers = Map.of("n",
+                    new Answer.Score(bad.getValue(), Map.of(), Map.of(), 0.9, 0.9, 0.2));
+            IllegalArgumentException refused = assertThrows(IllegalArgumentException.class,
+                    () -> Decisions.answersToJson(answers, schema), bad.getKey());
+            assertEquals("n is a score field, so its score must be finite and is " + bad.getKey(),
+                    refused.getMessage());
+            assertFalse(refused instanceof SchemaException,
+                    "the schema is fine; the answer is not");
+        }
+        // The finite path is untouched, including Python's half-to-even at 2.5 -> level 2.
+        assertEquals(Map.of("n", 3L), Decisions.answersToJson(
+                Map.of("n", new Answer.Score(2.5, Map.of(), Map.of(), 0.9, 0.9, 0.2)), schema));
+        // And a non-finite score is ignored outright when probabilities decide the level.
+        assertEquals(Map.of("n", 2L), Decisions.answersToJson(
+                Map.of("n", new Answer.Score(Double.NaN, Map.of(),
+                        new LinkedHashMap<>(Map.of("0", 0.1, "1", 0.9)), 0.9, 0.9, 0.2)), schema));
+    }
+
+    @Test
+    @DisplayName("a non-finite float is spelled CPython's way, in a label and in a refusal")
+    void nonFiniteFloatsUseCPythonSpelling() {
+        // Not reachable through `Json.parse`, which rejects a bare NaN, and fully reachable from
+        // the hand-built Map the public `Decisions.questions(Map)` signature takes -- so it is
+        // not in `fixtures/structured.json`, whose schemas are JSON. The expectations below are
+        // CPython's, measured on the reference:
+        //
+        //   repr(float("nan")) == "nan";  repr(float("inf")) == "inf"
+        //   questions_from_json_schema({"type": "object",
+        //                               "properties": {"x": {"enum": [float("nan"), 1]}}})
+        //     -> {"x": {..., "criteria": {"nan": None, "1": None}}}
+        //   ... {"properties": {"x": {"a": float("inf")}}}
+        //     -> SchemaError("properties.x: unsupported schema {'a': inf}")
+        //
+        // `PythonJson.repr(double)` gives "NaN"/"Infinity" on purpose: that is `json.dumps`'s
+        // spelling, and `dumps` is what it serves. This is the `%r` and `str` path.
+        Map<String, Object> labelled = Map.of("type", "object", "properties",
+                new LinkedHashMap<>(Map.of("x",
+                        Map.of("enum", List.of(Double.NaN, Double.POSITIVE_INFINITY,
+                                Double.NEGATIVE_INFINITY, 1L)))));
+        Map<String, Object> spec = Decisions.questions(labelled).get("x").spec();
+        // The LABEL is what the model is shown and what the answer comes back keyed by, so a
+        // port spelling it "NaN" hands a cross-language caller a different answer key.
+        assertEquals(List.of("nan", "inf", "-inf", "1"),
+                new ArrayList<>(map(spec.get("criteria")).keySet()));
+
+        for (Map.Entry<String, Double> bad : new LinkedHashMap<>(Map.of(
+                "nan", Double.NaN,
+                "inf", Double.POSITIVE_INFINITY,
+                "-inf", Double.NEGATIVE_INFINITY)).entrySet()) {
+            Map<String, Object> schema = Map.of("type", "object", "properties",
+                    new LinkedHashMap<>(Map.of("x", Map.of("a", bad.getValue()))));
+            SchemaException refused = assertThrows(SchemaException.class,
+                    () -> Decisions.questions(schema), bad.getKey());
+            assertEquals("properties.x: unsupported schema {'a': " + bad.getKey() + "}",
+                    refused.getMessage());
+        }
     }
 
     // ------------------------------------------------------------------ fixture decoding

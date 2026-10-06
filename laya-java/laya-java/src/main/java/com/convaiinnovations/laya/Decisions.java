@@ -67,6 +67,40 @@ import java.util.Set;
  *       the one the reference's own {@code decide_batch} always takes.</li>
  *   <li>{@code routing} is not reported. {@link Prediction} carries no routing block, so there is
  *       nothing to pass through; {@link Router} reports its decision at the point it makes it.</li>
+ *   <li>A <b>batched</b> decision cannot route per state. The reference's {@code decide_batch}
+ *       special-cases a {@code route_batch}-capable runner and sends one request per state "so
+ *       states may route to different checkpoints"; {@link Router} here implements
+ *       {@link Predictor} and not {@link BatchPredictor}, so {@link #decideBatch} will not take
+ *       one at all. Batching a router means deciding what a shared forward pass over two
+ *       checkpoints is, which is a design question and not a port.</li>
+ *   <li>An {@code enum} must be an <b>array</b>. The reference measures and iterates whatever
+ *       is there, so {@code "enum": "abc"} becomes a three-option choice over {@code "a"},
+ *       {@code "b"}, {@code "c"} — a schema nobody wrote, built from a typo — and
+ *       {@code "enum": 5} is a {@code TypeError} from inside {@code len()} rather than a
+ *       refusal naming the property.</li>
+ *   <li>A score's {@code minimum} and {@code maximum} must be integers, and a <b>boolean</b> is
+ *       not one. Python's {@code bool} subclasses {@code int}, so the reference accepts
+ *       {@code {"minimum": false, "maximum": true}} and asks "Score {@code x} from 0 to 1".</li>
+ *   <li>A {@code description} must be a <b>string</b>. The reference puts whatever is there into
+ *       the question's {@code instructions} — {@code 5}, or {@code ['a']} — which is not text a
+ *       model can be asked.</li>
+ *   <li>A {@code score} answer whose {@code score} is not finite is refused. CPython's
+ *       {@code int()} refuses it too — {@code ValueError} for a NaN, {@code OverflowError} for
+ *       an infinity — so the verdict matches and only the wording differs: this one names the
+ *       field, as the rest of the answer-shape refusals do.</li>
+ *   <li>An {@code anyOf}/{@code oneOf} that is neither falsy nor iterable — a number, or
+ *       {@code true} — is a {@link SchemaException} naming the key, where the reference raises
+ *       {@code TypeError: 'int' object is not iterable} from inside its own comprehension. The
+ *       truthiness itself is reproduced: a falsy {@code anyOf} falls through to {@code oneOf}
+ *       and a truthy non-array reaches the same "got 0" refusal the reference raises. This is
+ *       the <b>one</b> exception to the rule that a refusal message matches character for
+ *       character.</li>
+ *   <li>A top level that is not an object is a <b>compile error</b>, not a refusal:
+ *       {@link #plan} takes a {@link Map}, where the reference raises
+ *       {@code expected a JSON schema object, got list}. A caller who reaches it through an
+ *       unchecked cast — {@code (Map<String, Object>) Json.parse(text)}, which is the README's
+ *       own idiom — gets a {@link ClassCastException} from the cast instead. The one case the
+ *       static type does not cover, a null schema, is refused with the reference's message.</li>
  * </ul>
  */
 public final class Decisions {
@@ -182,6 +216,18 @@ public final class Decisions {
                     if (!score.probabilities().isEmpty()) {
                         level = argmax(score.probabilities());
                     } else {
+                        // Refused rather than narrowed. `(long)` on a non-finite double is silent
+                        // -- NaN becomes 0 and +Infinity becomes Long.MAX_VALUE -- so
+                        // `minimum + level` would project 1 for a NaN and
+                        // -9223372036854775808 for an infinity onto a field the schema declared
+                        // as 1..3, with nothing in the Decision saying so. CPython's `int()`
+                        // refuses both (ValueError for a NaN, OverflowError for an infinity),
+                        // and this is the one arithmetic path `expect` does not cover.
+                        if (!Double.isFinite(score.score())) {
+                            throw new IllegalArgumentException(String.format(
+                                    "%s is a score field, so its score must be finite and is %s",
+                                    field.name(), pythonStr(score.score())));
+                        }
                         // `score` is already the 0-based LEVEL INDEX, so it is rounded on its own
                         // with no `minimum` subtracted first. Math.rint is Python's round: half to
                         // even. Math.round is half up and gives 3 for 2.5.
@@ -283,6 +329,13 @@ public final class Decisions {
 
     /** Validates a JSON schema and returns one planned field per property. */
     public static Plan plan(Map<String, Object> schema) {
+        if (schema == null) {
+            // The reference's `isinstance(schema, dict)` check has one reachable case here and
+            // this is it: `Map` is the guard for a list, a string or a number, and null is
+            // assignable to it. Without this the refusal is an NPE from `schema.get`, which
+            // names neither the argument nor what was wrong with it.
+            throw new SchemaException("expected a JSON schema object, got NoneType");
+        }
         Object type = schema.get("type");
         if (!(type == null || "object".equals(type)) || !schema.containsKey("properties")) {
             throw new SchemaException("the top level must be an object with 'properties'");
@@ -380,10 +433,15 @@ public final class Decisions {
             // handles below. The single non-null branch is unwrapped so Optional[Literal[...]]
             // and friends map; a union of two real types is genuinely ambiguous and refused.
             //
-            // An EMPTY `anyOf` falls through to `oneOf`, because the reference spells this
-            // `prop.get("anyOf") or prop.get("oneOf")` and an empty list is falsy there.
+            // A FALSY `anyOf` falls through to `oneOf`, because the reference spells this
+            // `prop.get("anyOf") or prop.get("oneOf")`. Falsy is Python's, not "not a list":
+            // an empty list, an empty object, an empty string, zero and false are all falsy
+            // there and all fall through, while a NON-EMPTY string or object is truthy and does
+            // NOT -- it is iterated, yields no mapping branch, and lands on the `got 0` refusal
+            // below. Reproducing only the empty-list case sent a truthy `{"anyOf": "abc"}`
+            // through to `oneOf` and, with no `oneOf` to find, out to "unsupported schema".
             Object union = prop.get("anyOf");
-            if (!(union instanceof List) || ((List<?>) union).isEmpty()) {
+            if (!truthy(union)) {
                 union = prop.get("oneOf");
             }
             if (union != null) {
@@ -395,6 +453,15 @@ public final class Decisions {
                             branches.add((Map<String, Object>) candidate);
                         }
                     }
+                } else if (!(union instanceof String) && !(union instanceof Map)) {
+                    // A string iterates its characters and an object its keys, so both reach the
+                    // refusal below with zero branches, which is what the reference raises. A
+                    // number or a boolean is not iterable at all: the reference raises TypeError
+                    // there, and this is the one recorded exception to the
+                    // message-for-message rule -- see the class note.
+                    throw new SchemaException(path + ": '"
+                            + (truthy(prop.get("anyOf")) ? "anyOf" : "oneOf")
+                            + "' must be an array of branches, got " + pythonType(union));
                 }
                 if (branches.size() != 1) {
                     throw new SchemaException(path + ": only 'Optional[...]' unions (one non-null"
@@ -541,6 +608,40 @@ public final class Decisions {
     }
 
     /**
+     * Python's truth value of a parsed-JSON value, which is what {@code a or b} tests.
+     *
+     * <p>Empty is false: {@code []}, <code>{}</code>, {@code ""}, {@code 0}, {@code 0.0} and
+     * {@code false} are all falsy, which is why a schema may spell any of them and still mean
+     * "look at the other key". A Java truth test on the same value would be a null check and
+     * would differ on every one of them.
+     */
+    private static boolean truthy(Object value) {
+        if (value == null) {
+            return false;
+        }
+        if (value instanceof Boolean) {
+            return (Boolean) value;
+        }
+        if (value instanceof String) {
+            return !((String) value).isEmpty();
+        }
+        if (value instanceof List) {
+            return !((List<?>) value).isEmpty();
+        }
+        if (value instanceof Map) {
+            return !((Map<?, ?>) value).isEmpty();
+        }
+        if (value instanceof BigInteger) {
+            return ((BigInteger) value).signum() != 0;
+        }
+        if (value instanceof Number) {
+            // `0.0`, `-0.0` and `0` are all falsy; a NaN is truthy, as every non-zero float is.
+            return ((Number) value).doubleValue() != 0.0;
+        }
+        return true;
+    }
+
+    /**
      * Whether a bound counts as an integer.
      *
      * <p>A {@code Boolean} does not, where Python's {@code isinstance(x, int)} says it does
@@ -599,7 +700,25 @@ public final class Decisions {
 
     /** Decides one state against a schema, ungated. */
     public static Decision decide(Predictor runner, Object state, Map<String, Object> schema) {
-        return decide(runner, state, schema, null, (Double) null);
+        return decide(runner, state, schema, null);
+    }
+
+    /**
+     * Decides one state, ungated: pass exactly <b>one</b> of {@code schema} or
+     * {@code questions}.
+     *
+     * <p>The ungated spelling of the five-argument form, and the reason it exists is that the
+     * five-argument form is <b>ambiguous</b> on a bare {@code null} -- both the {@link Double}
+     * and the {@code Map} threshold overload match, so "no gate" could only be written
+     * {@code (Double) null}. A cast is not an argument, and an explicit-questions caller who
+     * wants no gate should not have to pick one of two threshold types to say so.
+     *
+     * @throws IllegalArgumentException if both or neither of {@code schema} and
+     *     {@code questions} is given
+     */
+    public static Decision decide(Predictor runner, Object state, Map<String, Object> schema,
+                                  Map<String, Question> questions) {
+        return decide(runner, state, schema, questions, (Double) null);
     }
 
     /**
@@ -631,7 +750,23 @@ public final class Decisions {
     /** Decides many states against one schema in one batched call, ungated. */
     public static List<Decision> decideBatch(BatchPredictor runner, List<?> states,
                                              Map<String, Object> schema) {
-        return decideBatch(runner, states, schema, null, (Double) null);
+        return decideBatch(runner, states, schema, null);
+    }
+
+    /**
+     * Decides many states in one batched call, ungated: pass exactly <b>one</b> of
+     * {@code schema} or {@code questions}.
+     *
+     * <p>The batched counterpart of {@link #decide(Predictor, Object, Map, Map)}, and there for
+     * the same reason: the five-argument form cannot express "no gate" without a cast.
+     *
+     * @throws IllegalArgumentException if both or neither of {@code schema} and
+     *     {@code questions} is given
+     */
+    public static List<Decision> decideBatch(BatchPredictor runner, List<?> states,
+                                             Map<String, Object> schema,
+                                             Map<String, Question> questions) {
+        return decideBatch(runner, states, schema, questions, (Double) null);
     }
 
     /**
@@ -767,7 +902,22 @@ public final class Decisions {
             return PythonJson.repr((String) value);
         }
         if (value instanceof Double || value instanceof Float) {
-            return PythonJson.repr(((Number) value).doubleValue());
+            double number = ((Number) value).doubleValue();
+            // CPython's `repr` spells the non-finite floats in LOWER CASE -- `nan`, `inf`,
+            // `-inf` -- where `json.dumps` writes `NaN`, `Infinity`, `-Infinity`.
+            // PythonJson.repr(double) reproduces the `dumps` spelling, which is right for
+            // `dumps` and wrong here: this is `%r` and `str`, so a refusal message quotes the
+            // fragment the way CPython would, and a choice LABEL -- what the model is shown and
+            // what the answer comes back keyed by -- is the same string on both sides. Not
+            // reachable through Json.parse, which rejects a bare NaN, and fully reachable from
+            // the hand-built Map the public `questions(Map)` signature takes.
+            if (Double.isNaN(number)) {
+                return "nan";
+            }
+            if (Double.isInfinite(number)) {
+                return number > 0 ? "inf" : "-inf";
+            }
+            return PythonJson.repr(number);
         }
         if (value instanceof Number) {
             return value.toString();

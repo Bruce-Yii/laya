@@ -156,16 +156,16 @@ jobs:
       - name: Tests that need no model
         working-directory: laya-java
         run: ./gradlew --no-daemon test
-      # Measured locally on JDK 17 with no checkpoints: 790 registered, 14 abort, 776 run. The
+      # Measured locally on JDK 17 with no checkpoints: 798 registered, 14 abort, 784 run. The
       # floor keeps the 5-test margin the 685/680 pair had, which is what makes it bind the
-      # class this bump is for: DecisionsTest is 91 of those 776, so dropping it leaves 685 and
-      # the floor exits 1. Measured both ways -- 776 passes at 771, and with DecisionsTest.java
+      # class this bump is for: DecisionsTest is 99 of those 784, so dropping it leaves 685 and
+      # the floor exits 1. Measured both ways -- 784 passes at 779, and with DecisionsTest.java
       # moved out of the tree the suite is still green and the floor still exits 1.
       - name: Model-free suite was not vacuous
         if: ${{ !cancelled() }}
         run: >
           python laya-java/scripts/check_test_results.py
-          laya-java/laya-java/build/test-results/test --min-tests 771 --allow-aborted
+          laya-java/laya-java/build/test-results/test --min-tests 779 --allow-aborted
 
       # The samples are single-file source programs, deliberately NOT a Gradle module: a
       # `samples` subproject would inherit the root build's MavenPublication and
@@ -324,7 +324,7 @@ jobs:
         if: ${{ !cancelled() }}
         run: >
           python laya-java/scripts/check_test_results.py
-          laya-java/laya-java/build/test-results/test --min-tests 771 --allow-aborted
+          laya-java/laya-java/build/test-results/test --min-tests 779 --allow-aborted
           --require-passed TestJvmVersionTest
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: ${{ failure() }}

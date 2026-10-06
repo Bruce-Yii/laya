@@ -93,8 +93,18 @@ subprojects {
         // are supposed to abort by assumption. Treating blank as unset is what makes "this cell
         // has no graph" and "this machine has no graph" the same case, which is what the tests
         // are written against.
+        //
+        // Declared as an INPUT as well as set. `environment(...)` alone is not a task input, so
+        // toggling one of these left `test` UP-TO-DATE and handed back the PREVIOUS lane's
+        // results -- a with-checkpoints run reporting the model-free run's counts, which is a
+        // measurement of the wrong thing that looks exactly like a measurement of the right one.
+        // CI never saw it (fresh runners), and every local count taken without `cleanTest` could
+        // silently have been the other lane's. The input makes the lane part of the task's
+        // identity, so the toggle re-runs the suite on its own.
         listOf("LAYA_CHECKPOINTS", "LAYA_ONNX_GRAPH", "LAYA_PREDICT_GOLDEN").forEach { name ->
-            System.getenv(name)?.takeIf { it.isNotBlank() }?.let { environment(name, it) }
+            val value = System.getenv(name)?.takeIf { it.isNotBlank() }
+            inputs.property("env.$name", value).optional(true)
+            value?.let { environment(name, it) }
         }
     }
 
