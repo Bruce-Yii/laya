@@ -481,8 +481,10 @@ override), loading checkpoints lazily under an LRU cache:
 
 ```csharp
 using var router = new LayaRouter(new LayaRouterOptions { MaxLoaded = 2 });
-var result = router.Predict(new { message = "I was charged twice" }, questions);   // -> english
-var deDe   = router.Predict(new { message = "Mein Konto wurde zweimal belastet" }, questions); // -> multilingual
+var result = router.Predict(
+    new Dictionary<string, object?> { ["message"] = "I was charged twice" }, questions);   // -> english
+var deDe   = router.Predict(
+    new Dictionary<string, object?> { ["message"] = "Mein Konto wurde zweimal belastet" }, questions); // -> multilingual
 Console.WriteLine(result.Routing!.Reason);   // "English Latin text"
 ```
 
