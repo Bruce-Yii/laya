@@ -823,7 +823,7 @@
     },
     {
       "input": "{1: 0.5}",
-      "error": "min_confidence map keys must be strings like 'choice:3-5', got 1"
+      "error": "min_confidence map keys must be a bucket like 'choice:3-5' or 'default', got 1"
     }
   ]
 }

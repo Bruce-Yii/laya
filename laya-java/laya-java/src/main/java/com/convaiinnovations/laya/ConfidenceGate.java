@@ -1,5 +1,6 @@
 package com.convaiinnovations.laya;
 
+import com.convaiinnovations.laya.json.PythonJson;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Optional;
@@ -147,6 +148,31 @@ public final class ConfidenceGate {
         return thresholds.getOrDefault("default", 0.0);
     }
 
+    /**
+     * Every bucket key an answer can actually produce, plus {@code "default"}.
+     *
+     * <p>Derived from the same spelling {@link #optionBucket} emits, rather than written out, so
+     * the two cannot drift: three question types crossed with the four size bands.
+     *
+     * <p>This set is the whole point of the check below. The reference validated only that a key
+     * was a string until {@code cb85656}; it now requires the key to name a bucket an answer can
+     * produce, because a threshold under {@code "choice:99"} is silently never applied -- the
+     * caller believes they gated something and nothing is gated. A port that accepts the key the
+     * reference refuses turns a loud refusal into exactly that silence.
+     */
+    private static final java.util.Set<String> ALLOWED_BUCKETS;
+
+    static {
+        java.util.Set<String> allowed = new java.util.LinkedHashSet<>();
+        for (String type : new String[]{"choice", "score", "noul"}) {
+            for (String size : new String[]{"2", "3-5", "6-10", "11+"}) {
+                allowed.add(type + ":" + size);
+            }
+        }
+        allowed.add("default");
+        ALLOWED_BUCKETS = java.util.Set.copyOf(allowed);
+    }
+
     /** Validates a scalar threshold, returning it. */
     public static double checkMinConfidence(double value) {
         if (!Double.isFinite(value) || value < 0.0 || value > 1.0) {
@@ -164,9 +190,13 @@ public final class ConfidenceGate {
         }
         Map<String, Double> out = new LinkedHashMap<>();
         for (Map.Entry<String, ? extends Number> entry : map.entrySet()) {
-            if (entry.getKey() == null) {
-                throw new IllegalArgumentException(
-                        "min_confidence map keys must be strings like 'choice:3-5', got null");
+            if (entry.getKey() == null || !ALLOWED_BUCKETS.contains(entry.getKey())) {
+                // Message matched to `laya/confidence.py` character for character, including the
+                // `%r` spelling of the offending key, because a caller greps for this line.
+                throw new IllegalArgumentException(String.format(
+                        "min_confidence map keys must be a bucket like 'choice:3-5' or "
+                        + "'default', got %s",
+                        entry.getKey() == null ? "None" : PythonJson.repr(entry.getKey())));
             }
             out.put(entry.getKey(), checkMinConfidence(entry.getValue().doubleValue()));
         }
