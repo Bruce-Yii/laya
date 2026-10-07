@@ -294,8 +294,6 @@ Router(
 router.route(state, questions=None, model=None, task=None, lang=None, lang_guess=None,
              hooks=None, hooks_raise=None, hooks_timeout=None)
 
-router.route_batch(requests, hooks_timeout=None, *, hooks=None, hooks_raise=None)
-
 router.predict(state, questions, model=None, task=None, lang=None, lang_guess=None,
                hooks=None, on_predict_start=None, on_predict_end=None, hooks_raise=None,
                hooks_timeout=None, max_len=None, head_max_len=None)
@@ -303,6 +301,8 @@ router.predict(state, questions, model=None, task=None, lang=None, lang_guess=No
 router.predict_batch(requests, batch_size=None, hooks_timeout=None, min_confidence=None,
                      sort_by_length=False, hooks=None, on_predict_start=None, on_predict_end=None,
                      hooks_raise=None)
+
+router.route_batch(requests, hooks_timeout=None, *, hooks=None, hooks_raise=None)
 
 router.system_one(...)      # alias of predict
 router.load(name)           # builds on first use; fires on_load
