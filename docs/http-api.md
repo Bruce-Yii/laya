@@ -278,7 +278,9 @@ Successful responses also carry `Server-Timing: inference;dur=<ms>` and `X-Infer
 ## Limits
 
 Request guardrails are checked before tokenization, so an oversized request costs the server
-nothing but the bytes it read. Every one of them is a `413`; the `detail` says which limit was hit.
+nothing but the bytes it read. Every size limit below is a `413`; the `detail` says which limit was
+hit. The last row is the exception: the concurrency cap is an admission limit, not a size one, and
+it answers `503` with `Retry-After: 1`.
 
 | limit | value |
 |---|---|
@@ -289,7 +291,7 @@ nothing but the bytes it read. Every one of them is a `413`; the `detail` says w
 | options per `choice` question | 100 |
 | levels per `score` question | 32 |
 | options across all questions | 512 |
-| concurrent admitted requests | `LAYA_MAX_CONCURRENT` (16) |
+| concurrent admitted requests (`503`, not `413`) | `LAYA_MAX_CONCURRENT` (16) |
 
 `/v1/systemone/batch` is bounded differently, and not by a refusal. It tokenizes each state once per
 question and collates every row into a single tensor, so the field caps multiply: 64 states of 64
