@@ -103,6 +103,30 @@ laya.train: choice calibration: not fitted: 2 calibration items, fewer than 10, 
 A warning like that means the checkpoint's confidences were not calibrated; don't gate on
 `min_confidence` with it until a run with more data fits them.
 
+### Diagnose a run that stays at chance
+
+If a fine-tune never rises above the class prior, accuracy alone cannot say whether the task is
+hard or the budget is wrong. A label-encoding positive control separates the two: prepend a tag
+that spells the answer (for example `label=<department>; `) to every training and test text, and
+fine-tune on that copy. The model can read the answer off the tag, so the same budget has a
+trivially learnable signal to fit.
+
+- Positive control fails to learn → suspect the budget, the optimization or the run setup, not the
+  task.
+- Positive control reaches 1.00 while the real task stays at the prior → the evidence points at
+  task or representation difficulty rather than too few updates.
+  [#963](https://github.com/NandhaKishorM/laya/issues/963) measured both at 8 epochs: the positive
+  control reached 1.00 while the real task still collapsed.
+
+A passing positive control only shows the run can fit a deliberately easy signal; it is not proof
+that the real task is learnable or that the checkpoint generalizes.
+
+Takeoff near the ln K plateau is also seed-dependent, so one run is not evidence either way.
+[#963](https://github.com/NandhaKishorM/laya/issues/963) saw 9 of 15 runs leave the plateau and 6
+never do within 32 epochs, on identical data and configuration. Repeat the run with different seeds
+before concluding that a task is unlearnable or that a budget is fine, and read the collapse
+warning the run prints before gating on `min_confidence`.
+
 ### Options
 
 | flag | default | what it changes |
