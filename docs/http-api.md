@@ -185,7 +185,7 @@ name of the decision head, and the checkpoint that answered is in `routing`.
 | `choice` | `choice` (the argmax option), `probabilities` per option |
 | `score` | `score` (expected level index, may fall between levels), `probabilities` keyed `"0".. "k-1"`, `legend` mapping index to the level text |
 | `noul` | `noul`, the probability of the yes option |
-| all | `confidence`, `answer_confidence`, and `action.act_probability` |
+| all | `type` (the discriminator, echoing the question's own type), `confidence`, `answer_confidence`, and `action.act_probability` |
 | gate | `abstention`, `abstention_threshold` and `low_confidence`, written by the abstention gate -- see below |
 
 The gate row is the abstention report (#361), and it is the only way a caller can see that the gate
