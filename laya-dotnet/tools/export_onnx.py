@@ -146,6 +146,16 @@ def verify_snapshot(directory, label, required=()):
                 except Exception as problem:
                     problems.append("%s: %d bytes, not valid JSON (%s)" % (shown, size, problem))
             elif name.endswith(".safetensors") and size < 1024:
+                # A floor, not a completeness check, and deliberately so: `safetensors` already
+                # validates that the tensor byte ranges cover the file, and says so clearly --
+                # a 2.3 GB weights file truncated to 500 KB raises `SafetensorError: Error while
+                # deserializing header: incomplete metadata, file not fully covered`, in the
+                # exporter, seconds after the fetch. That is self-diagnosing, which is exactly
+                # what the 0-byte `tokenizer.json` was NOT: it surfaced as `EOF while parsing a
+                # value at line 1 column 0` from a .NET constructor, in a test, ninety seconds
+                # later, naming neither a file nor a download. So this only catches a file too
+                # short to hold the 8-byte length prefix and a header at all, where the loader's
+                # own error would be about a malformed header rather than a truncated download.
                 problems.append("%s: %d bytes, too small to hold a header" % (shown, size))
     if problems:
         raise SystemExit(
