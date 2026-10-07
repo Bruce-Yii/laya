@@ -165,8 +165,10 @@ with agent.hooks_installed(debug):  # installed for the block, removed on exit
 ```
 
 `add_hook` accepts the same objects as `hooks=` (not plain callables). `hooks_installed` takes
-any number of hook objects or sequences and restores the previous list on exit, including when
-the block raises.
+any number of hook objects or sequences and, on exit -- including when the block raises -- removes
+exactly what it installed: one occurrence of each hook it added, the most recent. It does not
+restore a snapshot of the list, so a hook the application had already installed stays installed,
+and a hook added inside the block with `add_hook` is left in place.
 
 ## Process-wide defaults
 

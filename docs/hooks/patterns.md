@@ -248,7 +248,8 @@ earlier one.
 ### Scoped instrumentation
 
 Attach a tracer or debug hook only for the code that needs it, instead of reconstructing the
-agent. `hooks_installed` restores the previous list on exit, even if the block raises.
+agent. On exit -- even if the block raises -- `hooks_installed` removes one occurrence of each
+hook it installed, and nothing else: a hook added inside the block with `add_hook` outlives it.
 
 ```python
 with agent.hooks_installed(DebugDump()):
