@@ -207,8 +207,11 @@ With no ties in the data there is one level per answer, and both metrics are exa
 always been -- bit-identical, not merely close.
 
 
-Add `ScoreWithin(0.25)` to the evaluator list for a tolerance metric; the default set is
-`choice_accuracy`, `noul_accuracy`, `score_mae`, `mean_confidence`, plus `ece`. From the CLI the
+Add `ScoreWithin(0.25)` to the evaluator list for a tolerance metric; the default evaluator set is
+`choice_accuracy`, `noul_accuracy`, `score_mae` and `mean_confidence`. The confidence metrics are not
+evaluators and are not opted into: `ece`, `brier`, `aurc`, `selective_accuracy@50` and
+`selective_accuracy@80` are all computed on every run that has at least one answer carrying both a
+confidence and a known label, whatever evaluator list it was given. From the CLI the
 same thing is one flag: `laya-evals run data.jsonl --score-within 0.25` reports `score_within_0.25`
 beside the defaults, and the flag repeats, so `--score-within 0.25 --score-within 0.5` reports both.
 
