@@ -178,22 +178,25 @@ one ships every other low-confidence answer unannotated.
 
 ### Routing override
 
-`on_route` may replace `ctx.decision` to pin a checkpoint for a class of traffic.
+`on_route` may replace `ctx.decision` to pin a checkpoint for a class of traffic. It has to be a
+hook object: the convenience callables cover `on_predict_start` / `on_predict_end` only, so a bare
+function in `hooks=` is refused (see [plain callables in `hooks=`](#plain-callables-in-hooks)).
 
 ```python
 from laya.router import RouteDecision
 
-def pin(ctx):
-    if "refund" in str(ctx.states[0]).lower():
-        ctx.decision = RouteDecision(
-            model="typed-decisions",
-            repo="convaiinnovations/laya/typed-decisions",
-            reason="refund workflow",
-            detection=None,
-            workflow=None,
-        )
+class Pin:
+    def on_route(self, ctx):
+        if "refund" in str(ctx.states[0]).lower():
+            ctx.decision = RouteDecision(
+                model="typed-decisions",
+                repo="convaiinnovations/laya/typed-decisions",
+                reason="refund workflow",
+                detection=None,
+                workflow=None,
+            )
 
-Router(hooks=[pin])
+Router(hooks=[Pin()])
 ```
 
 ### Model lifecycle
