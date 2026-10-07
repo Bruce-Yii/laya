@@ -129,7 +129,7 @@ curl -s localhost:8000/v1/systemone -H 'content-type: application/json' -d '{
 | `lang_guess` | no | a language code from the client's own identifier, consulted after `lang` and before detection; any non-English code routes to the multilingual checkpoint |
 | `max_len` | no | total token window for this request, capped by `LAYA_MAX_TOKEN_BUDGET` |
 | `head_max_len` | no | token window the option prompt shares, same cap; see [Widening the Token Budget](langchain.md) for when a question needs it |
-| `min_confidence` | no | abstention threshold in `[0.0, 1.0]`; an answer whose `answer_confidence` falls below it comes back marked `low_confidence`, and the answer itself is kept |
+| `min_confidence` | no | abstention threshold: a number in `[0.0, 1.0]`, or a per-bucket map keyed by option-count bucket (`{"choice:3-5": 0.9, "default": 0.4}`) so the threshold can differ by option count; an answer whose `answer_confidence` falls below its own threshold comes back marked `low_confidence`, and the answer itself is kept |
 
 `model`, `task`, `lang`, `lang_guess`, `max_len`, `head_max_len` and `min_confidence` are the
 arguments `Router.predict` takes that a JSON body can state; each is forwarded only when the request
