@@ -120,8 +120,8 @@ Headline Laya cells for AG News and DAIR Emotion are the Applications-run number
 
 ### English vs the rest
 
-| task | | laya | laya-multilingual |
-|---|---|---|---|
+| task | laya | laya-multilingual |
+|---|---|---|
 | MASSIVE intent — English | **0.783** | 0.657 |
 | MASSIVE intent — other languages | 0.306 | **0.451** |
 | MASSIVE scenario — English | **0.603** | 0.560 |
