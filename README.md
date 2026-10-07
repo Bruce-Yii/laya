@@ -286,11 +286,11 @@ checkpoint goes from 24/58 correct at its default 192-token option budget to 34/
 accuracy back, because `max_len` then leaves fewer tokens for the request itself. [Honest
 limits](#honest-limits) describes the same budget ceiling for a 77-option question.
 
-Device selection is automatic, in this order: **CUDA → MPS → CPU**. Mixed precision is used on
+Device selection is automatic, in this order: **CUDA → MPS → XPU → CPU**. Mixed precision is used on
 CUDA; CPU and MPS run fp32. Override with `device=`, which is accepted by both entry points:
 
 ```python
-agent = laya.load("convaiinnovations/laya", device="cpu")      # or "cuda", "mps"
+agent = laya.load("convaiinnovations/laya", device="cpu")      # or "cuda", "mps", "xpu"
 router = Router(preload=True, device="mps")
 ```
 
