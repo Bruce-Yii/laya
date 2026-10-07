@@ -265,8 +265,9 @@ LAYA_HOST=127.0.0.1 LAYA_PRELOAD=0 LAYA_IDLE_UNLOAD_SECONDS=300 laya-serve
 Install `laya[serve]` where the HTTP server runs. MCP still uses stdio with the editor; its
 prediction tools use HTTP to reach your server. `laya_predict`, `laya_predict_batch`, `laya_decide`
 and `laya_preset` use the server's original state, instructions and option descriptions.
-Heterogeneous batches send one `/v1/systemone` request per item, preserving input order;
-`batch_size` and `sort_by_length` do not change the server's execution. `laya_status` reports the
+`laya_predict_batch` sends one `/v1/systemone` request per item -- every batch, not only a
+heterogeneous one -- preserving input order; `batch_size` and `sort_by_length` are accepted and
+ignored, so they do not change the server's execution. `laya_status` reports the
 server's `/health`; `laya_route` and `laya_route_batch` stay local and need no model or HTTP request.
 The MCP process imports no torch and loads no checkpoint, including when `LAYA_THREADS` or
 `LAYA_PRELOAD` is set.
