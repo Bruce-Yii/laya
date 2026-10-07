@@ -378,7 +378,7 @@ is for. Use `on_predict_start=` / `on_predict_end=` for those.
 These are used internally and are stable, but most users do not need them.
 
 ```python
-HOOK_EVENTS          # tuple of the six event names, in dispatch order
+HOOK_EVENTS          # tuple of the six event names; the set hooks= is validated against
 normalise_hooks(hooks=None, on_predict_start=None, on_predict_end=None) -> list
 dispatch(hooks, event, ctx, *, raise_errors=True, lock=None) -> None
 aggregate_usage(results) -> {"input_tokens": int, "output_tokens": int}
@@ -389,7 +389,10 @@ dispatch(hooks, event, ctx, *, raise_errors=True, lock=None, timeout=None)
 run_coroutine_sync(coro, loop=None)
 ```
 
-`normalise_hooks` flattens a `hooks` object/sequence and the two callables into one ordered list.
+`HOOK_EVENTS` is the set of names `normalise_hooks` and `AsyncHook` look for on a hook; its order
+is declaration order, not the order the events fire in a call -- for that see
+[Lifecycle](lifecycle.md). `normalise_hooks` flattens a `hooks` object/sequence and the two
+callables into one ordered list.
 `dispatch` calls `event` on every hook that implements it, applying the raise policy, lock and
 timeout, and runs a hook's result if it is awaitable. `run_coroutine_sync` runs an awaitable to
 completion from sync code, on the caller's loop if it is free, or on a background loop if the
