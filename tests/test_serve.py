@@ -662,23 +662,29 @@ class _StubAgent:
     def system_one(self, state, questions):
         return {"model": self.name, "answers": {}, "usage": {}}
 
+    def predict_batch(self, states, questions, batch_size=None, **kwargs):
+        return [self.system_one(state, questions) for state in states]
+
 
 def _server_router(monkeypatch, **env):
     """The Router `laya-serve` builds for `env`, with loads recorded instead of performed."""
-    from laya.router import normalise_name
     from laya.serve import build_router
 
     monkeypatch.setenv("LAYA_PRELOAD", "0")       # nothing may download
     monkeypatch.setenv("LAYA_AUTO_TASK", "1")     # the config that puts three checkpoints in play
     monkeypatch.delenv("LAYA_MAX_LOADED", raising=False)
     monkeypatch.delenv("LAYA_DEFAULT_MODEL", raising=False)
+    monkeypatch.delenv("LAYA_EXTRA_MODELS", raising=False)
     for name, value in env.items():
         monkeypatch.setenv(name, value)
     router = build_router()
     built = []
 
     def load(name):
-        key = normalise_name(name)
+        # `router.resolve`, not `normalise_name`: `predict` hands `load` the
+        # decision's key, which can be a LAYA_EXTRA_MODELS registration that the
+        # built-in table does not know.
+        key = router.resolve(name)
         if key in router._agents:
             router._touch(key)
             return router._agents[key]
@@ -3505,3 +3511,131 @@ def test_jev_strict_projection_page_names_the_projected_keys():
 
     # The noul bullet must not shrink the discriminator away.
     assert "noul only" not in page, "pre-fix 'noul only' wording is still on the page"
+
+# Serving a fine-tune today means rebuilding the package: `Router` has grown
+# `register` / `models=`, but `laya-serve` reads its whole configuration from the
+# environment, so an operator with a local checkpoint had no way to reach either.
+# LAYA_EXTRA_MODELS is the JSON-object form of `Router(models=...)`, parsed once
+# at startup; the request handlers then resolve `model` against the Router's own
+# registry rather than the built-in table, so a registered name pins its
+# checkpoint the same way `english` does.
+def test_extra_models_option_parses_the_json_object(monkeypatch):
+    from laya.serve import _extra_models_option
+
+    # Unset and blank are "not asked for", like every other option here.
+    monkeypatch.delenv("LAYA_EXTRA_MODELS", raising=False)
+    assert _extra_models_option() == {}
+    for blank in ("", "   ", "\n"):
+        monkeypatch.setenv("LAYA_EXTRA_MODELS", blank)
+        assert _extra_models_option() == {}, repr(blank)
+
+    # The two source shapes Router.register accepts: a plain string (Hub repo id
+    # or local directory) and a [repo, subfolder] pair, which arrives as a tuple
+    # because JSON has no tuple.
+    monkeypatch.setenv("LAYA_EXTRA_MODELS", json.dumps({
+        "my-ckpt": "/tmp/ckpt",
+        "nested": ["org/repo", "folder"],
+        "hub-only": "org/repo",
+    }))
+    parsed = _extra_models_option()
+    assert parsed == {
+        "my-ckpt": "/tmp/ckpt",
+        "nested": ("org/repo", "folder"),
+        "hub-only": "org/repo",
+    }, parsed
+
+
+def test_extra_models_option_refuses_a_malformed_value(monkeypatch):
+    from laya.serve import _extra_models_option
+
+    # The fail-closed rule is `_default_model_option`'s: a checkpoint silently
+    # absent from the registry would auto-route its traffic to a different one,
+    # which is the wrong answer -- so the server refuses to start and the
+    # message names the variable and the offending shape.
+    for raw in ("{", "not json", '"english"', '["english"]', "42", "null"):
+        monkeypatch.setenv("LAYA_EXTRA_MODELS", raw)
+        with pytest.raises(SystemExit) as raised:
+            _extra_models_option()
+        assert "invalid LAYA_EXTRA_MODELS" in str(raised.value), raw
+
+    # A source that is not a string or a pair fails the same way, naming the
+    # checkpoint it was meant to register.
+    monkeypatch.setenv("LAYA_EXTRA_MODELS", json.dumps({"my-ckpt": 7}))
+    with pytest.raises(SystemExit) as raised:
+        _extra_models_option()
+    message = str(raised.value)
+    assert "invalid LAYA_EXTRA_MODELS" in message
+    assert "'my-ckpt'" in message, message
+
+
+def test_extra_models_reach_the_router_the_server_builds(monkeypatch):
+    # Registration happens before preload, so the names resolve on the Router
+    # itself and `registered` reports them beside the bundled checkpoints.
+    router, built = _server_router(monkeypatch, LAYA_EXTRA_MODELS=json.dumps({
+        "my-ckpt": "/tmp/ckpt",
+        "nested": ["org/repo", "folder"],
+    }))
+    assert router.resolve("my-ckpt") == "my-ckpt"
+    assert router.resolve("nested") == "nested"
+    assert router.registered["my-ckpt"]["source"] == "/tmp/ckpt"
+    assert built == []  # registering is lazy: nothing loads until a request names it
+
+    # The built-ins are untouched, and an extra name is accepted as
+    # LAYA_DEFAULT_MODEL now that the Router knows it.
+    assert set(router.registered) == {"my-ckpt", "nested"}
+    defaulted, _ = _server_router(
+        monkeypatch,
+        LAYA_EXTRA_MODELS='{"my-ckpt": "/tmp/ckpt"}',
+        LAYA_DEFAULT_MODEL="my-ckpt",
+    )
+    assert defaulted.default == "my-ckpt"
+
+
+def test_extra_models_refuse_the_names_router_refuses(monkeypatch):
+    # Validation is Router._add's: the env var is only the delivery mechanism,
+    # so a name that cannot be a checkpoint is fatal with core's own message.
+    for name in ("auto", "Bad Name", "not/a/checkpoint"):
+        with pytest.raises(SystemExit) as raised:
+            _server_router(monkeypatch, LAYA_EXTRA_MODELS=json.dumps({name: "/tmp/ckpt"}))
+        assert "checkpoint name" in str(raised.value), name
+
+    # And a default that names nothing registered is still fatal, unchanged.
+    from laya.serve import build_router
+
+    monkeypatch.setenv("LAYA_PRELOAD", "0")
+    monkeypatch.setenv("LAYA_EXTRA_MODELS", '{"my-ckpt": "/tmp/ckpt"}')
+    monkeypatch.setenv("LAYA_DEFAULT_MODEL", "other-ckpt")
+    with pytest.raises(SystemExit) as raised:
+        build_router()
+    assert "invalid LAYA_DEFAULT_MODEL" in str(raised.value)
+
+
+def test_extra_models_pin_over_http_and_do_not_leak_into_routing(monkeypatch):
+    # The end-to-end contract: `model=my-ckpt` reaches `predict` as the pin, a
+    # Jev id still means "let the router choose", and a path is still a 422.
+    router, built = _server_router(monkeypatch, LAYA_EXTRA_MODELS='{"my-ckpt": "/tmp/ckpt"}')
+    client = TestClient(create_app(router=router))
+
+    pinned = client.post("/v1/systemone", json={**REQ, "model": "my-ckpt"})
+    assert pinned.status_code == 200, pinned.text
+    assert built == ["my-ckpt"], built
+    assert pinned.json()["routing"]["model"] == "my-ckpt", pinned.json()
+
+    batch = client.post("/v1/systemone/batch", json={
+        "states": ["one"], "questions": REQ["questions"], "model": "my-ckpt"})
+    assert batch.status_code == 200, batch.text
+
+    unrouted = client.post("/v1/systemone", json={**REQ, "model": "jev-1"})
+    assert unrouted.status_code == 200, unrouted.text
+    assert unrouted.json()["routing"]["model"] in ("english", "multilingual"), unrouted.json()
+
+    refused = client.post("/v1/systemone", json={**REQ, "model": "/path/to/other"})
+    assert refused.status_code == 422, refused.text
+    assert "unknown model" in refused.json()["detail"]
+
+    # A registered name is a pin, not a routing target: the extra checkpoint is
+    # never picked for a state that did not name it.
+    plain = client.post("/v1/systemone", json=REQ)
+    assert plain.status_code == 200, plain.text
+    assert plain.json()["routing"]["model"] in ("english", "multilingual", "typed-decisions")
+    assert "my-ckpt" not in built[1:] or built[1:] == [], built

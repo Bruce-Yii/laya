@@ -35,6 +35,7 @@ Everything is environment variables, so one image serves a laptop dev run and a 
 | `LAYA_AUTO_TASK` | auto-route to the typed-decisions checkpoint | `0` |
 | `LAYA_IDLE_UNLOAD_SECONDS` | unload resident checkpoints after this many idle seconds; the next request loads its checkpoint again. Zero disables unloading | `0` |
 | `LAYA_DEFAULT_MODEL` | checkpoint a state with no language evidence falls back to; aliases such as `ml` resolve the way core resolves them, and an unresolvable name stops the server at startup | `english` |
+| `LAYA_EXTRA_MODELS` | JSON object `{name: source}` registering extra checkpoints beside the bundled ones: a Hub repo id or local checkpoint directory as a string, or a `["repo", "subfolder"]` pair. Names get the same `model=` pin a built-in does; a malformed value or bad name stops the server at startup | none |
 | `LAYA_API_KEY` | if set, require `Authorization: Bearer <key>` | none |
 | `LAYA_LOG_LEVEL` | uvicorn log level | `info` |
 | `LAYA_MAX_CONCURRENT` | requests admitted past auth at once; excess gets `503` | `16` |
@@ -141,7 +142,9 @@ now get the same answer.
 
 `model` is accepted so a Jev client can keep sending one. The public Hugging Face ids
 (`convaiinnovations/laya-multilingual`, `convaiinnovations/laya-typed-decisions`), the checkpoint
-names (`english`, `multilingual`, `typed-decisions`) and their aliases select a checkpoint.
+names (`english`, `multilingual`, `typed-decisions`) and their aliases select a checkpoint, and so
+does every name `LAYA_EXTRA_MODELS` registered on this server's Router -- including a name that
+re-points a built-in, which is how a fine-tune is served under `english` without a code change.
 `convaiinnovations/laya`, and any other value that is not a path or a Hub repo id -- including a
 Jev id like `jev-1` -- means "let the router choose", and the response's `routing` block records
 what was chosen and why. A value that looks like a filesystem path or an unpublished Hub id

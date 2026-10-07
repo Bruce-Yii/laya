@@ -728,9 +728,12 @@ your traffic is not English), `LAYA_MAX_LOADED` (checkpoints resident at
 once, 2 by default; raise it to 3 when `LAYA_AUTO_TASK` makes a third one
 reachable on demand, or the server rebuilds one every time routing switches),
 `LAYA_IDLE_UNLOAD_SECONDS` (unload idle checkpoints; `0` disables it, `300` frees device memory
-after five minutes and makes the next request pay a cold load), and `LAYA_API_KEY` (when set, clients must
+after five minutes and makes the next request pay a cold load), `LAYA_EXTRA_MODELS` (a JSON object
+`{"my-checkpoint": "/path/to/it"}` registering extra checkpoints — Hub repo ids, local directories
+or `["repo", "subfolder"]` pairs — beside the bundled ones), and `LAYA_API_KEY` (when set, clients must
 send `Authorization: Bearer <key>`). A client's `model` field is honoured when it
-names a Laya checkpoint (`english`/`multilingual`/`typed-decisions` or a published Hub id).
+names a Laya checkpoint (`english`/`multilingual`/`typed-decisions`, a `LAYA_EXTRA_MODELS` name,
+or a published Hub id).
 `jev-1` and `convaiinnovations/laya` still mean the router auto-selects by script/language.
 A path or an unpublished Hub id (`/path/to/checkpoint`, `org/repo`) is a 422 on both
 `/v1/systemone` and `/v1/systemone/batch` instead of being answered by another checkpoint.
