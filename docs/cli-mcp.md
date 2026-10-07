@@ -157,7 +157,7 @@ Laya does not open a network port.
 
 | Tool | What it does | Main inputs |
 |---|---|---|
-| `laya_status` | Reports the configured or actual device, CUDA availability, loaded checkpoints, preload state, readiness, and package versions. | none |
+| `laya_status` | Reports the device per loaded checkpoint (`checkpoint_devices`), the configured or actual device, CUDA availability, loaded checkpoints, preload state, readiness, and package versions. | none |
 | `laya_route` | Selects a checkpoint and returns its model, repository, and reason without running a forward pass. | `state`, `questions`, optional `model`, `task`, `lang`, `lang_guess` |
 | `laya_predict` | Runs typed questions and returns answers, routing metadata, latency, and the answering device when readable. | `state`, `questions`, optional `model` (`auto`, `english`, `multilingual`, or `typed-decisions`), `task`, `lang`, `lang_guess`, `max_len`, `head_max_len`, `min_confidence` |
 | `laya_shortlist` | Shortlists a many-option choice question, then answers it and returns the shortlist metadata. | `state`, `questions`, optional `model`, `k` (default `20`), `task`, `lang`, `lang_guess`, `max_len`, `head_max_len`, `min_confidence` |
