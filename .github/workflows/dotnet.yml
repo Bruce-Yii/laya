@@ -117,7 +117,15 @@ jobs:
       # incomplete snapshot at the fetch, so this is no longer the only thing between a
       # truncated download and a confusing failure; not provoking the throttle is simply
       # cheaper than diagnosing it, and this lane is advisory.
-      max-parallel: 1
+      #
+      # TWO, not one. One was the first attempt and it cost too much: measured from this PR's own
+      # cells, serialising takes the parity critical path from 10:56 to 30:08. Two keeps the peak
+      # well below the seven concurrent fetches that provoked the throttle while costing roughly
+      # half of that. And serialising is no longer the load-bearing half of the fix -- the
+      # download sites now refuse an incomplete snapshot AT THE FETCH, naming the file, so a
+      # throttled fetch fails immediately and legibly instead of three minutes later inside a
+      # tokenizer constructor. This only reduces how often that path is taken.
+      max-parallel: 2
       matrix:
         include:
           - name: english
