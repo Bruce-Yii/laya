@@ -502,7 +502,7 @@ questions = {
         "criteria": {
             "billing": "invoices, payments, refunds",
             "technical": "bugs, outages, system errors",
-            "sales": "pricing, new contracts",
+            "sales": "pricing, new contracts, plan upgrades",
             "other": "everything else"
         }
     },
