@@ -75,8 +75,9 @@ laya-train --data tickets.csv --text-column body --label-column department --dry
 ```
 
 `--dry-run` builds the training items with the tokenizer and config of `--base`, without loading
-its weights or training, and prints how many rows were read, how many items they produced, and how many questions
-were skipped and why:
+its weights or training, and prints how many rows were read, how many items they produced, how many
+questions were skipped and why, and the optimizer-update budget the configured defaults will spend
+(see [Sizing a run in optimizer updates](#sizing-a-run-in-optimizer-updates)):
 
 | reason | the question was skipped because |
 |---|---|
@@ -84,6 +85,31 @@ were skipped and why:
 | `invalid_question`, `invalid_target` | the question or its answer could not be read |
 | `options_collapsed` | the head budget left two options with the same tokens (#538) |
 | `options_beyond_max_len` | the question's options do not fit in `max_len` |
+
+### Sizing a run in optimizer updates
+
+`--epochs`, `--micro-batch` and `--grad-accum` decide how much training a run gets, but the number
+that matters is the optimizer updates it performs. An epoch is split into
+`ceil(items / micro_batch)` micro-batches; one update runs per `grad_accum` micro-batches, plus one
+for the final partial window of each epoch, which steps once even when it holds fewer:
+
+```
+updates = epochs * ceil(ceil(train_items / micro_batch) / grad_accum)
+```
+
+`--dry-run` and the start of a run both print this budget, from the post-calibration training
+count, with the effective batch:
+
+```
+optimizer budget: 1100 train item(s), effective batch up to 64 (micro_batch 8 x grad_accum 8), 72 optimizer updates over 4 epoch(s)
+```
+
+The defaults (4 epochs, effective batch 64) are the notebook's; on typed-decisions' 6,000
+decisions they work out to about 376 updates, fewer once the calibration slice is held out. That
+number is a reference for comparing runs of different sizes, not a cutoff: the same defaults on
+1,100 items give about 72 updates, and [#963](https://github.com/NandhaKishorM/laya/issues/963)
+measured a head that collapsed there while 8 epochs still failed on the task itself. A small dataset
+therefore needs more epochs to reach a similar update count.
 
 ### What a run writes
 
