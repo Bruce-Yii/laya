@@ -322,12 +322,16 @@ agent.system_one(state, questions)
 Attach, detach or scope hooks after construction.
 
 ```python
-agent.add_hook(Metrics())          # attach at runtime
-agent.remove_hook(Metrics())       # by identity
+metrics = Metrics()
+agent.add_hook(metrics)            # attach at runtime
+agent.remove_hook(metrics)         # by identity: keep the instance to remove it
 
 with agent.hooks_installed(DebugDump()):
     agent.system_one(state, questions)   # DebugDump only here
 ```
+
+`remove_hook` compares with `is`, so a fresh `Metrics()` matches nothing: it returns `False` and
+the installed hook keeps running.
 
 ## Base class and process-wide defaults
 
