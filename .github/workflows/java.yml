@@ -394,6 +394,22 @@ jobs:
     timeout-minutes: ${{ matrix.timeout }}
     strategy:
       fail-fast: false
+      # One cell at a time, because every cell that needs weights downloads them from the same
+      # Hugging Face repo UNAUTHENTICATED, and the hub rate-limits that. This matrix grew a third
+      # cell in this change, and `dotnet.yml`'s parity matrix runs four of its own against the
+      # same repo in the same workflow run, so the peak was seven concurrent unauthenticated
+      # fetches of one repo. Under that, `hf-xet` returned a TRUNCATED file without raising: the
+      # 34 MB multilingual `tokenizer.json` arrived empty, the download step reported success, and
+      # the failure surfaced ninety seconds later as `EOF while parsing a value at line 1
+      # column 0` from inside a tokenizer constructor. Reproduced twice on this branch while the
+      # same job passed on a branch that adds no cell.
+      #
+      # Serialising costs wall-clock on an advisory lane and removes the pressure this change
+      # added. It is a MITIGATION, not the fix: the real defect is that nothing verifies a
+      # download before using it, and the real fix is an `HF_TOKEN` for the higher rate limit or
+      # a size/digest check at the fetch. Both live outside this directory, so they are not
+      # bundled here.
+      max-parallel: 1
       matrix:
         include:
           # Tokenizers and configs only -- no weights, nothing traced. The three families here
