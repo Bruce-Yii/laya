@@ -517,14 +517,22 @@ public final class Hooks {
                                 Policy policy) {
         for (Hook hook : hooks) {
             try {
-                if (policy.lock() == null) {
+                // Read ONCE into a local. `policy.lock()` is a record accessor today, so the two
+                // calls this replaces did return the same monitor -- but nothing in the type says
+                // they must, and `lock()` on one instance with `unlock()` on another leaves the
+                // first held with no owner able to release it. CodeQL's `java/unreleased-lock`
+                // flagged exactly that shape here, in the one file where a stuck lock would wedge
+                // every hooked call rather than one. Neither the pattern scanner nor a 14-mutant
+                // sweep saw it: it is a property of which paths reach the unlock, not of a line.
+                Lock lock = policy.lock();
+                if (lock == null) {
                     call(hook, event, ctx, policy.timeout());
                 } else {
-                    policy.lock().lock();
+                    lock.lock();
                     try {
                         call(hook, event, ctx, policy.timeout());
                     } finally {
-                        policy.lock().unlock();
+                        lock.unlock();
                     }
                 }
             } catch (RuntimeException problem) {
@@ -636,6 +644,15 @@ public final class Hooks {
         // what the branch below has to read, or 9.999999 lands in the wrong form.
         String scientific = String.format(Locale.ROOT, "%.5e", value);
         int marker = scientific.indexOf('e');
+        if (marker < 0) {
+            // Unreachable from a `Duration`, whose `toNanos()` is a long, so `value` is always
+            // finite -- but this method is PUBLIC so a caller's own sink can emit the same line,
+            // and `%.5e` of a non-finite double renders "NaN"/"Infinity", neither of which holds
+            // an 'e'. `substring(0)` would then hand the whole word to `Integer.parseInt`.
+            // CodeQL raised the uncaught NumberFormatException; this makes the guard explicit
+            // rather than resting on an invariant the signature does not state.
+            return scientific;
+        }
         int exponent = Integer.parseInt(scientific.substring(marker + 1));
         if (exponent < -4 || exponent >= 6) {
             return trimZeros(scientific.substring(0, marker))
