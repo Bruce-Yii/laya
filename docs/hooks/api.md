@@ -285,7 +285,7 @@ agent.predict(...)          # alias of system_one
 
 ```python
 Router(
-    models=None, device=None, token=None, max_loaded=2, default="english",
+    models=None, device=None, token=None, max_loaded=2, default="multilingual",
     auto_task_detection=False, standalone_repos=False, preload=False, lang_guess=None,
     hooks=None, on_predict_start=None, on_predict_end=None,
     hooks_raise=True, hooks_concurrent=True, hooks_timeout=None,
