@@ -74,9 +74,13 @@ result = app.invoke({"input": "I was billed twice for last month's subscription.
 print(result["response"])  # -> "Handling billing..."
 ```
 
-`confidence_threshold` reads `answer_confidence`, the calibrated `max(p)` confidence the
-calibration figures describe, when the answer carries it, and falls back to the entropy
-`confidence` otherwise.
+`confidence_threshold` reads `answer_confidence`, the `max(p)` confidence the calibration figures
+are computed on, when the answer carries it, and falls back to the entropy `confidence` otherwise.
+It is not calibrated as shipped: `laya-multilingual` ships `temperature: [1.0, 1.0, 1.0]` and no
+`temperature_by_options` at all, and the english checkpoint's `choice:11+` entry is refused by the
+loader's own clamp with a warning that says to treat it as uncalibrated. Fit and validate the
+threshold on held-out data at the option counts your workload uses -- see the README's
+[Calibration](https://github.com/NandhaKishorM/laya#calibration) section.
 
 ### Routing with the full conversation
 

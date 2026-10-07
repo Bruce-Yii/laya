@@ -117,10 +117,18 @@ Both synchronous `query()` and asynchronous `aquery()` are supported.
 
 ## 4. Confidence Threshold Gating
 
-Like Laya's LangChain integration, `LayaSingleSelector` and `LayaQueryRouter` read calibrated `answer_confidence` (`max(p)`):
+Like Laya's LangChain integration, `LayaSingleSelector` and `LayaQueryRouter` read `answer_confidence` (`max(p)`):
 
 - **Automatic Fallback:** Specify `fallback_index` (or `fallback_key`) to seamlessly divert uncertain queries to a safe default engine.
 - **Strict Guarding:** Set `raise_on_low_confidence=True` on `LayaSingleSelector` to raise `LayaLowConfidenceError` when input is ambiguous, allowing caller escalation.
+
+`answer_confidence` is the quantity temperature scaling fits and the one every calibration figure
+in the repository is computed on, which is why the threshold reads it rather than the entropy
+`confidence`. It is not calibrated as shipped: `laya-multilingual` ships no fitted temperatures at
+all (`temperature: [1.0, 1.0, 1.0]`, empty `temperature_by_options`), and english's `choice:11+` is
+refused by the loader's own clamp with a warning that says to treat it as uncalibrated. Fit and
+validate any threshold on held-out data at the option counts your workload uses -- see the
+README's [Calibration](https://github.com/NandhaKishorM/laya#calibration) section.
 
 ---
 

@@ -101,12 +101,20 @@ except LayaTaskGuardError as e:
 
 ---
 
-## 3. Calibrated Confidence Gating
+## 3. Confidence Gating
 
-`LayaCrewRouter` gates on calibrated `answer_confidence` (`max(p)`):
+`LayaCrewRouter` gates on `answer_confidence` (`max(p)`):
 
 - **Automatic Fallback:** Specify `fallback_agent_index` to route ambiguous tasks to a human supervisor or general lead agent.
 - **Strict Guarding:** Set `raise_on_low_confidence=True` to raise `LayaLowConfidenceError` when a task cannot be matched to an agent role with sufficient confidence.
+
+`answer_confidence` is the quantity temperature scaling fits and the one every calibration figure
+in the repository is computed on, which is why the threshold reads it rather than the entropy
+`confidence`. It is not calibrated as shipped: `laya-multilingual` ships no fitted temperatures at
+all (`temperature: [1.0, 1.0, 1.0]`, empty `temperature_by_options`), and english's `choice:11+` is
+refused by the loader's own clamp with a warning that says to treat it as uncalibrated. Fit and
+validate any threshold on held-out data at the option counts your workload uses -- see the
+README's [Calibration](https://github.com/NandhaKishorM/laya#calibration) section.
 
 ---
 
