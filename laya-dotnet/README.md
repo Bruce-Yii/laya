@@ -215,8 +215,8 @@ Question.Noul(
 ### Instructions
 
 `instructions` is `object`, not `string`. A string is used exactly as written, which is what you
-normally want. Any other value is serialized as JSON with non-ASCII characters escaped, matching
-the Python SDK's behavior with non-string instructions. Refer to state fields in backticks
+normally want. Any other value is serialized as JSON with non-ASCII characters kept as written,
+matching the Python SDK's behavior with non-string instructions. Refer to state fields in backticks
 (`` `body` ``), as the presets do.
 
 ### QuestionSet
