@@ -72,10 +72,11 @@ using Laya;
 This SDK runs **ONNX** models (opset 18), in either of two artifact layouts. The
 **fused** layout — this repo's own `export_onnx.py` — is a `model.onnx` graph with its weights in
 a `model.onnx.data` sidecar beside it, plus `rl_agent_config.json` and `tokenizer/`. The
-**split** layout — produced by `laya-ts`'s exporter — is a self-contained `encoder.onnx` and
-`head.onnx` pair with no external-data sidecar, plus the same `rl_agent_config.json` and a
-root-level `tokenizer.json`. No Python is needed at runtime for either; Python (or, for the split
-layout, `laya-ts`) is used once, to export the model from the published PyTorch checkpoint.
+**split** layout — produced by `laya-ts`'s exporter — is an `encoder.onnx` and `head.onnx`
+pair, each with its own `.data` sidecar when that graph's weights exceed the protobuf limit,
+plus the same `rl_agent_config.json` and a root-level `tokenizer.json`. No Python is needed at
+runtime for either; Python (or, for the split layout, `laya-ts`) is used once, to export the
+model from the published PyTorch checkpoint.
 
 The engine auto-detects which layout a directory holds — nothing in the API asks you to choose
 one. Point it at a checkpoint directory with `LayaEngine.FromDirectory(...)`,
