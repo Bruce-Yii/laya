@@ -191,8 +191,13 @@ inference. The two budgets do travel to a remote node, in the request body, up t
 
 `lang` pins the language the query is routed and answered in -- selecting the answering
 checkpoint's per-language calibration instead of relying on built-in detection -- and
-`min_confidence` is core's abstention gate: a decision under it comes back as an abstention rather
-than a forced selection. Both are read by `Agent.predict` and `Router.predict` alike and accepted by
+`min_confidence` is core's abstention gate, and that gate marks rather than withholds: an answer
+under it comes back carrying `low_confidence: true`, `abstention: "abstained"` and
+`abstention_threshold` on the raw decision kept in `last_decision`, while the `ToolSelection` this
+selector returns is still the argmax. What gets selected is changed by `confidence_threshold` and
+the knobs in [Confidence Threshold Gating](#4-confidence-threshold-gating); a `min_confidence` on
+its own reports the abstention and selects anyway.
+Both are read by `Agent.predict` and `Router.predict` alike and accepted by
 `laya-serve` in the request body, so a selector forwards them on the local and the remote path. An
 unset one is omitted, not sent as `None`, so it cannot shadow the deployment's own default;
 `min_confidence=0.0` and `lang=""` are real values and are forwarded as given.
@@ -201,6 +206,6 @@ unset one is omitted, not sent as `None`, so it cannot shadow the deployment's o
 selector = LayaSingleSelector(
     instructions="Which tool or query engine is best suited to answer this query?",
     lang="de",             # answer German queries in German
-    min_confidence=0.3,    # abstain when no tool clears a 0.3 confidence
+    min_confidence=0.3,    # report an abstention below 0.3; the selection is still made
 )
 ```

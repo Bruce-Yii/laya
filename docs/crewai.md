@@ -183,8 +183,13 @@ inference. The two budgets do travel to a remote node, in the request body, up t
 
 `lang` pins the language the task is routed and answered in -- selecting the answering
 checkpoint's per-language calibration instead of relying on built-in detection -- and
-`min_confidence` is core's abstention gate: a decision under it comes back as an abstention rather
-than a forced delegation. Both are read by `Agent.predict` and `Router.predict` alike and accepted by
+`min_confidence` is core's abstention gate, and that gate marks rather than withholds: an answer
+under it comes back carrying `low_confidence: true`, `abstention: "abstained"` and
+`abstention_threshold` on the raw decision kept in `last_decision`, while the agent this router
+returns is still the argmax. Which agent is delegated to is changed by `confidence_threshold`, with
+`fallback_agent_index` or `raise_on_low_confidence`; a `min_confidence` on its own reports the
+abstention and delegates anyway.
+Both are read by `Agent.predict` and `Router.predict` alike and accepted by
 `laya-serve` in the request body, so a router or guard forwards them on the local and the remote
 path. An unset one is omitted, not sent as `None`, so it cannot shadow the deployment's own default;
 `min_confidence=0.0` and `lang=""` are real values and are forwarded as given.
@@ -193,6 +198,6 @@ path. An unset one is omitted, not sent as `None`, so it cannot shadow the deplo
 router = LayaCrewRouter(
     confidence_threshold=0.80,
     lang="fr",             # route a French-language crew in French
-    min_confidence=0.3,    # abstain on a delegation the model is not sure about
+    min_confidence=0.3,    # report an abstention below 0.3; the delegation is still made
 )
 ```
