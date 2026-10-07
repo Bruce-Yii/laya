@@ -154,11 +154,12 @@ jobs:
       # Without LAYA_CHECKPOINTS the checkpoint-backed factories abort by assumption and the rest
       # run. `--min-tests` is what stops an aborted suite from looking like a pass.
       #
-      # Measured: 703 register here, 686 run, 17 abort on a checkpoint this lane does not have.
-      # Exact, not padded -- it stood at 680 long enough for the real figure to pass it by, which
-      # is how a floor stops being one. ONE below the JDK-matrix lane's floor on purpose: that
-      # lane passes `-PtestJavaVersion`, which is what makes `TestJvmVersionTest` run instead of
-      # skip, so it executes 687. Same suite, one more test, because the flag enables it.
+      # Measured on the merged tree: 934 register here, 917 run, 17 abort on a checkpoint this
+      # lane does not have. Exact, not padded -- the floor stood at 680 long enough for the real
+      # figure to pass it by, which is how a floor stops being one. ONE below the JDK-matrix
+      # lane's floor on purpose: that lane passes `-PtestJavaVersion`, which is what makes
+      # `TestJvmVersionTest` run instead of skip, so it executes 918. Same suite, one more test,
+      # because the flag enables it. The step below is where the number is justified.
       - name: Tests that need no model
         working-directory: laya-java
         run: ./gradlew --no-daemon test
@@ -334,16 +335,23 @@ jobs:
       # dropped, Gradle exits 0 and the floor alone exits 0 on 488 tests, having run JDK 17 twice
       # and reported it as two JDKs. With `--require-passed` it exits 1.
       #
-      # 814, not the build lane's 813, and the one is the point. This lane runs one test MORE
-      # than that one -- `TestJvmVersionTest` is `@EnabledIfSystemProperty` and only enabled
-      # here -- so 818 run against a shared floor of 813 would be a margin of 5, and the
-      # smallest class this lane could lose whole is `PreTokenizerTablesTest` at exactly 5.
-      # That is not hypothetical. Measured on the previous shared floor of 794, with the
-      # smallest `hooks.json` section emptied and no per-section guard: the build lane ran 793
-      # and exited 1 by exactly one test, and this lane ran 794 -- exactly ON the floor, so
-      # `check_test_results` exited 0 and the vacuity was invisible in the one lane that had the
-      # margin to hide it. The emptiness guard inside `HooksTest.section` is the real fix for
-      # that case; this keeps the arithmetic from being what saved it.
+      # 918, not the build lane's 917, and the one is the point: this lane runs one test MORE
+      # than that one, because `TestJvmVersionTest` is `@EnabledIfSystemProperty` and only
+      # enabled here. Both are EXACT, with no margin, for the reason the build lane gives --
+      # three classes here run exactly one test, so no positive margin can bind them.
+      #
+      # A shared number is not a theoretical problem. Measured on an earlier shared floor of
+      # 794, with the smallest `hooks.json` section emptied and no per-section guard: the build
+      # lane ran 793 and exited 1 by exactly one test, while this lane ran 794 -- exactly ON
+      # the floor, so `check_test_results` exited 0 and the vacuity was invisible in the one
+      # lane that had the margin to hide it. The emptiness guard inside `HooksTest.section` is
+      # the real fix for that case; the per-lane floors keep the arithmetic from being what
+      # saved it.
+      #
+      # The exact floor was prepared without a JDK 21 to test on, so whether 21 registers the
+      # same count as 17 and 24 was an argument -- no JDK-version-gated assumptions exist, and
+      # 17 and 24 agreed -- rather than a measurement. CI has since run all three green at
+      # these floors, so it is a measurement now.
       - name: Model-free suite was not vacuous, and ran on the right JVM
         if: ${{ !cancelled() }}
         run: >
