@@ -660,8 +660,14 @@ Routing asks one question: *can the English checkpoint read this state?* The bui
 ```python
 from laya.lang import analyse
 analyse("Care este ora in Tokyo?")
-# {'script': 'latin', 'language': 'en', 'is_english': True}   -> the English checkpoint
+# {'script': 'latin', 'script_profile': {'latin': 1.0}, 'language': 'en', 'is_english': True,
+#  'language_undecided': False, 'diacritic_rate': 0.0, 'non_latin_fraction': 0.0,
+#  'mixed_segment': None}                                     -> the English checkpoint
 ```
+
+`is_english` is the key routing reads. `language_undecided` separates "read as English" from
+"carried no usable signal, so the default applies", and `mixed_segment` names the line or field
+that made a mostly-English state non-English (`None` when none did).
 
 If you already run a language-identification model, hand routing the answer instead of relying on the heuristic. `lang_guess` takes a language code or a callable receiving the state, and is checked after an explicit `lang=` and before detection:
 
