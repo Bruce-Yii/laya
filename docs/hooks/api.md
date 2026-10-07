@@ -48,7 +48,7 @@ class PredictContext:
 |---|---|---|---|---|
 | `states` | `list` | always | yes (start) | the states for this call. `system_one`/`Router.predict` pass one; `Agent.predict_batch` passes many; `Router.predict_batch` passes one per request. A start hook may replace the list. |
 | `questions` | `dict` | always | yes (start) | the questions. A start hook may replace the dict. |
-| `run_id` | `str` | always | no | a unique id shared by every hook of this call. Use it to correlate events and spans. |
+| `run_id` | `str` | always | no | a unique id shared by the predict events of this call (`on_predict_start`, `on_predict_end`, `on_error`). `on_route`, `on_load` and `on_evict` are dispatched with contexts of their own, so their `run_id` differs even within one `Router.predict`. Use it to correlate events and spans. |
 | `results` | `list \| None` | end (and on a skip) | yes (end) | per-state result dicts, each shaped like `system_one`'s return. `None` until inference finishes. |
 | `decision` | `dict \| None` | Router only | yes (route) | the `RouteDecision` (a `dict`) that selected the checkpoint. |
 | `model` | `str \| None` | always | no | the checkpoint id: `Agent.model_id` for an Agent, the resolved alias (for example `"english"`) for a Router. |
