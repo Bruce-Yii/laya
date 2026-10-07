@@ -226,7 +226,7 @@ caller sizing states by character count cannot see the cut anywhere else in the 
 | `routing` key | meaning |
 |---|---|
 | `model` | the checkpoint that answered: `english`, `multilingual` or `typed-decisions` |
-| `repo` | its public Hugging Face id |
+| `repo` | where it was loaded from, as `repo` or `repo/subfolder`. The default server loads all three from the `convaiinnovations/laya` bundle, so `multilingual` and `typed-decisions` report `convaiinnovations/laya/multilingual` and `convaiinnovations/laya/typed-decisions` -- a readable id, not a Hub repo id to fetch with |
 | `reason` | the sentence for the choice, naming the evidence it acted on |
 | `detection` | `laya.lang.analyse()` on the state -- `script`, `script_profile`, `language`, `is_english`, `language_undecided`, `diacritic_rate`, `non_latin_fraction`, `mixed_segment` -- or `null` when the route decided before reading the text |
 | `workflow` | the typed-decisions workflow the question ids match, or `null` |
