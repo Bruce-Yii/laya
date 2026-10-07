@@ -124,21 +124,16 @@ public final class Decoder {
      * plausible for a well-trained head, which is what makes it the wrong kind of bug.
      */
     public static float[] actionProbabilities(float[] actLogits) {
-        // The width the graph actually produced, except for an empty block.
-        //
-        // Padding a SINGLE column up to two turned a probability of 1.0 into sigmoid(logit) -- a
-        // plausible-looking number for a value the model never produced, in the field callers
-        // gate escalation on. That is fixed here by using the real width.
-        //
-        // An EMPTY block still pads to two, giving {0.5, 0.5}, because that is the behaviour
-        // a1edd45 settled on and `DecoderTest.emptyActionLogitsAreNeutral` asserts. It is NOT
-        // what the reference does -- `laya/onnx_agent.py:694` reads `act[offset + r, 0]`, so zero
-        // columns raise IndexError there, and 0.5 is a number no model produced being published
-        // in an escalation field. Changing it is a behaviour change to a merged decision, so it
-        // belongs in its own change against that test rather than buried in this one; raised with
-        // the maintainer separately. Reverting to `Math.max(2, ...)` wholesale would have taken
-        // the single-column fix with it, which is why the two cases are split.
-        int width = actLogits.length == 0 ? 2 : actLogits.length;
+        if (actLogits.length == 0) {
+            // Published as NaN before this. The reference indexes act[r, 0] and raises; an
+            // escalation signal that reads NaN is worse than one that refuses.
+            throw new IllegalArgumentException(
+                    "the graph produced no action logits, so there is no action probability");
+        }
+        // The width the graph actually produced. Padding a single column up to two turned a
+        // probability of 1.0 into sigmoid(logit) -- a plausible-looking number for a value the
+        // model never produced, in the field callers gate escalation on.
+        int width = actLogits.length;
         double max = Double.NEGATIVE_INFINITY;
         for (int i = 0; i < width; i++) {
             double value = i < actLogits.length ? actLogits[i] : 0.0;
