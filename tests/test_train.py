@@ -1173,13 +1173,11 @@ class OptimizerBudgetTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
             make_checkpoint(root / "base", make_tokenizer())
-            data = root / "train.jsonl"
-            data.write_text("\n".join(json.dumps(r) for r in rows(2)), encoding="utf-8")
             config = TrainConfig(epochs=3, micro_batch=4, grad_accum=2, calib_frac=0.25, log_every=0)
 
             buf = io.StringIO()
-            with contextlib.redirect_stdout(buf):
-                summary = dry_run(str(data), str(root / "base"), config)
+            with patch("laya.train.read_data", return_value=rows(2)), contextlib.redirect_stdout(buf):
+                summary = dry_run("synthetic.jsonl", str(root / "base"), config)
 
             # The budget must come from the post-calibration split, not the raw valid-item count.
             self.assertGreater(summary["calibration_items"], 0)

@@ -104,12 +104,14 @@ count, with the effective batch:
 optimizer budget: 1100 train item(s), effective batch up to 64 (micro_batch 8 x grad_accum 8), 72 optimizer updates over 4 epoch(s)
 ```
 
-The defaults (4 epochs, effective batch 64) are the notebook's; on typed-decisions' 6,000
-decisions they work out to about 376 updates, fewer once the calibration slice is held out. That
-number is a reference for comparing runs of different sizes, not a cutoff: the same defaults on
-1,100 items give about 72 updates, and [#963](https://github.com/NandhaKishorM/laya/issues/963)
-measured a head that collapsed there while 8 epochs still failed on the task itself. A small dataset
-therefore needs more epochs to reach a similar update count.
+The defaults (4 epochs, effective batch 64) are the notebook's. On typed-decisions' 6,000
+decisions the default 400-item calibration slice leaves 5,600 training items, so a default run
+spends **352** updates — 376 only if no slice were held out. That number is a reference for
+comparing runs of different sizes, not a cutoff: 1,100 *training* items at the same settings give
+72 updates (64 when 1,100 is the pre-split count and the 10% slice holds 110 out), and
+[#963](https://github.com/NandhaKishorM/laya/issues/963) measured a head that collapsed there while
+8 epochs still failed on the task itself. A small dataset therefore needs more epochs to reach a
+similar update count.
 
 ### What a run writes
 
