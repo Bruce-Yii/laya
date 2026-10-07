@@ -403,7 +403,9 @@ public final class Router implements AutoCloseable, Predictor {
     public static final class Builder {
 
         private final Map<Checkpoint, ModelSpec> overrides = new LinkedHashMap<>();
-        private Checkpoint defaultCheckpoint = Checkpoint.ENGLISH;
+        // Follows the reference, which moved this to multilingual: undecided Latin text is no
+        // evidence of English, and multilingual leads on 50 of the 51 languages swept.
+        private Checkpoint defaultCheckpoint = Checkpoint.MULTILINGUAL;
         private boolean autoTaskDetection;
         private boolean standaloneRepos;
         private LanguageHint langGuess;

@@ -165,10 +165,14 @@ public final class Shortlist {
      */
     public static Ranking rank(Object state, Map<String, ?> criteria, Embedder embedder, int k,
             String instructions) {
-        Map<String, Object> options = new LinkedHashMap<>();
         if (criteria == null) {
             throw new IllegalArgumentException("criteria must not be null");
         }
+        // Validated BEFORE the copy. Copying into a LinkedHashMap preserves whatever order the
+        // caller's map had, so checking afterwards can never fail -- and order decides which labels
+        // survive the cut here, not just how they are numbered.
+        Question.requireOrderedCriteria(criteria);
+        Map<String, Object> options = new LinkedHashMap<>();
         options.putAll(criteria);
         if (options.isEmpty()) {
             throw new IllegalArgumentException("choice criteria must contain at least one option");

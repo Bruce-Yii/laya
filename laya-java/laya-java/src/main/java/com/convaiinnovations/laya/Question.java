@@ -88,11 +88,7 @@ public final class Question {
     public static Question choice(String instructions, Map<String, ?> criteria) {
         requireInstructions(instructions);
         require(criteria != null && !criteria.isEmpty(), "a choice question needs criteria");
-        require(!orderIsUnspecified(criteria),
-                "a choice's options are positional, so the criteria map's iteration order decides "
-                + "what is asked and how the answer is labelled, and "
-                + criteria.getClass().getName() + " does not specify one. Use a LinkedHashMap, or "
-                + "Question.choiceOf(instructions, Map.entry(label, description), ...)");
+        requireOrderedCriteria(criteria);
         return new Question(Type.CHOICE, instructions, new LinkedHashMap<>(criteria), null,
                 null, null);
     }
@@ -127,6 +123,15 @@ public final class Question {
         return new Question(Type.CHOICE, instructions, ordered, null, null, null);
     }
 
+    /** Refuses a criteria map whose iteration order is not defined. For in-package callers. */
+    static void requireOrderedCriteria(Map<String, ?> criteria) {
+        require(!orderIsUnspecified(criteria),
+                "a choice's options are positional, so the criteria map's iteration order decides "
+                + "what is asked and how the answer is labelled, and "
+                + criteria.getClass().getName() + " does not specify one. Use a LinkedHashMap, or "
+                + "Question.choiceOf(instructions, Map.entry(label, description), ...)");
+    }
+
     /**
      * Whether this map's own contract leaves its iteration order unspecified.
      *
@@ -138,8 +143,13 @@ public final class Question {
      * differently after a restart.
      *
      * <p>A denylist rather than an allowlist, because a false refusal breaks working code: Guava's
-     * {@code ImmutableMap} and {@code Collections.unmodifiableMap(aLinkedHashMap)} both iterate in a
-     * defined order this method cannot see, and refusing them would be wrong.
+     * {@code ImmutableMap} iterates in insertion order and refusing it would be wrong.
+     *
+     * <p>So this does not catch everything. {@code Collections.unmodifiableMap}/
+     * {@code synchronizedMap}/{@code checkedMap} are the same wrapper class whichever map they
+     * wrap, so a wrapped {@code HashMap} is accepted and its order is not the caller's. Reaching
+     * the wrapped map needs {@code --add-opens} into {@code java.base}. Wrap a
+     * {@code LinkedHashMap}, or use {@link #choiceOf}.
      */
     private static boolean orderIsUnspecified(Map<String, ?> criteria) {
         if (criteria.size() < 2) {
@@ -148,13 +158,15 @@ public final class Question {
         if (criteria instanceof LinkedHashMap || criteria instanceof SortedMap) {
             return false;
         }
-        // By class, not by `instanceof`: LinkedHashMap IS a HashMap, so an instanceof test would
-        // reject the very map this is meant to accept.
-        Class<?> type = criteria.getClass();
-        if (type == HashMap.class || type == Hashtable.class || type == WeakHashMap.class
-                || type == IdentityHashMap.class || type == ConcurrentHashMap.class) {
+        // `instanceof`, so a subclass is caught too: `class Mine extends HashMap {}` iterates in
+        // hash order and was being accepted. The ordered types are returned above, so this cannot
+        // reject a LinkedHashMap.
+        if (criteria instanceof HashMap || criteria instanceof Hashtable
+                || criteria instanceof WeakHashMap || criteria instanceof IdentityHashMap
+                || criteria instanceof ConcurrentHashMap) {
             return true;
         }
+        Class<?> type = criteria.getClass();
         // `Map.of` and `Map.copyOf` with two or more entries. The class is package-private, so its
         // name is the only handle on it; it has been stable since the factories arrived in 9. The
         // single-entry form is a different class and cannot be misordered, so it is not named here.

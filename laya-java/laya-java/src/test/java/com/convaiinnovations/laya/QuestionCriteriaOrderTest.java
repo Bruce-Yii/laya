@@ -128,6 +128,51 @@ class QuestionCriteriaOrderTest {
                 renderedOptions(Question.choice("Which?", Collections.unmodifiableMap(inner))));
     }
 
+    /** Nothing overridden: it iterates in hash order exactly as HashMap does. */
+    private static final class SubclassOfHashMap<K, V> extends HashMap<K, V> {
+        private static final long serialVersionUID = 1L;
+    }
+
+    /** Nothing overridden: it keeps LinkedHashMap's insertion order. */
+    private static final class SubclassOfLinkedHashMap<K, V> extends LinkedHashMap<K, V> {
+        private static final long serialVersionUID = 1L;
+    }
+
+    @Test
+    @DisplayName("a subclass of an unordered map is refused too, not just the exact class")
+    void aSubclassOfHashMapIsRefused() {
+        Map<String, Object> c = new SubclassOfHashMap<>();
+        c.put("refund", "money back");
+        c.put("escalate", "to a human");
+        c.put("ignore", "no action");
+        assertEquals(List.of("ignore", "escalate", "refund"), new ArrayList<>(c.keySet()));
+        assertThrows(IllegalArgumentException.class, () -> Question.choice("Which?", c));
+    }
+
+    @Test
+    @DisplayName("a subclass of an ordered map is still accepted")
+    void aSubclassOfLinkedHashMapIsAccepted() {
+        Map<String, Object> c = new SubclassOfLinkedHashMap<>();
+        c.put("refund", "money back");
+        c.put("escalate", "to a human");
+        assertEquals(List.of("refund", "escalate"), renderedOptions(Question.choice("Which?", c)));
+    }
+
+    @Test
+    @DisplayName("Shortlist refuses it too: order decides which labels survive the cut")
+    void shortlistRefusesAnUnorderedMap() {
+        Map<String, Object> c = new HashMap<>();
+        c.put("refund", "money back");
+        c.put("escalate", "to a human");
+        c.put("ignore", "no action");
+        // Shortlist copied into a LinkedHashMap before validating, so the guard never fired and a
+        // different option survived the cut purely because of the map's type.
+        assertThrows(IllegalArgumentException.class,
+                () -> Shortlist.rank("state", c, texts -> {
+                    throw new AssertionError("the embedder must not be reached");
+                }, 2));
+    }
+
     @Test
     @DisplayName("the ordered-entry factory needs no map at all, so order cannot be lost")
     void orderedEntriesFactory() {

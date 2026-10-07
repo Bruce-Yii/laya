@@ -45,7 +45,9 @@ public sealed class LayaRouterOptions
     /// non-English evidence. Default
     /// <see cref="LayaCheckpoint.English"/>, matching Python's default.
     /// </summary>
-    public LayaCheckpoint Default { get; set; } = LayaCheckpoint.English;
+    // Follows the reference, which moved this to multilingual: undecided Latin text is no
+    // evidence of English, and multilingual leads on 50 of the 51 languages swept.
+    public LayaCheckpoint Default { get; set; } = LayaCheckpoint.Multilingual;
 
     /// <summary>
     /// Whether <see cref="LayaRouter.Route"/> may pick <see cref="LayaCheckpoint.TypedDecisions"/>

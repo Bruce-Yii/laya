@@ -492,10 +492,16 @@ that belonged to `ignore`. It is at least reproducible, because `String.hashCode
 `Map.of` is worse: it salts its table per JVM, so three runs of one program gave three different
 orders -- the same question answering differently after a restart.
 
-`Question.choice` therefore refuses a map whose contract leaves the order unspecified -- `HashMap`,
-`Map.of`/`Map.copyOf` with two or more options, `ConcurrentHashMap`, `Hashtable`, `WeakHashMap`,
-`IdentityHashMap` -- and names the fix. A `LinkedHashMap`, a `SortedMap`, an unmodifiable view of
-either, or any single-option map is accepted; one option cannot be out of order.
+`Question.choice` therefore refuses the unordered maps it can recognise -- `HashMap`,
+`Hashtable`, `WeakHashMap`, `IdentityHashMap`, `ConcurrentHashMap` **and their subclasses**, and
+`Map.of`/`Map.copyOf`/`Map.ofEntries` with two or more options -- and names the fix. A
+`LinkedHashMap`, a `SortedMap`, their subclasses, and any single-option map are accepted; one
+option cannot be out of order. `Shortlist.rank`/`choice` apply the same check.
+
+It cannot recognise all of them. `Collections.unmodifiableMap`, `synchronizedMap` and
+`checkedMap` are the same wrapper class whichever map they wrap, so a wrapped `HashMap` is
+accepted and its order is not the one you wrote; reaching the wrapped map needs `--add-opens`
+into `java.base`. Wrap a `LinkedHashMap`, or use `choiceOf`.
 
 When there is no map to hand, build the question from the options directly and the order cannot be
 lost at all:
