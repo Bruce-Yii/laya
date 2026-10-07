@@ -58,7 +58,7 @@ class PredictContext:
 | `head_max_len` | `int \| None` | always | yes (start) | per-call token budget for the question head. `None` uses the agent config. |
 | `usage` | `dict \| None` | end | yes (end) | `{"input_tokens", "output_tokens"}`, summed over the states of the call. |
 | `started_at` | `float` | always | no | `time.perf_counter()` when the call began. |
-| `elapsed_ms` | `float \| None` | end | no | wall time for the whole call, milliseconds. |
+| `elapsed_ms` | `float \| None` | end | no | wall time in milliseconds, measured from `started_at`. On an Agent that is the whole call. On a Router `started_at` is reset after routing and loading, so it is the prediction only -- a cold model load is not in it. |
 | `error` | `BaseException \| None` | failure path | no | the exception, set before `on_error` and `on_predict_end`. |
 
 ### `PredictContext.skip(results)`
