@@ -405,10 +405,11 @@ jobs:
       # same job passed on a branch that adds no cell.
       #
       # Serialising costs wall-clock on an advisory lane and removes the pressure this change
-      # added. It is a MITIGATION, not the fix: the real defect is that nothing verifies a
-      # download before using it, and the real fix is an `HF_TOKEN` for the higher rate limit or
-      # a size/digest check at the fetch. Both live outside this directory, so they are not
-      # bundled here.
+      # added. It is one of three parts, not the whole fix: `prepare_checkpoint.py` now refuses an
+      # incomplete snapshot at the fetch -- a download that produced nothing, a missing file, a
+      # 0-byte or unparseable one -- and the fetching step carries `HF_TOKEN` so the higher rate
+      # limit applies where the secret exists. The guard is what matters; not provoking the
+      # throttle is merely cheaper than diagnosing it.
       max-parallel: 1
       matrix:
         include:
@@ -542,6 +543,16 @@ jobs:
       # a boolean, because `graph: true` could not say WHICH checkpoint to trace, and a cell that
       # names two would otherwise have traced both.
       - name: Prepare the checkpoints this cell owns
+        env:
+          # Scoped to this step, not the workflow: a workflow-level `env` reaches every step of
+          # every job, including `pip`, `gradle`, `semgrep` and third-party actions that have no
+          # business holding a credential. Only the steps that fetch from the hub get it.
+          #
+          # Unauthenticated requests are rate-limited, and a throttled fetch is what arrived
+          # TRUNCATED here. Unset expands to "", which the implicit token path treats as
+          # anonymous -- the explicit `token=` call sites normalise "" to None themselves,
+          # because an empty Bearer header makes httpx refuse the request outright.
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           for c in ${{ matrix.checkpoints }}; do
             if [ "$c" = "${{ matrix.graph-model }}" ]; then
