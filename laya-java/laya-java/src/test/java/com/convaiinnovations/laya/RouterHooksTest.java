@@ -2,6 +2,7 @@ package com.convaiinnovations.laya;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.convaiinnovations.laya.Router.Checkpoint;
@@ -12,6 +13,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -146,29 +148,87 @@ class RouterHooksTest {
                     trace.events.toString());
             assertEquals(1, trace.events.stream().filter(e -> e.startsWith("end:")).count(),
                     trace.events.toString());
-            // on_load lands inside the pair, which is the order the reference dispatches in.
-            int start = trace.events.indexOf("start:english");
-            int load = trace.events.indexOf("load:english");
-            int end = trace.events.indexOf("end:english");
-            assertTrue(start >= 0 && load > start && end > load, trace.events.toString());
+            // on_route first, then on_load inside the predict pair -- the reference's order.
+            // Derived from the trace, not hard-coded: which checkpoint answers is the default's
+            // business, and this test is about the sequence.
+            List<String> kinds = trace.events.stream().map(e -> e.split(":")[0]).toList();
+            assertEquals(List.of("route", "start", "load", "end"), kinds,
+                    trace.events.toString());
         }
     }
 
     @Test
-    @DisplayName("a hook that calls back into the router does not deadlock")
-    void aReentrantHookDoesNotDeadlock(@TempDir Path root) throws IOException {
+    @DisplayName("on_load is dispatched with no router lock held, as seen from a SECOND thread")
+    void dispatchHoldsNoRouterLock(@TempDir Path root) throws Exception {
         TinyCheckpoint.write(root, 64, 32);
-        List<Integer> seen = new ArrayList<>();
+        // A second thread, not the dispatching one: `lock` is a ReentrantLock, so a callback on the
+        // dispatching thread re-enters it successfully whether or not it is held. Only another
+        // thread can tell the difference.
+        AtomicBoolean reached = new AtomicBoolean();
         try (Router router = Router.builder().agents(new StubAgents(root)).maxLoaded(2).build()) {
-            // Dispatching under the router lock would park this call on itself for ever.
             router.hooks().addHook(new Hook() {
                 @Override
                 public void onLoad(PredictContext ctx) {
-                    seen.add(router.loaded().size());
+                    Thread other = new Thread(() -> {
+                        router.loaded();
+                        reached.set(true);
+                    }, "router-lock-probe");
+                    other.start();
+                    try {
+                        other.join(5_000);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
                 }
             });
             router.load("english");
-            assertEquals(List.of(1), seen);
+            assertTrue(reached.get(),
+                    "a second thread could not reach the router during on_load, so the dispatch "
+                    + "held the lock");
+        }
+    }
+
+    @Test
+    @DisplayName("unloadAll dispatches on_evict for every checkpoint, which is what close() uses")
+    void unloadAllDispatches(@TempDir Path root) throws IOException {
+        TinyCheckpoint.write(root, 64, 32);
+        Trace trace = new Trace();
+        try (Router router = Router.builder().agents(new StubAgents(root)).maxLoaded(3).build()) {
+            router.load("english");
+            router.load("multilingual");
+            router.hooks().addHook(trace);
+            assertEquals(2, router.unloadAll().size());
+            assertEquals(List.of("evict:english", "evict:multilingual"), trace.events);
+        }
+    }
+
+    @Test
+    @DisplayName("preload dispatches on_load for what it built")
+    void preloadDispatches(@TempDir Path root) throws IOException {
+        TinyCheckpoint.write(root, 64, 32);
+        Trace trace = new Trace();
+        try (Router router = Router.builder().agents(new StubAgents(root)).maxLoaded(3).build()) {
+            router.hooks().addHook(trace);
+            router.preload(List.of("english", "multilingual"));
+            assertEquals(List.of("load:english", "load:multilingual"), trace.events);
+        }
+    }
+
+    @Test
+    @DisplayName("a throwing on_load hook does not strand the lease that lease() took")
+    void aThrowingHookDoesNotLeakTheLease(@TempDir Path root) throws IOException {
+        TinyCheckpoint.write(root, 64, 32);
+        try (Router router = Router.builder().agents(new StubAgents(root)).maxLoaded(2).build()) {
+            router.hooks().addHook(new Hook() {
+                @Override
+                public void onLoad(PredictContext ctx) {
+                    throw new IllegalStateException("the sink refused it");
+                }
+            });
+            assertThrows(IllegalStateException.class, () -> router.lease("english"));
+            // A stranded lease leaves the slot retired-but-never-closed: unload would report it
+            // freed while the session stayed open.
+            assertEquals(List.of(Checkpoint.ENGLISH), router.unload("english"));
         }
     }
 

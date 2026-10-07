@@ -16,6 +16,7 @@ import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -108,6 +109,39 @@ class AsyncHookTest {
             IllegalStateException thrown =
                     assertThrows(IllegalStateException.class, () -> async.onRoute(ctx()));
             assertTrue(thrown.getMessage().contains("did not finish"), thrown.getMessage());
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
+    @Test
+    @DisplayName("an overrunning callback is abandoned, so its late writes are refused")
+    void anOverrunningCallbackIsAbandoned() throws Exception {
+        ExecutorService pool = Executors.newSingleThreadExecutor();
+        try {
+            CountDownLatch wrote = new CountDownLatch(1);
+            Hook async = AsyncHook.of(new Hook() {
+                @Override
+                public void onPredictStart(PredictContext c) {
+                    try {
+                        Thread.sleep(400);          // overruns the 50ms deadline below
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                    try {
+                        c.states(List.of("written after the call moved on"));
+                    } catch (RuntimeException refused) {
+                        wrote.countDown();          // refused, which is the point
+                    }
+                }
+            }, pool, Duration.ofMillis(50));
+            PredictContext ctx = ctx();
+            assertThrows(IllegalStateException.class, () -> async.onPredictStart(ctx));
+            // cancel(true) cannot interrupt a task already on an executor, so it keeps running.
+            // ctx.abandon is what stops it writing to a call that has finished.
+            assertTrue(wrote.await(3, TimeUnit.SECONDS), "the late write was never attempted");
+            assertEquals(List.of("state"), ctx.states(),
+                    "an abandoned callback's write reached the context");
         } finally {
             pool.shutdownNow();
         }

@@ -24,19 +24,9 @@ package com.convaiinnovations.laya.hooks;
  * calling a default no-op and the reference finding no attribute to call both leave the context
  * untouched and nothing in the log.
  *
- * <p>Nothing here mirrors the reference's {@code AsyncHook}, deliberately. That class exists to
- * solve a problem the JVM does not have: in Python an {@code async def} hook returns a coroutine
- * that only an event loop can finish, so a synchronous caller needs
- * {@code run_coroutine_sync} — and a background loop thread when it is already inside one — to
- * get a value back. A JVM method call is already synchronous, so a hook that wants to do
- * asynchronous work composes it and blocks on the result itself:
- *
- * <pre>{@code
- * @Override public void onPredictEnd(PredictContext ctx) {
- *     ship(ctx.results()).toCompletableFuture().join();   // or orTimeout(...), or ignore it
- * }
- * }</pre>
- *
+ * <p>{@link AsyncHook} runs a hook on an {@link java.util.concurrent.Executor} and waits for it,
+ * for a callback that must run on a particular thread. It is not a way to make a slow hook
+ * free: the prediction still waits, as the reference's does.
  * <p>Porting {@code AsyncHook} would mean choosing a future type for every caller and owning a
  * thread pool to await it on, to wrap a {@code join} the caller can write in one line and bound
  * however their own runtime wants. Half-porting it — accepting a {@code CompletionStage} and

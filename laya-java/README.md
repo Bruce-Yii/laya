@@ -506,6 +506,19 @@ router.hooks().addHook(new Hook() {
 });
 ```
 
+### What a router hook cannot do
+
+| | |
+|---|---|
+| a process-wide default hook sees **two** predict pairs per `Router.predict` | the router's and the agent's. A metric that sums `usage()` on `on_predict_end` double-counts. Install on `router.hooks()` or `agent.hooks()`, not `Hooks.setDefaultHooks`, unless you want both |
+| a throwing `on_evict` hook fails `Router.close()` | and the remaining evictions are not dispatched. In try-with-resources that masks the body's own failure |
+| calling back into the router from `on_evict` **during `close()`** | throws `this Router is closed`: `close()` marks the router closed before unloading |
+| `concurrent(false)` with an `AsyncHook` | deadlocks. Serial dispatch holds a lock across the callback, and the callback is on another thread, so re-entrancy cannot save it. Use one or the other |
+| `ctx.maxLen` / `ctx.headMaxLen`, and states past the first | ignored on the router path. `Agent.predict` takes no budget arguments, and the router answers one state |
+
+`on_route` carries its own context, not the predict pair's, so `runId` differs between them. Correlate
+on the model name or `ctx.decision`, not on `runId`.
+
 `AsyncHook.of(hook, executor)` runs a hook on a particular thread — a framework request scope, an
 actor, a UI loop. It waits for the callback, so an exception still reaches the hook policy and the
 mutable `PredictContext` is never read after the call has moved on. Pass a `Duration` to fail a

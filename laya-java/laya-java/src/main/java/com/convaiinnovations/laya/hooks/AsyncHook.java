@@ -7,6 +7,8 @@ import java.util.concurrent.CompletionException;
 import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
 
 /**
  * Runs another hook's callbacks on an {@link Executor}, and waits for each one.
@@ -16,9 +18,15 @@ import java.util.concurrent.TimeoutException;
  * coroutine is driven to completion on a background loop ({@code laya/hooks.run_coroutine_sync}), so
  * the prediction still waits for it.
  *
- * <p>Waiting is what makes it safe. {@link PredictContext} is mutable and shared by one call, so a
- * callback still reading it after the call moved on would see another call's state; a thrown
- * exception would also be lost rather than reaching the hook policy.
+ * <p>Waiting is what keeps a thrown exception reaching the hook policy, and keeps the mutable
+ * {@link PredictContext} from being read after the call moved on.
+ *
+ * <p>Except on a deadline. {@code CompletableFuture.cancel} does not interrupt a task already
+ * running on an executor, so an overrunning callback keeps going. It is {@link
+ * PredictContext#abandon abandoned} instead, exactly as {@link Hooks} does for a hook that
+ * overruns {@code hooks_timeout}: anything it writes to the context afterwards is refused. It still
+ * occupies the executor's thread until it returns, so a single-threaded executor has none left for
+ * the next callback -- size the executor for the deadline, or leave the deadline off.
  */
 public final class AsyncHook implements Hook {
 
@@ -57,38 +65,44 @@ public final class AsyncHook implements Hook {
 
     @Override
     public void onPredictStart(PredictContext ctx) {
-        await("on_predict_start", () -> delegate.onPredictStart(ctx));
+        await("on_predict_start", ctx, delegate::onPredictStart);
     }
 
     @Override
     public void onPredictEnd(PredictContext ctx) {
-        await("on_predict_end", () -> delegate.onPredictEnd(ctx));
+        await("on_predict_end", ctx, delegate::onPredictEnd);
     }
 
     @Override
     public void onRoute(PredictContext ctx) {
-        await("on_route", () -> delegate.onRoute(ctx));
+        await("on_route", ctx, delegate::onRoute);
     }
 
     @Override
     public void onLoad(PredictContext ctx) {
-        await("on_load", () -> delegate.onLoad(ctx));
+        await("on_load", ctx, delegate::onLoad);
     }
 
     @Override
     public void onEvict(PredictContext ctx) {
-        await("on_evict", () -> delegate.onEvict(ctx));
+        await("on_evict", ctx, delegate::onEvict);
     }
 
     @Override
     public void onError(PredictContext ctx) {
-        await("on_error", () -> delegate.onError(ctx));
+        await("on_error", ctx, delegate::onError);
     }
 
-    private void await(String event, Runnable callback) {
+    private void await(String event, PredictContext ctx, Consumer<PredictContext> callback) {
+        // The executor picks the thread, so the task reports it back: abandoning the context needs
+        // the thread that will be writing to it.
+        AtomicReference<Thread> runner = new AtomicReference<>();
         CompletableFuture<Void> running;
         try {
-            running = CompletableFuture.runAsync(callback, executor);
+            running = CompletableFuture.runAsync(() -> {
+                runner.set(Thread.currentThread());
+                callback.accept(ctx);
+            }, executor);
         } catch (RuntimeException rejected) {
             // A saturated or shut-down executor. Thrown as-is so the hook policy decides, exactly
             // as it would for a synchronous hook that threw.
@@ -111,6 +125,12 @@ public final class AsyncHook implements Hook {
             }
             throw new IllegalStateException(delegate + " failed in " + event, cause);
         } catch (TimeoutException expired) {
+            // cancel(true) cannot interrupt a task already running on an executor, so the callback
+            // is cut off from the call instead: whatever it writes from here on is refused.
+            Thread overrunning = runner.get();
+            if (overrunning != null) {
+                ctx.abandon(overrunning);
+            }
             running.cancel(true);
             throw new IllegalStateException(
                     delegate + " did not finish " + event + " within " + timeout, expired);

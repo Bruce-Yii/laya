@@ -382,6 +382,11 @@ public final class Router implements AutoCloseable, Predictor {
     /** Serialises builds, so two cold loads do not hold two checkpoints in flight at once. */
     private final ReentrantLock buildLock = new ReentrantLock();
     private final Map<Checkpoint, Slot> slots = new LinkedHashMap<>();
+    /** This router's hooks: install, remove, and set the error, timeout and concurrency policy. */
+    public HookRegistry hooks() {
+        return hooks;
+    }
+
     /** Least recently used first, which is the end eviction takes from. */
     private final List<Checkpoint> order = new ArrayList<>();
     private final Map<Checkpoint, InFlight> loading = new LinkedHashMap<>();
@@ -874,8 +879,15 @@ public final class Router implements AutoCloseable, Predictor {
         requireNonNull(checkpoint, "checkpoint");
         Outcome outcome = new Outcome();
         Slot slot = acquire(checkpoint, outcome);
-        // Before the Lease is handed over, so on_load precedes any use of the agent.
-        dispatchOutcome(checkpoint, outcome);
+        // Before the Lease is handed over, so on_load precedes any use of the agent -- but the
+        // lease is this method's until the Lease exists, so a throwing hook must not strand it.
+        // `build` guards the same shape at the `release(built); throw` below.
+        try {
+            dispatchOutcome(checkpoint, outcome);
+        } catch (RuntimeException | Error failure) {
+            release(slot);
+            throw failure;
+        }
         return new Lease(checkpoint, slot);
     }
 
@@ -892,11 +904,16 @@ public final class Router implements AutoCloseable, Predictor {
     public Agent load(String name) {
         Checkpoint checkpoint = normaliseName(name);
         Outcome outcome = new Outcome();
-        Slot slot = acquire(checkpoint, outcome);
-        release(slot);
-        // After release: a hook calling back in must not find this call still holding a lease.
-        dispatchOutcome(checkpoint, outcome);
-        return slot.agent;
+        try {
+            Slot slot = acquire(checkpoint, outcome);
+            release(slot);
+            return slot.agent;
+        } finally {
+            // `finally`: a build that published and then threw while closing the evicted agent
+            // still loaded and still evicted, so both events are owed. After `release`, so a hook
+            // calling back in does not find this call holding a lease.
+            dispatchOutcome(checkpoint, outcome);
+        }
     }
 
     /**
@@ -1268,7 +1285,9 @@ public final class Router implements AutoCloseable, Predictor {
                 lock.unlock();
             }
             if (!already) {
-                release(acquire(checkpoint));
+                Outcome preloaded = new Outcome();
+                release(acquire(checkpoint, preloaded));
+                dispatchOutcome(checkpoint, preloaded);
             }
         }
         return this;
@@ -1305,9 +1324,14 @@ public final class Router implements AutoCloseable, Predictor {
                 lock.unlock();
             }
             if (inflight == null) {
-                closeAll(toClose);
-                for (Checkpoint evicted : freed) {
-                    dispatchLifecycle(Hooks.Event.EVICT, evicted);
+                // `finally`: the eviction happened whether or not closing the agent threw, so the
+                // event is owed either way. `closeAll` rethrows the first failure.
+                try {
+                    closeAll(toClose);
+                } finally {
+                    for (Checkpoint evicted : freed) {
+                        dispatchLifecycle(Hooks.Event.EVICT, evicted);
+                    }
                 }
                 return freed;
             }
@@ -1336,9 +1360,12 @@ public final class Router implements AutoCloseable, Predictor {
                 lock.unlock();
             }
             if (inflights.isEmpty()) {
-                closeAll(toClose);
-                for (Checkpoint evicted : freed) {
-                    dispatchLifecycle(Hooks.Event.EVICT, evicted);
+                try {
+                    closeAll(toClose);
+                } finally {
+                    for (Checkpoint evicted : freed) {
+                        dispatchLifecycle(Hooks.Event.EVICT, evicted);
+                    }
                 }
                 return freed;
             }
@@ -1366,11 +1393,6 @@ public final class Router implements AutoCloseable, Predictor {
      * ceiling in place. That is the reference's behaviour and is kept deliberately; a caller who
      * needs the original ceiling back should build a new router.
      */
-    /** This router's hooks: install, remove, and set the error, timeout and concurrency policy. */
-    public HookRegistry hooks() {
-        return hooks;
-    }
-
     public int maxLoaded() {
         lock.lock();
         try {
