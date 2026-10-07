@@ -292,6 +292,8 @@ Router(
 router.route(state, questions=None, model=None, task=None, lang=None, lang_guess=None,
              hooks=None, hooks_raise=None, hooks_timeout=None)
 
+router.route_batch(requests, hooks_timeout=None, *, hooks=None, hooks_raise=None)
+
 router.predict(state, questions, model=None, task=None, lang=None, lang_guess=None,
                hooks=None, on_predict_start=None, on_predict_end=None, hooks_raise=None,
                hooks_timeout=None, max_len=None, head_max_len=None)
@@ -308,6 +310,10 @@ router.attach(name, agent)  # registers an existing agent; does not fire on_load
 router.loaded               # list of resident checkpoint names
 ```
 
+- `route_batch` calls `route` once per request, so it dispatches `on_route` once per request with
+  the same per-call hooks. It is the one surface whose hook arguments differ in shape: `hooks` and
+  `hooks_raise` are keyword-only and there is no `on_predict_start=` / `on_predict_end=`, because
+  it never predicts.
 - Per-call `hooks=` on `route`, `route_batch`, `predict` and `predict_batch` apply to the whole call, including `on_route`. On `predict_batch` the list is composed the same way as on `predict` (installed hooks first, then the per-call list; `None` and `[]` add nothing) and runs once per request.
 - `route()` is public: calling it dispatches `on_route` with the installed hooks plus any
   per-call `hooks`.
