@@ -83,7 +83,7 @@ Exit codes:
 
 ```jsonc
 {
-  "checkpoint": "english",            // TypedDecisions is written as "typeddecisions"
+  "checkpoint": "english",            // the flag spelling: "multilingual", "english", "typed-decisions"
   "runtime": "DotNet + ONNX Runtime",
   "threads": "ORT default",
   "cold_ms": 0.0,
