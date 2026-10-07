@@ -659,9 +659,20 @@ res_hi["routing"]
 # {
 #   'model': 'multilingual',
 #   'repo': 'convaiinnovations/laya/multilingual',
-#   'reason': 'non-Latin script (devanagari, 100% of letters); the English checkpoint cannot read it'
+#   'reason': 'non-Latin script (devanagari, 100% of letters); the English checkpoint cannot read it',
+#   'detection': {'script': 'devanagari', 'script_profile': {'devanagari': 1.0},
+#                 'language': None, 'is_english': False, 'language_undecided': True,
+#                 'diacritic_rate': 0.0, 'non_latin_fraction': 1.0, 'mixed_segment': None},
+#   'workflow': None
 # }
 ```
+
+All five keys are always present. `detection` is the
+[`laya.lang.analyse`](#supplying-your-own-language-detection) result the decision was made from,
+and is `None` whenever routing decided before detection ran: `model=`, `task=`, a detected
+workflow, a decisive `lang=` and a resolving `lang_guess` all take precedence over it and
+short-circuit it. `workflow` names the typed-decisions workflow whose question ids matched, and is
+`None` when none did.
 
 Inspect a routing decision without running any forward pass:
 
