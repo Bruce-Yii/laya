@@ -987,7 +987,7 @@ A threshold also depends on the autocast dtype. On CUDA at compute capability 8 
 
 ### Opt-in abstention: `min_confidence`
 
-`predict`, `predict_batch`, `system_one` and `decide` — on `Agent`, `Router` and `ONNXAgent` — take an opt-in `min_confidence`, off by default. It is a caller-side policy on top of the emitted confidence: every answer whose `answer_confidence` falls below the threshold is flagged `low_confidence: True`, with the raw answer, probabilities and confidence left intact for inspection.
+`predict`, `predict_batch`, `system_one`, `decide` and `decide_batch` — on `Agent`, `Router` and `ONNXAgent` — take an opt-in `min_confidence`, off by default. It is a caller-side policy on top of the emitted confidence: every answer whose `answer_confidence` falls below the threshold is flagged `low_confidence: True`, with the raw answer, probabilities and confidence left intact for inspection.
 
 ```python
 res = agent.predict(state, questions, min_confidence=0.85)
