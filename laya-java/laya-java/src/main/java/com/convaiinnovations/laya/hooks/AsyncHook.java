@@ -1,0 +1,130 @@
+package com.convaiinnovations.laya.hooks;
+
+import java.time.Duration;
+import java.util.Objects;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.Executor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+
+/**
+ * Runs another hook's callbacks on an {@link Executor}, and waits for each one.
+ *
+ * <p>For a hook that must run on a particular thread -- a framework request scope, a single-threaded
+ * actor, a UI loop -- not for making a slow hook free. The reference does the same: an async hook's
+ * coroutine is driven to completion on a background loop ({@code laya/hooks.run_coroutine_sync}), so
+ * the prediction still waits for it.
+ *
+ * <p>Waiting is what makes it safe. {@link PredictContext} is mutable and shared by one call, so a
+ * callback still reading it after the call moved on would see another call's state; a thrown
+ * exception would also be lost rather than reaching the hook policy.
+ */
+public final class AsyncHook implements Hook {
+
+    private final Hook delegate;
+    private final Executor executor;
+    private final Duration timeout;
+
+    private AsyncHook(Hook delegate, Executor executor, Duration timeout) {
+        this.delegate = Objects.requireNonNull(delegate, "delegate");
+        this.executor = Objects.requireNonNull(executor, "executor");
+        this.timeout = timeout;
+    }
+
+    /** Runs {@code delegate} on {@code executor}, waiting indefinitely for each callback. */
+    public static AsyncHook of(Hook delegate, Executor executor) {
+        return new AsyncHook(delegate, executor, null);
+    }
+
+    /**
+     * Runs {@code delegate} on {@code executor}, failing a callback that outlasts {@code timeout}.
+     *
+     * <p>Independent of {@code hooks_timeout}: that one bounds the whole dispatch and is not visible
+     * to a hook, so this one has to be given here.
+     */
+    public static AsyncHook of(Hook delegate, Executor executor, Duration timeout) {
+        if (timeout != null && (timeout.isNegative() || timeout.isZero())) {
+            throw new IllegalArgumentException("timeout must be positive, got " + timeout);
+        }
+        return new AsyncHook(delegate, executor, timeout);
+    }
+
+    /** The hook whose callbacks this runs. */
+    public Hook delegate() {
+        return delegate;
+    }
+
+    @Override
+    public void onPredictStart(PredictContext ctx) {
+        await("on_predict_start", () -> delegate.onPredictStart(ctx));
+    }
+
+    @Override
+    public void onPredictEnd(PredictContext ctx) {
+        await("on_predict_end", () -> delegate.onPredictEnd(ctx));
+    }
+
+    @Override
+    public void onRoute(PredictContext ctx) {
+        await("on_route", () -> delegate.onRoute(ctx));
+    }
+
+    @Override
+    public void onLoad(PredictContext ctx) {
+        await("on_load", () -> delegate.onLoad(ctx));
+    }
+
+    @Override
+    public void onEvict(PredictContext ctx) {
+        await("on_evict", () -> delegate.onEvict(ctx));
+    }
+
+    @Override
+    public void onError(PredictContext ctx) {
+        await("on_error", () -> delegate.onError(ctx));
+    }
+
+    private void await(String event, Runnable callback) {
+        CompletableFuture<Void> running;
+        try {
+            running = CompletableFuture.runAsync(callback, executor);
+        } catch (RuntimeException rejected) {
+            // A saturated or shut-down executor. Thrown as-is so the hook policy decides, exactly
+            // as it would for a synchronous hook that threw.
+            throw rejected;
+        }
+        try {
+            if (timeout == null) {
+                running.join();
+            } else {
+                running.get(timeout.toNanos(), TimeUnit.NANOSECONDS);
+            }
+        } catch (CompletionException | java.util.concurrent.ExecutionException wrapper) {
+            // Unwrapped, so the caller sees what the delegate threw rather than the plumbing.
+            Throwable cause = wrapper.getCause() == null ? wrapper : wrapper.getCause();
+            if (cause instanceof RuntimeException problem) {
+                throw problem;
+            }
+            if (cause instanceof Error problem) {
+                throw problem;
+            }
+            throw new IllegalStateException(delegate + " failed in " + event, cause);
+        } catch (TimeoutException expired) {
+            running.cancel(true);
+            throw new IllegalStateException(
+                    delegate + " did not finish " + event + " within " + timeout, expired);
+        } catch (InterruptedException interrupted) {
+            // The flag is restored before unwinding, so a caller using interruption to cancel is
+            // not left thinking the interrupt was swallowed.
+            Thread.currentThread().interrupt();
+            running.cancel(true);
+            throw new IllegalStateException(delegate + " was interrupted in " + event, interrupted);
+        }
+    }
+
+    @Override
+    public String toString() {
+        return "AsyncHook(" + delegate + (timeout == null ? "" : ", timeout=" + timeout) + ")";
+    }
+}

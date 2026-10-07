@@ -18,9 +18,10 @@ state builder (`LayaEmail`), the abstention gate (`ConfidenceGate`), scanning a 
 the context window (`predictLong`), schema-driven decisions (`Decisions.decide` / `decideBatch`),
 and the prediction hooks (`hooks`).
 
-Not implemented yet: the `laya-java-client` HTTP module, Android. Hooks run on `predict` and
-`predictBatch`; `Router` and `predictLong` do not dispatch them, and there is no `AsyncHook` — see
-[Watching and shaping a call](#watching-and-shaping-a-call). **Not published to
+Not implemented yet: the `laya-java-client` HTTP module, Android. `predictLong` dispatches no hook:
+a scan is sized before a hook could rewrite what is asked, so it stays unhooked until the
+reference's start probe and budget check are ported — see
+[Watching and shaping a call](#watching-and-shaping-a-call) and [Router hooks](#router-hooks). **Not published to
 Maven Central** — see [Installing](#installing).
 
 ## Where to go next
@@ -476,6 +477,39 @@ There is no `AsyncHook`. It exists in the reference to finish a coroutine from s
 and a JVM method call is already synchronous: a hook that wants asynchronous work composes it and
 blocks on it — `ship(ctx.results()).toCompletableFuture().join()` — bounded however your runtime
 wants, or by `timeout(Duration)`.
+
+## Router hooks
+
+`Router.hooks()` is its own registry, separate from any agent's. A router-level hook sees three
+events no agent can:
+
+| event | when |
+|---|---|
+| `onRoute` | after a checkpoint is chosen, from every branch of `route` |
+| `onLoad` | after a checkpoint is built — not on a cache hit |
+| `onEvict` | after one is dropped, by `maxLoaded`, `unload` or `unloadAll` |
+
+`Router.predict` also dispatches one `onPredictStart`/`onPredictEnd` pair for the whole
+route-and-answer call, with `onLoad` and `onEvict` landing inside it. The agent's own pair still
+fires for the forward pass, so a router-level hook and an agent-level hook see different spans.
+
+Hooks are dispatched outside the router's lock, so a hook may call back into the router —
+including `loaded()` or another `predict` — without deadlocking.
+
+`ctx.maxLen` / `ctx.headMaxLen` set by a router-level start hook are not honoured:
+`Agent.predict` takes no budget arguments. An agent-level hook can still set them.
+
+```java
+router.hooks().addHook(new Hook() {
+    @Override public void onRoute(PredictContext ctx) { log.info("routed to {}", ctx.model()); }
+    @Override public void onEvict(PredictContext ctx) { meter.increment("evictions"); }
+});
+```
+
+`AsyncHook.of(hook, executor)` runs a hook on a particular thread — a framework request scope, an
+actor, a UI loop. It waits for the callback, so an exception still reaches the hook policy and the
+mutable `PredictContext` is never read after the call has moved on. Pass a `Duration` to fail a
+callback that overruns.
 
 ## Option order
 
