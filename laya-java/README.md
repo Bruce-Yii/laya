@@ -55,6 +55,7 @@ import java.nio.file.Path;
 import java.util.*;
 
 // Options are POSITIONAL, so use a LinkedHashMap: two orders are two different questions.
+// A HashMap or Map.of is refused rather than silently reordered -- see Option order below.
 Map<String, Object> criteria = new LinkedHashMap<>();
 criteria.put("refund", "money back for a duplicate charge");
 criteria.put("escalate", "pass it to a human");
@@ -475,6 +476,39 @@ There is no `AsyncHook`. It exists in the reference to finish a coroutine from s
 and a JVM method call is already synchronous: a hook that wants asynchronous work composes it and
 blocks on it — `ship(ctx.results()).toCompletableFuture().join()` — bounded however your runtime
 wants, or by `timeout(Duration)`.
+
+## Option order
+
+A choice's options are positional: option N renders Nth and logit N is read back as the Nth label.
+So the criteria map's iteration order decides both what is asked and how the answer is labelled, and
+a map whose type does not define that order changes both silently. Measured on JDK 17:
+
+| written | `LinkedHashMap` | `HashMap` | `Map.of` |
+|---|---|---|---|
+| `refund, escalate, ignore` | `refund, escalate, ignore` | `ignore, escalate, refund` | varies per JVM |
+
+`HashMap` is exactly reversed here, so `probabilities().get("refund")` would have reported the logit
+that belonged to `ignore`. It is at least reproducible, because `String.hashCode` is specified.
+`Map.of` is worse: it salts its table per JVM, so three runs of one program gave three different
+orders -- the same question answering differently after a restart.
+
+`Question.choice` therefore refuses a map whose contract leaves the order unspecified -- `HashMap`,
+`Map.of`/`Map.copyOf` with two or more options, `ConcurrentHashMap`, `Hashtable`, `WeakHashMap`,
+`IdentityHashMap` -- and names the fix. A `LinkedHashMap`, a `SortedMap`, an unmodifiable view of
+either, or any single-option map is accepted; one option cannot be out of order.
+
+When there is no map to hand, build the question from the options directly and the order cannot be
+lost at all:
+
+```java
+Question q = Question.choiceOf("What does the customer want?",
+        Map.entry("refund", "money back for a duplicate charge"),
+        Map.entry("escalate", "pass it to a human"),
+        Map.entry("ignore", "no action needed"));
+```
+
+Two options sharing a label are refused there too: a map would have kept only the last, asking a
+question with fewer options than were written.
 
 ## Threads
 
