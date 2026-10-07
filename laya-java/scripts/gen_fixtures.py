@@ -1788,8 +1788,28 @@ def predict_golden():
                          DEFAULT_CHECKPOINT_ROOT)
     if not graph or not os.path.exists(graph):
         return {"skipped": "set LAYA_ONNX_GRAPH to an exported laya.onnx to record this family"}
+    # The graph alone is not enough: a graph exported before the checkpoints are assembled is a
+    # real configuration, and there `ONNXAgent` raised `FileNotFoundError: Local model path not
+    # found` out of this family and took the whole generator down with it, rather than recording
+    # the `skipped` this docstring promises.
+    #
+    # Guard the two files the loader actually opens, not the directory. `isdir` is not enough:
+    # an empty directory passes it and `ONNXAgent` then raises "does not contain
+    # 'rl_agent_config.json'" -- the same crash, one line later. Worse, a checkpoint with the
+    # config but no local `tokenizer/` passes too, and `ONNXAgent` falls back to
+    # `AutoTokenizer.from_pretrained(cfg["encoder"])`: an unpinned network fetch, reported as a
+    # pass, in the one generator whose job is to measure the pinned checkpoint. The tokenizer and
+    # config families above guard on the file for the same reason.
+    #
+    # No path in the message on purpose: an absolute LAYA_FIXTURE_CHECKPOINTS would be written
+    # into a committed skip marker, which is the trap DEFAULT_CHECKPOINT_ROOT records above.
+    checkpoint = os.path.join(rig, model)
+    for needed in ("rl_agent_config.json", "tokenizer/tokenizer.json"):
+        if not os.path.isfile(os.path.join(checkpoint, *needed.split("/"))):
+            return {"skipped": "set LAYA_FIXTURE_CHECKPOINTS to a root whose %s checkpoint has "
+                               "%s, to record this family" % (model, needed)}
     from laya.onnx_agent import ONNXAgent
-    agent = ONNXAgent(os.path.join(rig, model), onnx_path=graph)
+    agent = ONNXAgent(checkpoint, onnx_path=graph)
     single = {}
     for cid, state, lang, questions in PREDICT_CASES:
         result = agent.predict(state, questions, lang=lang)
