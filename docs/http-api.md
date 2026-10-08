@@ -34,6 +34,8 @@ Everything is environment variables, so one image serves a laptop dev run and a 
 | `LAYA_THREADS` | cap torch intra-op threads on CPU; keep it <= physical cores -- oversubscribing logical cores is a large regression | torch default |
 | `LAYA_AUTO_TASK` | auto-route to the typed-decisions checkpoint | `0` |
 | `LAYA_IDLE_UNLOAD_SECONDS` | unload resident checkpoints after this many idle seconds; the next request loads its checkpoint again. Zero disables unloading | `0` |
+| `LAYA_MAX_LOADED` | checkpoints kept resident at once; a cap below what routing chooses rebuilds one per switch, and `preload()` raises it to hold whatever it builds | `2` |
+| `LAYA_MAX_TOKEN_BUDGET` | server-side ceiling on the per-request `max_len` and `head_max_len` overrides; a larger value is a `422`. Unparseable or non-positive input logs a warning and falls back | `8192` |
 | `LAYA_DEFAULT_MODEL` | checkpoint a state with no language evidence falls back to; aliases such as `ml` resolve the way core resolves them, and an unresolvable name stops the server at startup | `english` |
 | `LAYA_API_KEY` | if set, require `Authorization: Bearer <key>` | none |
 | `LAYA_LOG_LEVEL` | uvicorn log level | `info` |
@@ -127,7 +129,7 @@ curl -s localhost:8000/v1/systemone -H 'content-type: application/json' -d '{
 | `lang_guess` | no | a language code from the client's own identifier, consulted after `lang` and before detection; any non-English code routes to the multilingual checkpoint |
 | `max_len` | no | total token window for this request, capped by `LAYA_MAX_TOKEN_BUDGET` |
 | `head_max_len` | no | token window the option prompt shares, same cap; see [Widening the Token Budget](langchain.md) for when a question needs it |
-| `min_confidence` | no | abstention threshold in `[0.0, 1.0]`; an answer whose `answer_confidence` falls below it comes back marked `low_confidence`, and the answer itself is kept |
+| `min_confidence` | no | abstention threshold: a number in `[0.0, 1.0]`, or a per-bucket map keyed by option-count bucket (`{"choice:3-5": 0.9, "default": 0.4}`) so the threshold can differ by option count; an answer whose `answer_confidence` falls below its own threshold comes back marked `low_confidence`, and the answer itself is kept |
 
 `model`, `task`, `lang`, `lang_guess`, `max_len`, `head_max_len` and `min_confidence` are the
 arguments `Router.predict` takes that a JSON body can state; each is forwarded only when the request
@@ -185,7 +187,7 @@ name of the decision head, and the checkpoint that answered is in `routing`.
 | `choice` | `choice` (the argmax option), `probabilities` per option |
 | `score` | `score` (expected level index, may fall between levels), `probabilities` keyed `"0".. "k-1"`, `legend` mapping index to the level text |
 | `noul` | `noul`, the probability of the yes option |
-| all | `confidence`, `answer_confidence`, and `action.act_probability` |
+| all | `type` (the discriminator, echoing the question's own type), `confidence`, `answer_confidence`, and `action.act_probability` |
 | gate | `abstention`, `abstention_threshold` and `low_confidence`, written by the abstention gate -- see below |
 
 The gate row is the abstention report (#361), and it is the only way a caller can see that the gate
@@ -224,7 +226,7 @@ caller sizing states by character count cannot see the cut anywhere else in the 
 | `routing` key | meaning |
 |---|---|
 | `model` | the checkpoint that answered: `english`, `multilingual` or `typed-decisions` |
-| `repo` | its public Hugging Face id |
+| `repo` | where it was loaded from, as `repo` or `repo/subfolder`. The default server loads all three from the `convaiinnovations/laya` bundle, so `multilingual` and `typed-decisions` report `convaiinnovations/laya/multilingual` and `convaiinnovations/laya/typed-decisions` -- a readable id, not a Hub repo id to fetch with |
 | `reason` | the sentence for the choice, naming the evidence it acted on |
 | `detection` | `laya.lang.analyse()` on the state -- `script`, `script_profile`, `language`, `is_english`, `language_undecided`, `diacritic_rate`, `non_latin_fraction`, `mixed_segment` -- or `null` when the route decided before reading the text |
 | `workflow` | the typed-decisions workflow the question ids match, or `null` |
@@ -278,7 +280,9 @@ Successful responses also carry `Server-Timing: inference;dur=<ms>` and `X-Infer
 ## Limits
 
 Request guardrails are checked before tokenization, so an oversized request costs the server
-nothing but the bytes it read. Every one of them is a `413`; the `detail` says which limit was hit.
+nothing but the bytes it read. Every size limit below is a `413`; the `detail` says which limit was
+hit. The last row is the exception: the concurrency cap is an admission limit, not a size one, and
+it answers `503` with `Retry-After: 1`.
 
 | limit | value |
 |---|---|
@@ -289,7 +293,7 @@ nothing but the bytes it read. Every one of them is a `413`; the `detail` says w
 | options per `choice` question | 100 |
 | levels per `score` question | 32 |
 | options across all questions | 512 |
-| concurrent admitted requests | `LAYA_MAX_CONCURRENT` (16) |
+| concurrent admitted requests (`503`, not `413`) | `LAYA_MAX_CONCURRENT` (16) |
 
 `/v1/systemone/batch` is bounded differently, and not by a refusal. It tokenizes each state once per
 question and collates every row into a single tensor, so the field caps multiply: 64 states of 64
