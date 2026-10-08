@@ -205,7 +205,8 @@ List<Prediction> mixed = router.predictBatch(List.of(
 
 Requests are routed first, grouped by checkpoint in order of first appearance, and within a
 checkpoint those sharing a question schema and token budget share `Agent.predictBatch` calls.
-Results come back in request order and equal per-request `predict`. `Router` is a
+Results come back in request order and match per-request `predict` within 1e-4 (padding in a
+shared forward pass moves the last bits). `Router` is a
 `BatchPredictor`, so `Decisions.decideBatch(router, states, schema)` works; to pin it, pass
 `(s, q) -> router.predictBatch(s, q, options)` as the runner.
 
@@ -514,6 +515,9 @@ the pair, and on success `elapsedMs` does not include a cold load. A routing or 
 reaches `onError` and `onPredictEnd`, with no start event, and its `elapsedMs` covers the routing
 and the failed load. The agent's own pair still
 fires for the forward pass, so a router-level hook and an agent-level hook see different spans.
+Process-wide defaults (`Hooks.setDefaultHooks`) see only the router's pair: the forward pass runs
+without them, as the reference runs it under `_SKIP_DEFAULTS`, so they fire once per request on
+`predict` and `predictBatch` alike.
 
 `Router.predictBatch` dispatches one pair **per request**, as `predict` does, so a start hook can
 rewrite or `skip` a request before it joins a shared forward pass. The order is the reference's:
@@ -521,8 +525,8 @@ every `onRoute`, then per checkpoint its `onEvict`/`onLoad`, its requests' start
 their ends in reverse. If a checkpoint's inference fails, each of its started requests gets
 `onError` and its end before the failure propagates. A routing failure reaches that request, and a
 loading failure every request of that checkpoint, as `onError` and `onPredictEnd` with no start —
-as on `predict`, where the reference's `predict_batch` reports neither. The agent's pair fires once per forward
-pass, not per request. Unlike `predict`, the batch path honours `ctx.maxLen` / `ctx.headMaxLen`
+as on `predict`, where the reference's `predict_batch` reports neither. The agent's installed hooks fire once
+per forward pass, not per request. Unlike `predict`, the batch path honours `ctx.maxLen` / `ctx.headMaxLen`
 from a router-level start hook, since a request's own budget is seeded there.
 
 Hooks are dispatched outside the router's lock, so a hook may call back into the router —
@@ -546,7 +550,6 @@ router.hooks().addHook(new Hook() {
 
 | | |
 |---|---|
-| a process-wide default hook sees **two** predict pairs per `Router.predict` (per request plus per forward pass on `predictBatch`) | the router's and the agent's. A metric that sums `usage()` on `on_predict_end` double-counts. Install on `router.hooks()` or `agent.hooks()`, not `Hooks.setDefaultHooks`, unless you want both |
 | a throwing `on_evict` hook fails `Router.close()` | and the remaining evictions are not dispatched. In try-with-resources that masks the body's own failure |
 | calling back into the router from `on_evict` **during `close()`** | throws `this Router is closed`: `close()` marks the router closed before unloading |
 | `concurrent(false)` with an `AsyncHook` whose callback dispatches a hook on the same registry | deadlocks with no deadline, and stalls until it with one. Serial dispatch holds a lock across the callback, and the callback is on another thread, so the inner dispatch cannot re-enter that lock. A callback that dispatches nothing — `loaded()`, a cached `load` — is fine |

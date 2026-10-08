@@ -67,7 +67,7 @@ jobs:
       # that lane already covered.
       - name: Model-free tests
         run: ./gradlew --no-daemon test
-      # 1003 of the 1021 registered tests run without a checkpoint. This floor has been raised
+      # 1007 of the 1025 registered tests run without a checkpoint. This floor has been raised
       # as the model-free suite grew -- 440 left 191 of slack, 625 left 60 -- because a floor
       # that does not bind is not a gate: under 625 the whole confidence-gate family of 26
       # tests could have vanished from this lane with the gate still green.
@@ -83,7 +83,7 @@ jobs:
       - name: The suite was not vacuous
         run: >
           python3 scripts/check_test_results.py laya-java/build/test-results/test
-          --min-tests 1003 --allow-aborted
+          --min-tests 1007 --allow-aborted
 
       - name: Build the jars
         run: ./gradlew --no-daemon build -x test

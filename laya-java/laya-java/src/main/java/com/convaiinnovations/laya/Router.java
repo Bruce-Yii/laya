@@ -1575,8 +1575,8 @@ public final class Router implements AutoCloseable, Predictor, BatchPredictor {
             PredictContext ctx = new PredictContext(Collections.singletonList(state), questions,
                     decision.model().wireName(), this);
             answered = Hooks.around(composed, ctx, policy,
-                    (states, asked, maxLen, headMaxLen) ->
-                            List.of(held.agent().predict(states.get(0), asked, resolved)));
+                    (states, asked, maxLen, headMaxLen) -> withoutDefaultHooks(() ->
+                            List.of(held.agent().predict(states.get(0), asked, resolved))));
         }
         if (answered == null || answered.isEmpty()) {
             // Only a hook can cause this, by skipping with no result. Inventing one would report
@@ -1585,6 +1585,17 @@ public final class Router implements AutoCloseable, Predictor, BatchPredictor {
                     "a hook left no prediction for this call; ctx.skip(...) needs one result");
         }
         return answered.get(0);
+    }
+
+    /**
+     * The agent's forward pass without the process-wide defaults, as the reference runs it under
+     * {@code _SKIP_DEFAULTS}: a default hook already sees this request's router-level pair.
+     */
+    @SuppressWarnings("try")
+    private static <T> T withoutDefaultHooks(Supplier<T> pass) {
+        try (Hooks.DefaultsScope ignored = Hooks.withoutDefaultHooks()) {
+            return pass.get();
+        }
     }
 
     /**
@@ -1632,8 +1643,8 @@ public final class Router implements AutoCloseable, Predictor, BatchPredictor {
      * <p>Every request is routed first, then grouped by checkpoint in order of first appearance.
      * Within a checkpoint, requests that share a question schema, a token budget and (when the
      * checkpoint has per-language temperatures) a language share {@link Agent#predictBatch}
-     * calls. Each request is answered exactly as {@link #predict(Object, Map, RouteOptions)}
-     * would answer it.
+     * calls. Each answer matches {@link #predict(Object, Map, RouteOptions)} within padding noise
+     * (1e-4 measured on real checkpoints).
      *
      * <p>Router hooks run per request, as {@link #predict} runs them, and in the reference's
      * order: every {@code on_route} first, then per checkpoint any {@code on_evict}/{@code on_load},
@@ -1765,9 +1776,9 @@ public final class Router implements AutoCloseable, Predictor, BatchPredictor {
                 states.add(ctx.states().get(0));
             }
             Key key = pass.getKey();
-            List<Prediction> answered = agent.predictBatch(states, members.get(0).questions(),
-                    key.language(), batchSize, sortByLength, HookCall.none(), key.maxLen(),
-                    key.headMaxLen());
+            List<Prediction> answered = withoutDefaultHooks(() -> agent.predictBatch(states,
+                    members.get(0).questions(), key.language(), batchSize, sortByLength,
+                    HookCall.none(), key.maxLen(), key.headMaxLen()));
             if (answered.size() != members.size()) {
                 throw new IllegalStateException("internal error: Agent.predictBatch returned "
                         + answered.size() + " results for " + members.size() + " states");

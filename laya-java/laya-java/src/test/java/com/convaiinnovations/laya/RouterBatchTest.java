@@ -10,6 +10,7 @@ import com.convaiinnovations.laya.Router.Checkpoint;
 import com.convaiinnovations.laya.Router.Request;
 import com.convaiinnovations.laya.Router.RouteOptions;
 import com.convaiinnovations.laya.hooks.Hook;
+import com.convaiinnovations.laya.hooks.Hooks;
 import com.convaiinnovations.laya.hooks.PredictContext;
 import com.convaiinnovations.laya.infer.InferenceSession;
 import com.convaiinnovations.laya.sequence.Collator;
@@ -492,6 +493,102 @@ class RouterBatchTest {
                     Request.of("c", urgent()).options(ENGLISH))));
             assertEquals(List.of(), router.loaded());
             assertEquals(List.of("route:english", "error:bad@null", "end:bad"), trace.events);
+        }
+    }
+
+    @Test
+    @DisplayName("a start hook's replacement questions are the ones its request is asked")
+    void hookQuestionsHonoured() throws IOException {
+        try (Router router = router()) {
+            router.hooks().addHook(new Hook() {
+                @Override
+                public void onPredictStart(PredictContext ctx) {
+                    if ("b".equals(ctx.states().get(0))) {
+                        ctx.questions(topic());
+                    }
+                }
+            });
+            List<Prediction> out = router.predictBatch(List.of(
+                    Request.of("a", urgent()).options(ENGLISH),
+                    Request.of("b", urgent()).options(ENGLISH),
+                    Request.of("c", urgent()).options(ENGLISH)));
+            assertEquals(List.of("urgent"), List.copyOf(out.get(0).answers().keySet()));
+            assertEquals(List.of("topic"), List.copyOf(out.get(1).answers().keySet()));
+            assertEquals(List.of("urgent"), List.copyOf(out.get(2).answers().keySet()));
+            assertEquals(2, calls(Checkpoint.ENGLISH), "the rewritten request has its own pass");
+        }
+    }
+
+    @Test
+    @DisplayName("a throwing start hook fails every started request once, itself included")
+    void startHookFailure() throws IOException {
+        Lifecycle trace = new Lifecycle();
+        try (Router router = router()) {
+            router.hooks().addHook(trace);
+            router.hooks().addHook(new Hook() {
+                @Override
+                public void onPredictStart(PredictContext ctx) {
+                    if ("b".equals(ctx.states().get(0))) {
+                        throw new IllegalStateException("start refused");
+                    }
+                }
+            });
+            IllegalStateException failure = assertThrows(IllegalStateException.class,
+                    () -> router.predictBatch(List.of(
+                            Request.of("a", urgent()).options(ENGLISH),
+                            Request.of("b", urgent()).options(ENGLISH),
+                            Request.of("c", urgent()).options(ENGLISH))));
+            assertEquals("start refused", failure.getMessage());
+            assertEquals(List.of("route:english", "route:english", "route:english",
+                    "start:a", "start:b", "error:b@english", "end:b", "error:a@english", "end:a"),
+                    trace.events);
+            assertEquals(0, calls(Checkpoint.ENGLISH), "nothing reached the model");
+        }
+    }
+
+    /** Counts start events, for the process-wide defaults. */
+    private static final class Starts implements Hook {
+
+        int count;
+
+        @Override
+        public void onPredictStart(PredictContext ctx) {
+            count++;
+        }
+    }
+
+    @Test
+    @DisplayName("a process-wide default hook starts once per request on predictBatch")
+    void defaultsOncePerRequestBatch() throws IOException {
+        Starts starts = new Starts();
+        Hooks.setDefaultHooks(List.of(starts));
+        try (Router router = router()) {
+            router.predictBatch(List.of(
+                    Request.of("a", urgent()).options(ENGLISH),
+                    Request.of("b", urgent()).options(ENGLISH),
+                    Request.of("c", urgent()).options(ENGLISH)));
+            assertEquals(3, starts.count, "the forward pass runs without the defaults");
+            assertEquals(1, calls(Checkpoint.ENGLISH));
+        } finally {
+            Hooks.clearDefaultHooks();
+        }
+    }
+
+    @Test
+    @DisplayName("a process-wide default hook starts once on Router.predict")
+    void defaultsOncePerPredict() throws IOException {
+        Starts starts = new Starts();
+        Starts installed = new Starts();
+        Hooks.setDefaultHooks(List.of(starts));
+        try (Router router = Router.builder().build()) {
+            Agent agent = TinyCheckpoint.agent(root, new TinyCheckpoint.RecordingSession());
+            agent.hooks().addHook(installed);
+            router.attach("english", agent);
+            router.predict("a", urgent(), ENGLISH);
+            assertEquals(1, starts.count, "the forward pass runs without the defaults");
+            assertEquals(1, installed.count, "the agent's own hooks still run");
+        } finally {
+            Hooks.clearDefaultHooks();
         }
     }
 }
