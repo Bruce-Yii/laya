@@ -131,13 +131,20 @@ Each metric is computed per answer where it applies and aggregated over the data
 | `noul_accuracy` | `noul` | fraction whose boolean (probability >= 0.5) matches |
 | `score_mae` | `score` | mean absolute error |
 | `score_within_<tol>` | `score` | fraction within an absolute tolerance |
-| `ece` | any answer with a confidence | expected calibration error, 15 bins, computed on the column `laya.evals._answer_confidence` reads -- `answer["answer_confidence"]` where the answer carries it, and a fallback where it does not; see [which confidence a metric reads](#which-confidence-a-metric-reads) |
+| `ece` | any answer with a confidence and a known label | expected calibration error, 15 bins, computed on the column `laya.evals._answer_confidence` reads -- `answer["answer_confidence"]` where the answer carries it, and a fallback where it does not; see [which confidence a metric reads](#which-confidence-a-metric-reads) |
 | `brier` | any answer with a confidence and a known label | Brier score of confidence as P(correct), `mean((confidence - correct)**2)`; lower is better |
 | `aurc` | any answer with a confidence and a known label | area under the risk--coverage curve: one risk value per distinct confidence level, each weighted by the answers that level spans; lower is better, and rewards a confidence that *ranks* right from wrong rather than just being calibrated |
 | `selective_accuracy@50`, `selective_accuracy@80` | any answer with a confidence and a known label | accuracy over the answers a confidence threshold at the 50% / 80% coverage point accepts -- what abstaining on the least-confident tail buys. A threshold cannot split a group of equal confidences, so this can cover more than the named fraction; see [coverage cuts](#coverage-cuts-and-ties) |
 | `mean_confidence` | any answer with a confidence | mean of the same column -- `answer["answer_confidence"]` where the answer carries it |
 | `latency_p50_ms`, `latency_p95_ms` | per request | wall time each request waited, informational -- see [batching](#batching-and-timing) |
 | `cost_per_decision_p50_ms`, `cost_per_decision_p95_ms` | per decision | a call's wall time divided by the rows it carried, informational |
+
+A "known label" is one `_correct` can judge: a `choice` answer against a string label, or a `noul`
+answer against a boolean. A `score` answer has no `correct` value at any tolerance, so it is left out
+of all five of those metrics -- `ece` included, because `ece`, `brier`, `aurc` and both
+`selective_accuracy@*` read one and the same `(confidence, correct)` column. A `score`-only dataset
+therefore publishes no `ece` however confident its answers are, and `--max-ece` over it fails with
+`metric 'ece' is not in the report` rather than passing on a number that was never computed.
 
 ### Which confidence a metric reads
 
@@ -207,8 +214,11 @@ With no ties in the data there is one level per answer, and both metrics are exa
 always been -- bit-identical, not merely close.
 
 
-Add `ScoreWithin(0.25)` to the evaluator list for a tolerance metric; the default set is
-`choice_accuracy`, `noul_accuracy`, `score_mae`, `mean_confidence`, plus `ece`. From the CLI the
+Add `ScoreWithin(0.25)` to the evaluator list for a tolerance metric; the default evaluator set is
+`choice_accuracy`, `noul_accuracy`, `score_mae` and `mean_confidence`. The confidence metrics are not
+evaluators and are not opted into: `ece`, `brier`, `aurc`, `selective_accuracy@50` and
+`selective_accuracy@80` are all computed on every run that has at least one answer carrying both a
+confidence and a known label, whatever evaluator list it was given. From the CLI the
 same thing is one flag: `laya-evals run data.jsonl --score-within 0.25` reports `score_within_0.25`
 beside the defaults, and the flag repeats, so `--score-within 0.25 --score-within 0.5` reports both.
 
