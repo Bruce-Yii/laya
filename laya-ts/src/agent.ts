@@ -516,6 +516,8 @@ export class Agent extends HookRegistry {
       ? [...this.hooks, ...normaliseHooks(opts.hooks, opts.onPredictStart, opts.onPredictEnd)]
       : composeHooks(this.hooks, opts.hooks, opts.onPredictStart, opts.onPredictEnd);
     const raiseErrors = opts.hooksRaise ?? this.hooksRaise;
+    const hookTimeoutSec = this.hooksTimeout ?? null;
+    const hookTimeoutMs = hookTimeoutSec !== null ? hookTimeoutSec * 1000 : null;
     const ctx = new PredictContext({
       states,
       questions: questions as Record<string, unknown>,
@@ -524,7 +526,7 @@ export class Agent extends HookRegistry {
       headMaxLen: opts.headMaxLen ?? null,
     });
     try {
-      await dispatchAsync(active, "onPredictStart", ctx, { raiseErrors, timeoutMs: this.hooksTimeout !== null ? this.hooksTimeout * 1000 : null });
+      await dispatchAsync(active, "onPredictStart", ctx, { raiseErrors, timeoutMs: hookTimeoutMs });
       if (ctx.results === null) {
         if (!Array.isArray(ctx.states)) {
           throw new TypeError(
@@ -575,7 +577,7 @@ export class Agent extends HookRegistry {
         }
       }
       try {
-        await dispatchAsync(active, "onPredictEnd", ctx, { raiseErrors, timeoutMs: this.hooksTimeout !== null ? this.hooksTimeout * 1000 : null });
+        await dispatchAsync(active, "onPredictEnd", ctx, { raiseErrors, timeoutMs: hookTimeoutMs });
       } catch (hookErr) {
         // End hooks run on the failure path too; do not let one mask the real error.
         if (ctx.error === null) throw hookErr;

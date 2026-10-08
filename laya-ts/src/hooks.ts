@@ -348,7 +348,7 @@ async function runWithTimeout<T>(
   try {
     return await Promise.race([promise, new Promise<never>((_, reject) => {
       abortController.signal.addEventListener("abort", () => {
-        reject(new Error(`hook ${operationName} timed out after ${timeoutMs}ms")));
+        reject(new Error(`hook ${operationName} timed out after ${timeoutMs}ms`));
       });
     })]);
   } finally {
@@ -360,7 +360,7 @@ export function dispatch(
   hooks: Hook[],
   event: HookEvent,
   ctx: PredictContext,
-  opts: { raiseErrors?: boolean; timeoutMs?: number | null } = {},
+  opts: { raiseErrors?: boolean; timeoutMs?: number | null; hook?: Hook } = {},
 ): void {
   const timeoutMs = opts.timeoutMs ?? null;
   const operationName = `${(opts.hook?.constructor?.name ?? "hook")}.`;
@@ -395,7 +395,7 @@ export async function dispatchAsync(
     const method = hook?.[event];
     if (typeof method !== "function") continue;
     try {
-      await runWithTimeout(method.call(hook, ctx), timeoutMs, operationName);
+      await runWithTimeout(Promise.resolve(method.call(hook, ctx)), timeoutMs, operationName);
     } catch (err) {
       if (raiseErrors) throw err;
       reportHookFailure(hook, event, err);
