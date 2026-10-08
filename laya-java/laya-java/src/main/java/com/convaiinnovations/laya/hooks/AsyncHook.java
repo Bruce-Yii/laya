@@ -25,8 +25,10 @@ import java.util.function.Consumer;
  * running on an executor, so an overrunning callback keeps going. It is {@link
  * PredictContext#abandon abandoned} instead, as {@link Hooks} does for a hook that overruns
  * {@code hooks_timeout}: anything it writes to the context afterwards is refused. Unlike that
- * case the thread is pooled, so the abandonment ends when the overrunning task returns, and a
- * later callback of the same call on that thread is accepted. It still occupies the executor's
+ * case the executor's thread is reused, so the abandonment ends when the overrunning task
+ * returns, and a later callback of the same call on that thread is accepted; an abandonment
+ * made by anything else on that thread stays in force. A callback that had not started by the
+ * deadline never runs. It still occupies the executor's
  * thread until it returns, so a single-threaded executor has none left for the next callback --
  * size the executor for the deadline, or leave the deadline off.
  */
@@ -99,21 +101,31 @@ public final class AsyncHook implements Hook {
         // The executor picks the thread, so the task reports it back: abandoning the context needs
         // the thread that will be writing to it.
         AtomicReference<Thread> runner = new AtomicReference<>();
-        // Guards abandon against the task finishing: abandoning a thread whose task has already
-        // returned would refuse whatever that pooled thread runs for this call next.
+        // One gate decides start, expiry, abandon and release, so none of them races another: a
+        // task starting at the deadline does not run unabandoned, a task finishing at it does not
+        // stay abandoned, and only an abandonment made here is released here.
         Object gate = new Object();
+        boolean[] gaveUp = new boolean[1];
         boolean[] finished = new boolean[1];
+        boolean[] abandonedHere = new boolean[1];
         CompletableFuture<Void> running;
         try {
             running = CompletableFuture.runAsync(() -> {
                 Thread self = Thread.currentThread();
-                runner.set(self);
+                synchronized (gate) {
+                    if (gaveUp[0]) {
+                        return;                     // the call gave up before this started
+                    }
+                    runner.set(self);
+                }
                 try {
                     callback.accept(ctx);
                 } finally {
                     synchronized (gate) {
                         finished[0] = true;
-                        ctx.release(self);
+                        if (abandonedHere[0]) {
+                            ctx.release(self);
+                        }
                     }
                 }
             }, executor);
@@ -142,9 +154,11 @@ public final class AsyncHook implements Hook {
             // cancel(true) cannot interrupt a task already running on an executor, so the callback
             // is cut off from the call instead: whatever it writes from here on is refused.
             synchronized (gate) {
+                gaveUp[0] = true;
                 Thread overrunning = runner.get();
                 if (overrunning != null && !finished[0]) {
                     ctx.abandon(overrunning);
+                    abandonedHere[0] = true;
                 }
             }
             running.cancel(true);

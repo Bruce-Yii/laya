@@ -766,4 +766,25 @@ public final class Hooks {
         }
         return ctx.results();
     }
+
+    /**
+     * Reports a failure that happened before {@code on_predict_start} could fire -- routing or
+     * loading, which the reference runs inside its predict {@code try} -- as {@code on_error} and
+     * then {@code on_predict_end}. A hook failure is attached to {@code problem}, never substituted.
+     */
+    public static void failedBeforeStart(List<? extends Hook> hooks, PredictContext ctx,
+                                         Policy policy, Throwable problem) {
+        ctx.error(problem);
+        try {
+            dispatch(hooks, Event.ERROR, ctx, policy);
+        } catch (RuntimeException | Error hookFailure) {
+            problem.addSuppressed(hookFailure);
+        }
+        ctx.elapsedMs((System.nanoTime() - ctx.startedAt()) / 1_000_000.0);
+        try {
+            dispatch(hooks, Event.PREDICT_END, ctx, policy);
+        } catch (RuntimeException | Error hookFailure) {
+            problem.addSuppressed(hookFailure);
+        }
+    }
 }

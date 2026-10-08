@@ -28,8 +28,9 @@ package com.convaiinnovations.laya.hooks;
  * for a callback that must run on a particular thread. It is not a way to make a slow hook
  * free: the prediction still waits, as the reference's does.
  *
- * <p>A hook runs on the calling thread, or an {@code AsyncHook}'s executor while the caller
- * waits, so it is as thread-safe as the call around it. Install
+ * <p>A hook runs on the calling thread, on the thread a {@link Hooks.Policy#timeout()} runs it
+ * on, or on an {@code AsyncHook}'s executor, and in each case the caller waits for it until a
+ * deadline expires -- so until it overruns, it is as thread-safe as the call around it. Install
  * one that is not, and set {@link HookRegistry#concurrent(boolean)} to false to have dispatch
  * serialise it.
  */

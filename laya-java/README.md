@@ -488,11 +488,13 @@ events no agent can:
 | event | when |
 |---|---|
 | `onRoute` | after a checkpoint is chosen, from every branch of `route` |
-| `onLoad` | after a checkpoint is built by `load`, `lease`, `predict` or `preload` — not on a cache hit |
+| `onLoad` | after a checkpoint is built by `load`, `lease`, `predict` or `preload`, or attached while that build ran — not on a cache hit |
 | `onEvict` | after one is dropped, by `maxLoaded`, `unload` or `unloadAll` — before the `onLoad` that caused it, as in the reference |
 
-`Router.predict` also dispatches one `onPredictStart`/`onPredictEnd` pair for the whole
-route-and-answer call, with `onLoad` and `onEvict` landing inside it. The agent's own pair still
+`Router.predict` also dispatches one `onPredictStart`/`onPredictEnd` pair for the answer. As in the
+reference, routing and loading run first, so the order is `onRoute`, any `onEvict`/`onLoad`, then
+the pair, and `elapsedMs` does not include a cold load. A routing or loading failure still reaches
+`onError` and `onPredictEnd`, with no start event. The agent's own pair still
 fires for the forward pass, so a router-level hook and an agent-level hook see different spans.
 
 Hooks are dispatched outside the router's lock, so a hook may call back into the router —
@@ -518,7 +520,7 @@ router.hooks().addHook(new Hook() {
 | a process-wide default hook sees **two** predict pairs per `Router.predict` | the router's and the agent's. A metric that sums `usage()` on `on_predict_end` double-counts. Install on `router.hooks()` or `agent.hooks()`, not `Hooks.setDefaultHooks`, unless you want both |
 | a throwing `on_evict` hook fails `Router.close()` | and the remaining evictions are not dispatched. In try-with-resources that masks the body's own failure |
 | calling back into the router from `on_evict` **during `close()`** | throws `this Router is closed`: `close()` marks the router closed before unloading |
-| `concurrent(false)` with an `AsyncHook` whose callback calls back into the router or agent | deadlocks. Serial dispatch holds a lock across the callback, and the callback is on another thread, so the inner dispatch cannot re-enter that lock. A callback that does not call back in is fine |
+| `concurrent(false)` with an `AsyncHook` whose callback dispatches a hook on the same registry | deadlocks with no deadline, and stalls until it with one. Serial dispatch holds a lock across the callback, and the callback is on another thread, so the inner dispatch cannot re-enter that lock. A callback that dispatches nothing — `loaded()`, a cached `load` — is fine |
 | `ctx.maxLen` / `ctx.headMaxLen`, and states past the first | ignored on the router path. `Agent.predict` takes no budget arguments, and the router answers one state |
 
 `on_route` carries its own context, not the predict pair's, so `runId` differs between them. Correlate
