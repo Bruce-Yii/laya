@@ -8,6 +8,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.convaiinnovations.laya.Router.Checkpoint;
 import com.convaiinnovations.laya.hooks.Hook;
+import com.convaiinnovations.laya.hooks.Hooks;
 import com.convaiinnovations.laya.hooks.PredictContext;
 import java.io.IOException;
 import java.nio.file.Path;
@@ -383,6 +384,70 @@ class RouterHooksTest {
         }
     }
 
+    @Test
+    @DisplayName("a hook rethrowing ctx.error() from any error or end event leaves the real failure")
+    void rethrowingCtxErrorNeverReplacesTheFailure(@TempDir Path root) throws IOException {
+        TinyCheckpoint.write(root, 64, 32);
+        // A start hook failing goes through Hooks.around; a load failing through failedBeforeStart.
+        for (String rethrowIn : List.of("error", "end")) {
+            Hook rethrow = new Hook() {
+                @Override
+                public void onPredictStart(PredictContext ctx) {
+                    throw new IllegalStateException("start refused");
+                }
+
+                @Override
+                public void onError(PredictContext ctx) {
+                    if (rethrowIn.equals("error")) {
+                        throw (RuntimeException) ctx.error();
+                    }
+                }
+
+                @Override
+                public void onPredictEnd(PredictContext ctx) {
+                    if (rethrowIn.equals("end")) {
+                        throw (RuntimeException) ctx.error();
+                    }
+                }
+            };
+            try (Router router = Router.builder().agents(new StubAgents(root)).build()) {
+                router.hooks().addHook(rethrow);
+                IllegalStateException thrown = assertThrows(IllegalStateException.class,
+                        () -> router.predict("hello", questions()));
+                assertEquals("start refused", thrown.getMessage(), "rethrown in " + rethrowIn);
+            }
+        }
+        Router.AgentFactory broken = checkpoint -> {
+            throw new IllegalStateException("no weights here");
+        };
+        try (Router router = Router.builder().agents(broken).build()) {
+            router.hooks().addHook(new Hook() {
+                @Override
+                public void onPredictEnd(PredictContext ctx) {
+                    throw (RuntimeException) ctx.error();
+                }
+            });
+            IllegalStateException thrown = assertThrows(IllegalStateException.class,
+                    () -> router.predict("hello", questions()));
+            assertEquals("no weights here", thrown.getMessage());
+        }
+    }
+
+    @Test
+    @DisplayName("failedBeforeStart refuses a null failure and a context that already has an outcome")
+    void failedBeforeStartRefusesMisuse() {
+        PredictContext fresh = new PredictContext(List.of("s"), Map.of(), "english", null);
+        assertThrows(NullPointerException.class, () -> Hooks.failedBeforeStart(List.of(), fresh,
+                Hooks.Policy.raising(), null, System.nanoTime()));
+        PredictContext reported = new PredictContext(List.of("s"), Map.of(), "english", null);
+        Hooks.failedBeforeStart(List.of(), reported, Hooks.Policy.raising(),
+                new IllegalStateException("first"), System.nanoTime());
+        assertThrows(IllegalStateException.class, () -> Hooks.failedBeforeStart(List.of(),
+                reported, Hooks.Policy.raising(), new IllegalStateException("second"),
+                System.nanoTime()));
+        assertEquals("first", reported.error().getMessage());
+    }
+
     /** A factory that keeps every session it hands out, so a test can see which were closed. */
     private static Router.AgentFactory recording(Path root, List<TinyCheckpoint.RecordingSession> out) {
         return checkpoint -> {
@@ -444,16 +509,22 @@ class RouterHooksTest {
     }
 
     @Test
-    @DisplayName("null questions are refused before routing: nothing is built, loaded or evicted")
-    void nullQuestionsAreRefusedBeforeAnyLoad(@TempDir Path root) throws IOException {
+    @DisplayName("null state or questions are refused before routing, with or without hooks")
+    void nullsAreRefusedBeforeAnyLoad(@TempDir Path root) throws IOException {
         TinyCheckpoint.write(root, 64, 32);
-        StubAgents agents = new StubAgents(root);
-        Trace trace = new Trace();
-        try (Router router = Router.builder().agents(agents).build()) {
-            router.hooks().addHook(trace);
-            assertThrows(IllegalArgumentException.class, () -> router.predict("hello", null));
-            assertEquals(0, agents.builds);
-            assertEquals(List.of(), trace.events);
+        for (boolean hooked : new boolean[] {true, false}) {
+            StubAgents agents = new StubAgents(root);
+            Trace trace = new Trace();
+            try (Router router = Router.builder().agents(agents).build()) {
+                if (hooked) {
+                    router.hooks().addHook(trace);
+                }
+                assertThrows(IllegalArgumentException.class, () -> router.predict("hello", null));
+                assertThrows(IllegalArgumentException.class,
+                        () -> router.predict(null, questions()));
+                assertEquals(0, agents.builds, "hooked=" + hooked + ": a refused call loaded");
+                assertEquals(List.of(), trace.events);
+            }
         }
     }
 
@@ -479,9 +550,12 @@ class RouterHooksTest {
                     seen.set(ctx.error());
                 }
             });
+            long before = System.nanoTime();
             assertSame(failure, assertThrows(IllegalStateException.class,
                     () -> router.predict("hello", questions())));
+            double wall = (System.nanoTime() - before) / 1_000_000.0;
             assertTrue(elapsed.get() >= 50.0, "elapsedMs " + elapsed.get() + " missed the load");
+            assertTrue(elapsed.get() <= wall, "elapsedMs " + elapsed.get() + " exceeds the call");
             assertSame(failure, seen.get());
         }
     }

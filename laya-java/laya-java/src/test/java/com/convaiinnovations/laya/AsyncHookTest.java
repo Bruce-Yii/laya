@@ -241,17 +241,14 @@ class AsyncHookTest {
     void anInterruptedWaitAbandonsTheCallback() throws Exception {
         ExecutorService pool = Executors.newSingleThreadExecutor();
         try {
+            CountDownLatch release = new CountDownLatch(1);
             CountDownLatch started = new CountDownLatch(1);
             CountDownLatch done = new CountDownLatch(1);
             Hook async = AsyncHook.of(new Hook() {
                 @Override
                 public void onPredictStart(PredictContext c) {
                     started.countDown();
-                    try {
-                        Thread.sleep(300);
-                    } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
-                    }
+                    awaitQuietly(release);
                     try {
                         c.states(List.of("late"));
                     } catch (RuntimeException refused) {
@@ -261,7 +258,8 @@ class AsyncHookTest {
                     }
                 }
             }, pool, Duration.ofSeconds(5));       // timed: an untimed join() ignores interrupts
-            assertLateWriteRefusedAfterInterrupt(ctx -> async.onPredictStart(ctx), started, done);
+            assertLateWriteRefusedAfterInterrupt(ctx -> async.onPredictStart(ctx), started, release,
+                    done);
         } finally {
             pool.shutdownNow();
         }
@@ -270,17 +268,14 @@ class AsyncHookTest {
     @Test
     @DisplayName("an interrupted wait on a Hooks timeout thread cuts that hook off too")
     void anInterruptedHooksWaitAbandonsTheHook() throws Exception {
+        CountDownLatch release = new CountDownLatch(1);
         CountDownLatch started = new CountDownLatch(1);
         CountDownLatch done = new CountDownLatch(1);
         Hook slow = new Hook() {
             @Override
             public void onPredictStart(PredictContext c) {
                 started.countDown();
-                try {
-                    Thread.sleep(300);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                }
+                awaitQuietly(release);
                 try {
                     c.states(List.of("late"));
                 } catch (RuntimeException refused) {
@@ -292,12 +287,12 @@ class AsyncHookTest {
         };
         assertLateWriteRefusedAfterInterrupt(ctx -> Hooks.dispatch(List.of(slow),
                 Hooks.Event.PREDICT_START, ctx, Hooks.Policy.raising().timeout(Duration.ofSeconds(5))),
-                started, done);
+                started, release, done);
     }
 
     private static void assertLateWriteRefusedAfterInterrupt(
             java.util.function.Consumer<PredictContext> waitOn, CountDownLatch started,
-            CountDownLatch done) throws Exception {
+            CountDownLatch release, CountDownLatch done) throws Exception {
         PredictContext ctx = ctx();
         AtomicReference<Throwable> caught = new AtomicReference<>();
         Thread caller = new Thread(() -> {
@@ -312,8 +307,18 @@ class AsyncHookTest {
         caller.interrupt();
         caller.join(3_000);
         assertTrue(caught.get() instanceof IllegalStateException, String.valueOf(caught.get()));
+        release.countDown();                        // only now may the hook try its late write
         assertTrue(done.await(3, TimeUnit.SECONDS));
         assertEquals(List.of("state"), ctx.states(), "a write after the caller moved on landed");
+    }
+
+    /** Waits for the test's go-ahead; a latch, so no sleep decides the order of events. */
+    private static void awaitQuietly(CountDownLatch release) {
+        try {
+            release.await(5, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     @Test

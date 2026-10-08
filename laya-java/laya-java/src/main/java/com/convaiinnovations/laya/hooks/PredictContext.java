@@ -61,10 +61,11 @@ public final class PredictContext {
     private volatile Throwable error;
 
     /**
-     * Threads whose deadline expired, and whose writes are therefore refused.
+     * Threads the call stopped waiting for -- on a deadline or an interrupt -- whose writes are
+     * therefore refused.
      *
-     * <p>Empty for every call that does not use {@link Hooks.Policy#timeout}, and at most one
-     * entry per overrun. A set rather than a flag because a chain can overrun more than once.
+     * <p>Empty unless the call stopped waiting for some hook, and at most one entry each time it
+     * did. A set rather than a flag because that can happen more than once in one chain.
      */
     private final Set<Thread> abandoned = ConcurrentHashMap.newKeySet();
 
@@ -158,7 +159,7 @@ public final class PredictContext {
      * store", which is a narrowing, not a proof — and the guard is cheap enough to be worth the
      * narrowing on its own.
      *
-     * @throws IllegalStateException when the calling thread's deadline has already expired
+     * @throws IllegalStateException when the call has already stopped waiting for this thread
      */
     public void states(List<?> replacement) {
         refuseIfAbandoned("states");
@@ -173,7 +174,7 @@ public final class PredictContext {
     /**
      * Replaces the questions, keeping the given iteration order — a choice's options are positional.
      *
-     * @throws IllegalStateException when the calling thread's deadline has already expired; see
+     * @throws IllegalStateException when the call has already stopped waiting for this thread; see
      *     {@link #states(List)}
      */
     public void questions(Map<String, Question> replacement) {
@@ -196,7 +197,7 @@ public final class PredictContext {
     /**
      * Replaces the results. From an end hook this is what the caller receives.
      *
-     * @throws IllegalStateException when the calling thread's deadline has already expired; see
+     * @throws IllegalStateException when the call has already stopped waiting for this thread; see
      *     {@link #states(List)}
      */
     public void results(List<Prediction> replacement) {
@@ -212,7 +213,7 @@ public final class PredictContext {
     /**
      * Overrides the token budget for this call.
      *
-     * @throws IllegalStateException when the calling thread's deadline has already expired; see
+     * @throws IllegalStateException when the call has already stopped waiting for this thread; see
      *     {@link #states(List)}
      */
     public void maxLen(Integer replacement) {
@@ -228,7 +229,7 @@ public final class PredictContext {
     /**
      * Overrides the head budget for this call.
      *
-     * @throws IllegalStateException when the calling thread's deadline has already expired; see
+     * @throws IllegalStateException when the call has already stopped waiting for this thread; see
      *     {@link #states(List)}
      */
     public void headMaxLen(Integer replacement) {
@@ -289,7 +290,7 @@ public final class PredictContext {
      * "nothing", and an empty call has nothing to answer.
      *
      * @throws IllegalArgumentException when the count is neither 1 nor one per state
-     * @throws IllegalStateException when the calling thread's deadline has already expired; see
+     * @throws IllegalStateException when the call has already stopped waiting for this thread; see
      *     {@link #states(List)}
      */
     public void skip(List<Prediction> results) {
@@ -305,8 +306,8 @@ public final class PredictContext {
     /**
      * Cuts {@code runner} off from this call: nothing it writes from here on is accepted.
      *
-     * <p>Called by {@link Hooks} the moment a hook's deadline expires, which is the moment the
-     * call stops being able to wait for it. See {@link #states(List)}.
+     * <p>Called the moment the call stops waiting for a hook, on its deadline or on an interrupt.
+     * See {@link #states(List)}.
      */
     void abandon(Thread runner) {
         abandoned.add(runner);
@@ -324,8 +325,8 @@ public final class PredictContext {
     private void refuseIfAbandoned(String what) {
         if (!abandoned.isEmpty() && abandoned.contains(Thread.currentThread())) {
             throw new IllegalStateException(String.format(
-                    "laya: hook thread %s exceeded its deadline and was abandoned; this call has "
-                    + "moved on, so ctx.%s() is refused rather than applied to it",
+                    "laya: hook thread %s was abandoned when the call stopped waiting for it; "
+                    + "this call has moved on, so ctx.%s() is refused rather than applied to it",
                     Thread.currentThread().getName(), what));
         }
     }

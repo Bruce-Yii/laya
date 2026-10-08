@@ -29,9 +29,10 @@ import java.util.function.Consumer;
  * returns, and a later callback of the same call on that thread is accepted; an abandonment
  * made by anything else on that thread stays in force. A callback that had not started when the
  * caller stopped waiting -- on the deadline, or on an interrupt while it waited for one -- never
- * runs. Without a deadline the wait ignores interrupts, so it always ends with the callback. It still occupies the executor's
- * thread until it returns, so a single-threaded executor has none left for the next callback --
- * size the executor for the deadline, or leave the deadline off.
+ * runs. Without a deadline the wait ignores interrupts, so it always ends with the callback. An
+ * abandoned callback still occupies the executor's thread until it returns, so a single-threaded
+ * executor has none left for the next callback -- size the executor for the deadline, or leave
+ * the deadline off.
  */
 public final class AsyncHook implements Hook {
 
@@ -169,7 +170,10 @@ public final class AsyncHook implements Hook {
         }
     }
 
-    /** The call has stopped waiting: a callback not yet started never runs, a running one is cut off. */
+    /**
+     * The call has stopped waiting: a callback not yet started never runs, and a running one is
+     * cut off.
+     */
     private static void giveUp(Object gate, boolean[] gaveUp, boolean[] finished,
                                boolean[] abandonedHere, AtomicReference<Thread> runner,
                                PredictContext ctx) {

@@ -778,8 +778,8 @@ public final class Hooks {
      * A hook failure is attached to {@code problem}, never substituted.
      *
      * <p>For a {@link com.convaiinnovations.laya.Predictor} that must do work before its start
-     * event, as {@code Router} does. {@code ctx} must be fresh: one that already carries results
-     * or an error belongs to a call that has been reported, and is refused.
+     * event, as {@code Router} does. Pass a context no hook has seen: one that already carries
+     * results or an error is refused, though a context mid-call without either is not detected.
      */
     public static void failedBeforeStart(List<? extends Hook> hooks, PredictContext ctx,
                                          Policy policy, Throwable problem, long startedAtNanos) {

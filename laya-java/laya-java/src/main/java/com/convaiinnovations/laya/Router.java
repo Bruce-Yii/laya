@@ -962,7 +962,10 @@ public final class Router implements AutoCloseable, Predictor {
         }
     }
 
-    /** {@code addSuppressed}, unless the hook rethrew {@code failure} itself, which cannot suppress itself. */
+    /**
+     * {@code addSuppressed}, unless the hook rethrew {@code failure} itself: a throwable cannot
+     * suppress itself.
+     */
     private static void attachHookFailure(Throwable failure, Throwable hookFailure) {
         if (hookFailure != failure) {
             failure.addSuppressed(hookFailure);
@@ -1494,7 +1497,8 @@ public final class Router implements AutoCloseable, Predictor {
         // Before routing, as the reference does: a malformed call must not cold-load a
         // checkpoint, fire on_load or evict a resident one before it is refused.
         if (state == null) {
-            throw new IllegalArgumentException("state must not be null");
+            throw new IllegalArgumentException(
+                    "state must not be null; pass a string, a map or a list");
         }
         if (questions == null) {
             throw new IllegalArgumentException("questions must not be null");
@@ -1586,7 +1590,7 @@ public final class Router implements AutoCloseable, Predictor {
             } catch (RuntimeException failure) {
                 if (first == null) {
                     first = failure;
-                } else {
+                } else if (failure != first) {
                     first.addSuppressed(failure);
                 }
             }
