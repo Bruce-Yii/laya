@@ -94,15 +94,18 @@ The shipped checkpoints work zero-shot, but fine-tuning on decisions from your o
 
 **[nandhakishorm.github.io/laya](https://nandhakishorm.github.io/laya/)**: guides for [prediction hooks](https://nandhakishorm.github.io/laya/hooks/), [schema-driven decisions](https://nandhakishorm.github.io/laya/structured/), [Docker](https://nandhakishorm.github.io/laya/docker/) and [LangChain and LangGraph](https://nandhakishorm.github.io/laya/langchain/), plus a full [API reference](https://nandhakishorm.github.io/laya/reference/).
 
-## What's new in 0.4.0
+## What's new in 0.4.1
 
-* **The routing default is now `multilingual`.** Text whose language the detector cannot place
-  used to fall back to the English checkpoint. On the 51-language sweep the multilingual
-  checkpoint leads on 50 of the 51, the exception being English itself (0.820 against 0.710),
-  and by 0.180 macro accuracy excluding English. Identified English still routes to the English
-  checkpoint, so only undecided text moves. Set `Router(default="english")` or
-  `LAYA_DEFAULT_MODEL=english` to restore the old behaviour; the break-even is around 62%
-  English traffic.
+* **Serve your own checkpoints.** `LAYA_EXTRA_MODELS` registers extra checkpoints on
+  `laya-serve` as a JSON name-to-source map, and a registered name pins its checkpoint over
+  HTTP like a built-in (#1047, #919). Malformed values stop the server at startup.
+* **Fine-tuning tells you its budget.** A run now prints its optimizer-update count before it
+  starts: 5,600 items gives 352 updates where 1,100 gives 72 at the same settings, which is why
+  small datasets collapsed silently (#1014, #963).
+* **Fixes.** `laya-evals` writes redirected output as utf-8 (#1045); the server serves again
+  after a lifespan restart (#1049); `Router.decide_batch` takes a checkpoint pin (#1050); the
+  ONNX path answers single-option questions instead of failing (#1051).
+* **Docs.** Twenty-four corrections where a page contradicted the code, each verified against it.
 
 Earlier releases are in the [GitHub releases](https://github.com/NandhaKishorM/laya/releases).
 
