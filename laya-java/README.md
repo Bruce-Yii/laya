@@ -186,9 +186,11 @@ explicit language, a caller's hint, the built-in detection, then the configured 
 long as you hold it — `predict` leases internally, so the ordinary path needs no thought. An agent
 handed in with `attach` is never closed: the caller keeps ownership.
 
-A deployment whose traffic is mostly not English should set
-`defaultCheckpoint(Checkpoint.MULTILINGUAL)`: an unidentified Latin-script state is no evidence of
-English, and that is the only knob which says so.
+The default is multilingual, as in the reference: an unidentified Latin-script state is no
+evidence of English. A deployment whose traffic is known to be English can set
+`defaultCheckpoint(Checkpoint.ENGLISH)`. The *alias* `"default"` is a different thing and still names
+english, as the reference's alias table does: `load("default")` loads english whatever
+`defaultCheckpoint` is set to.
 
 ## Detection on its own
 

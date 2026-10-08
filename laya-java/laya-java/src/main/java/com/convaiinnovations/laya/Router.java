@@ -405,7 +405,7 @@ public final class Router implements AutoCloseable, Predictor {
         this.maxLoaded = builder.maxLoaded;
     }
 
-    /** A router with the reference's defaults: the bundle, English as default, no auto-detection. */
+    /** A router with the reference's defaults: the bundle, multilingual as default, no auto-detection. */
     public static Router withDefaults() {
         return builder().build();
     }
@@ -434,9 +434,9 @@ public final class Router implements AutoCloseable, Predictor {
         /**
          * Where to send a state nothing identifies.
          *
-         * <p>English by default, which is the reference's choice. A deployment whose traffic is
-         * mostly not English should set this to {@link Checkpoint#MULTILINGUAL}: an unidentified
-         * Latin-script state is no evidence of English, and this is the only knob that says so.
+         * <p>Multilingual by default, which is the reference's choice: an unidentified
+         * Latin-script state is no evidence of English. A deployment whose traffic is known to be
+         * English can set {@link Checkpoint#ENGLISH} here.
          */
         public Builder defaultCheckpoint(Checkpoint value) {
             this.defaultCheckpoint = requireNonNull(value, "defaultCheckpoint");

@@ -43,7 +43,7 @@ public sealed class LayaRouterOptions
     /// <summary>
     /// Checkpoint used when a state has no letters or its Latin language is undetermined without
     /// non-English evidence. Default
-    /// <see cref="LayaCheckpoint.English"/>, matching Python's default.
+    /// <see cref="LayaCheckpoint.Multilingual"/>, matching Python's default.
     /// </summary>
     // Follows the reference, which moved this to multilingual: undecided Latin text is no
     // evidence of English, and multilingual leads on 50 of the 51 languages swept.
