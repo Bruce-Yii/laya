@@ -154,17 +154,17 @@ jobs:
       # Without LAYA_CHECKPOINTS the checkpoint-backed factories abort by assumption and the rest
       # run. `--min-tests` is what stops an aborted suite from looking like a pass.
       #
-      # Measured on the merged tree: 1002 register here, 985 run, 17 abort on a checkpoint this
+      # Measured on the merged tree: 1021 register here, 1003 run, 18 abort on a checkpoint this
       # lane does not have. Exact, not padded -- the floor stood at 680 long enough for the real
       # figure to pass it by, which is how a floor stops being one. ONE below the JDK-matrix
       # lane's floor on purpose: that lane passes `-PtestJavaVersion`, which is what makes
-      # `TestJvmVersionTest` run instead of skip, so it executes 986. Same suite, one more test,
+      # `TestJvmVersionTest` run instead of skip, so it executes 1004. Same suite, one more test,
       # because the flag enables it. The step below is where the number is justified.
       - name: Tests that need no model
         working-directory: laya-java
         run: ./gradlew --no-daemon test
-      # Measured on the merged tree, Corretto 17, no checkpoints: 1002 registered, 17 abort,
-      # 985 RUN -- the floor counts what ran, so the aborted checkpoint-backed cases are not in
+      # Measured on the merged tree, Corretto 17, no checkpoints: 1021 registered, 18 abort,
+      # 1003 RUN -- the floor counts what ran, so the aborted checkpoint-backed cases are not in
       # it. The floor is EXACT, with no margin, which is a change from the margin-of-4 this
       # replaced. A margin only binds classes larger than itself, and three classes in this lane
       # run exactly ONE test (`DecoderTest`, `TypedDecisionsParityTest`, `WindowPlanTest`), so no
@@ -179,7 +179,7 @@ jobs:
         if: ${{ !cancelled() }}
         run: >
           python laya-java/scripts/check_test_results.py
-          laya-java/laya-java/build/test-results/test --min-tests 985 --allow-aborted
+          laya-java/laya-java/build/test-results/test --min-tests 1003 --allow-aborted
 
       # The samples are single-file source programs, deliberately NOT a Gradle module: a
       # `samples` subproject would inherit the root build's MavenPublication and
@@ -335,7 +335,7 @@ jobs:
       # dropped, Gradle exits 0 and the floor alone exits 0 on 488 tests, having run JDK 17 twice
       # and reported it as two JDKs. With `--require-passed` it exits 1.
       #
-      # 986, not the build lane's 985, and the one is the point: this lane runs one test MORE
+      # 1004, not the build lane's 1003, and the one is the point: this lane runs one test MORE
       # than that one, because `TestJvmVersionTest` is `@EnabledIfSystemProperty` and only
       # enabled here. Both are EXACT, with no margin, for the reason the build lane gives --
       # three classes here run exactly one test, so no positive margin can bind them.
@@ -356,7 +356,7 @@ jobs:
         if: ${{ !cancelled() }}
         run: >
           python laya-java/scripts/check_test_results.py
-          laya-java/laya-java/build/test-results/test --min-tests 986 --allow-aborted
+          laya-java/laya-java/build/test-results/test --min-tests 1004 --allow-aborted
           --require-passed TestJvmVersionTest
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: ${{ failure() }}

@@ -192,6 +192,23 @@ evidence of English. A deployment whose traffic is known to be English can set
 english, as the reference's alias table does: `load("default")` loads english whatever
 `defaultCheckpoint` is set to.
 
+`predictBatch` routes many requests and answers them with one load per checkpoint used:
+
+```java
+List<Prediction> out = router.predictBatch(states, questions);     // each state routed alone
+List<Prediction> mixed = router.predictBatch(List.of(
+        Router.Request.of(email, Presets.email()),
+        Router.Request.of(ticket, Presets.triage())
+                .options(Router.RouteOptions.none().model("multilingual"))
+                .maxLen(512)));
+```
+
+Requests are routed first, grouped by checkpoint in order of first appearance, and within a
+checkpoint those sharing a question schema and token budget share `Agent.predictBatch` calls.
+Results come back in request order and equal per-request `predict`. `Router` is a
+`BatchPredictor`, so `Decisions.decideBatch(router, states, schema)` works; to pin it, pass
+`(s, q) -> router.predictBatch(s, q, options)` as the runner.
+
 ## Detection on its own
 
 `lang.LanguageDetection` is the router's evidence, usable without one:
@@ -498,14 +515,25 @@ reaches `onError` and `onPredictEnd`, with no start event, and its `elapsedMs` c
 and the failed load. The agent's own pair still
 fires for the forward pass, so a router-level hook and an agent-level hook see different spans.
 
+`Router.predictBatch` dispatches one pair **per request**, as `predict` does, so a start hook can
+rewrite or `skip` a request before it joins a shared forward pass. The order is the reference's:
+every `onRoute`, then per checkpoint its `onEvict`/`onLoad`, its requests' starts in order and
+their ends in reverse. If a checkpoint's inference fails, each of its started requests gets
+`onError` and its end before the failure propagates. A routing failure reaches that request, and a
+loading failure every request of that checkpoint, as `onError` and `onPredictEnd` with no start —
+as on `predict`, where the reference's `predict_batch` reports neither. The agent's pair fires once per forward
+pass, not per request. Unlike `predict`, the batch path honours `ctx.maxLen` / `ctx.headMaxLen`
+from a router-level start hook, since a request's own budget is seeded there.
+
 Hooks are dispatched outside the router's lock, so a hook may call back into the router —
 `loaded()`, `load`, `unload` — without deadlocking. Two consequences of that are yours to handle:
 `load()` can hand back an agent a hook unloaded while its `on_load` was being dispatched, and a
 router-level `on_predict_start` that calls `router.predict` recurses until the stack runs out,
 because that inner call dispatches the same hook again.
 
-`ctx.maxLen` / `ctx.headMaxLen` set by a router-level start hook are not honoured:
-`Agent.predict` takes no budget arguments. An agent-level hook can still set them.
+`ctx.maxLen` / `ctx.headMaxLen` set by a router-level start hook are not honoured by
+`Router.predict`: `Agent.predict` takes no budget arguments. `predictBatch` honours them, and an
+agent-level hook can set them on either path.
 
 ```java
 router.hooks().addHook(new Hook() {
@@ -518,11 +546,11 @@ router.hooks().addHook(new Hook() {
 
 | | |
 |---|---|
-| a process-wide default hook sees **two** predict pairs per `Router.predict` | the router's and the agent's. A metric that sums `usage()` on `on_predict_end` double-counts. Install on `router.hooks()` or `agent.hooks()`, not `Hooks.setDefaultHooks`, unless you want both |
+| a process-wide default hook sees **two** predict pairs per `Router.predict` (per request plus per forward pass on `predictBatch`) | the router's and the agent's. A metric that sums `usage()` on `on_predict_end` double-counts. Install on `router.hooks()` or `agent.hooks()`, not `Hooks.setDefaultHooks`, unless you want both |
 | a throwing `on_evict` hook fails `Router.close()` | and the remaining evictions are not dispatched. In try-with-resources that masks the body's own failure |
 | calling back into the router from `on_evict` **during `close()`** | throws `this Router is closed`: `close()` marks the router closed before unloading |
 | `concurrent(false)` with an `AsyncHook` whose callback dispatches a hook on the same registry | deadlocks with no deadline, and stalls until it with one. Serial dispatch holds a lock across the callback, and the callback is on another thread, so the inner dispatch cannot re-enter that lock. A callback that dispatches nothing — `loaded()`, a cached `load` — is fine |
-| `ctx.maxLen` / `ctx.headMaxLen`, and states past the first | ignored on the router path. `Agent.predict` takes no budget arguments, and the router answers one state |
+| `ctx.maxLen` / `ctx.headMaxLen`, and states past the first | ignored by `Router.predict`, which calls `Agent.predict` with no budget arguments; `predictBatch` honours the budgets. Both answer only the first state |
 
 `on_route` carries its own context, not the predict pair's, so `runId` differs between them. Correlate
 on the model name, not on `runId`. That context holds the chosen checkpoint in `ctx.model()` and no

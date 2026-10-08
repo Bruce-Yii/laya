@@ -12,8 +12,10 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -46,7 +48,7 @@ import java.util.function.Supplier;
  * <p>This class decides; it does not load. {@link #route} runs no model and touches no disk, so it
  * is safe to call on every request and to test without a checkpoint.
  */
-public final class Router implements AutoCloseable, Predictor {
+public final class Router implements AutoCloseable, Predictor, BatchPredictor {
 
     /** The hub repository that bundles all three checkpoints. */
     public static final String BUNDLE_REPO = "convaiinnovations/laya";
@@ -148,6 +150,45 @@ public final class Router implements AutoCloseable, Predictor {
         /** A hint consulted after an explicit language and before detection. */
         public RouteOptions langGuess(LanguageHint value) {
             return new RouteOptions(model, task, lang, value);
+        }
+    }
+
+    /**
+     * One request of a {@link #predictBatch(List)}: a state, its questions, and the routing and
+     * token-budget overrides the reference reads off each request dict.
+     *
+     * @param options    routing for this request alone; null means {@link RouteOptions#none()}
+     * @param maxLen     a token budget for this request alone, or null for the checkpoint's
+     * @param headMaxLen a head budget for this request alone, or null for the checkpoint's
+     */
+    public record Request(Object state, Map<String, Question> questions, RouteOptions options,
+                          Integer maxLen, Integer headMaxLen) {
+
+        /** @throws IllegalArgumentException for a null state or null questions */
+        public Request {
+            requireNonNull(state, "state");
+            requireNonNull(questions, "questions");
+            options = options == null ? RouteOptions.none() : options;
+        }
+
+        /** A request routed on its state and questions alone, at the checkpoint's budgets. */
+        public static Request of(Object state, Map<String, Question> questions) {
+            return new Request(state, questions, null, null, null);
+        }
+
+        /** This request with these routing options. */
+        public Request options(RouteOptions value) {
+            return new Request(state, questions, value, maxLen, headMaxLen);
+        }
+
+        /** This request with this token budget. */
+        public Request maxLen(Integer value) {
+            return new Request(state, questions, options, value, headMaxLen);
+        }
+
+        /** This request with this head budget. */
+        public Request headMaxLen(Integer value) {
+            return new Request(state, questions, options, maxLen, value);
         }
     }
 
@@ -1556,6 +1597,185 @@ public final class Router implements AutoCloseable, Predictor {
             return decision.detection().language();
         }
         return lang;
+    }
+
+    /**
+     * Route every state and answer the shared questions, sharing forward passes per checkpoint.
+     *
+     * <p>{@link BatchPredictor}'s form, so {@link Decisions#decideBatch} takes a router. To pin
+     * one, pass {@code (states, asked) -> router.predictBatch(states, asked, options)}.
+     */
+    @Override
+    public List<Prediction> predictBatch(List<?> states, Map<String, Question> questions) {
+        return predictBatch(states, questions, RouteOptions.none());
+    }
+
+    /** {@link #predictBatch(List, Map)} with the same routing options on every state. */
+    public List<Prediction> predictBatch(List<?> states, Map<String, Question> questions,
+            RouteOptions options) {
+        requireNonNull(states, "states");
+        List<Request> requests = new ArrayList<>(states.size());
+        for (Object state : states) {
+            requests.add(new Request(state, questions, options, null, null));
+        }
+        return predictBatch(requests);
+    }
+
+    /** {@link #predictBatch(List, int, boolean)} with every state at once and no sorting. */
+    public List<Prediction> predictBatch(List<Request> requests) {
+        return predictBatch(requests, 0, false);
+    }
+
+    /**
+     * Route each request and answer it, with one checkpoint load per checkpoint used.
+     *
+     * <p>Every request is routed first, then grouped by checkpoint in order of first appearance.
+     * Within a checkpoint, requests that share a question schema, a token budget and (when the
+     * checkpoint has per-language temperatures) a language share {@link Agent#predictBatch}
+     * calls. Each request is answered exactly as {@link #predict(Object, Map, RouteOptions)}
+     * would answer it.
+     *
+     * <p>Router hooks run per request, as {@link #predict} runs them, and in the reference's
+     * order: every {@code on_route} first, then per checkpoint any {@code on_evict}/{@code on_load},
+     * then that checkpoint's start events in request order, so a start hook can rewrite or skip a
+     * request before it joins a forward pass, then its end events in reverse. If its inference
+     * fails, every started request of that checkpoint gets the error and its end before the
+     * failure propagates; checkpoints already answered have ended normally. A routing failure
+     * reaches its own request, and a loading failure every request of that checkpoint, as
+     * {@code on_error} and {@code on_predict_end} with no start, as in {@link #predict}.
+     *
+     * @param batchSize    states per graph call, or 0 for each group at once
+     * @param sortByLength forwarded to {@link Agent#predictBatch}; changes no answer
+     * @return one prediction per request, in the order the requests were given
+     */
+    public List<Prediction> predictBatch(List<Request> requests, int batchSize,
+            boolean sortByLength) {
+        requireNonNull(requests, "requests");
+        if (batchSize < 0) {
+            throw new IllegalArgumentException("batchSize must be 0 or positive, got " + batchSize);
+        }
+        // Before any routing, as predict does: a malformed batch must not route, load or evict.
+        for (int i = 0; i < requests.size(); i++) {
+            if (requests.get(i) == null) {
+                throw new IllegalArgumentException("request " + i + " is null");
+            }
+        }
+        List<Hook> composed = hooks.composeFor(HookCall.none());
+        Hooks.Policy policy = hooks.policyFor(HookCall.none());
+        List<RouteDecision> decisions = new ArrayList<>(requests.size());
+        for (Request request : requests) {
+            long startedAt = System.nanoTime();
+            try {
+                decisions.add(route(request.state(), request.questions(), request.options()));
+            } catch (RuntimeException | Error failure) {
+                failedBeforeStart(composed, policy, request, null, failure, startedAt);
+                throw failure;
+            }
+        }
+        Map<Checkpoint, List<Integer>> groups = new LinkedHashMap<>();
+        for (int i = 0; i < decisions.size(); i++) {
+            groups.computeIfAbsent(decisions.get(i).model(), key -> new ArrayList<>()).add(i);
+        }
+
+        Prediction[] out = new Prediction[requests.size()];
+        for (Map.Entry<Checkpoint, List<Integer>> group : groups.entrySet()) {
+            Checkpoint checkpoint = group.getKey();
+            // Loaded before the starts, as the reference loads, so elapsedMs excludes a cold load.
+            long startedAt = System.nanoTime();
+            Lease lease;
+            try {
+                lease = lease(checkpoint);
+            } catch (RuntimeException | Error failure) {
+                for (int i : group.getValue()) {
+                    failedBeforeStart(composed, policy, requests.get(i), checkpoint, failure,
+                            startedAt);
+                }
+                throw failure;
+            }
+            List<PredictContext> contexts = new ArrayList<>(group.getValue().size());
+            Map<PredictContext, Integer> indexOf = new IdentityHashMap<>();
+            try (Lease held = lease) {
+                for (int i : group.getValue()) {
+                    Request request = requests.get(i);
+                    PredictContext ctx = new PredictContext(
+                            Collections.singletonList(request.state()), request.questions(),
+                            checkpoint.wireName(), this, request.maxLen(), request.headMaxLen());
+                    contexts.add(ctx);
+                    indexOf.put(ctx, i);
+                }
+                Hooks.aroundGroup(composed, contexts, policy, pending -> answer(held.agent(),
+                        pending, indexOf, requests, decisions, batchSize, sortByLength));
+            }
+            for (PredictContext ctx : contexts) {
+                int i = indexOf.get(ctx);
+                if (ctx.results() == null || ctx.results().isEmpty()) {
+                    // As in predict: only a hook can cause this, and inventing an answer would
+                    // report a decision the model never made.
+                    throw new IllegalStateException("a hook left no prediction for request " + i
+                            + "; ctx.skip(...) needs one result");
+                }
+                out[i] = ctx.results().get(0);
+            }
+        }
+        // Not List.of: an end hook may leave a null result, which predict returns as it is.
+        return Collections.unmodifiableList(Arrays.asList(out));
+    }
+
+    /** One request's {@link Hooks#failedBeforeStart}, skipped when no hook would see it. */
+    private void failedBeforeStart(List<Hook> composed, Hooks.Policy policy, Request request,
+            Checkpoint checkpoint, Throwable failure, long startedAt) {
+        if (composed.isEmpty()) {
+            return;
+        }
+        PredictContext failed = new PredictContext(Collections.singletonList(request.state()),
+                request.questions(), checkpoint == null ? null : checkpoint.wireName(), this,
+                request.maxLen(), request.headMaxLen());
+        Hooks.failedBeforeStart(composed, failed, policy, failure, startedAt);
+    }
+
+    /** Answers one checkpoint's pending requests, one agent call per compatible group. */
+    private static void answer(Agent agent, List<PredictContext> pending,
+            Map<PredictContext, Integer> indexOf, List<Request> requests,
+            List<RouteDecision> decisions, int batchSize, boolean sortByLength) {
+        // The language only selects a temperature, so it splits a group only when the
+        // checkpoint has per-language temperatures; otherwise it would cost forward passes.
+        boolean tempered = !agent.config().langTemperatures().isEmpty();
+        // Grouped on what the start hooks left, so a rewritten question set or budget applies to
+        // its own request only. The schema is order-sensitive, as option order is positional.
+        record Key(String schema, Integer maxLen, Integer headMaxLen, String language) {
+        }
+        Map<Key, List<PredictContext>> forwardPasses = new LinkedHashMap<>();
+        for (PredictContext ctx : pending) {
+            String language = null;
+            if (tempered) {
+                int i = indexOf.get(ctx);
+                language = requests.get(i).options().lang();
+                if (language == null && decisions.get(i).detection() != null) {
+                    language = decisions.get(i).detection().language();
+                }
+            }
+            Key key = new Key(questionSchema(ctx.questions()), ctx.maxLen(), ctx.headMaxLen(),
+                    language);
+            forwardPasses.computeIfAbsent(key, k -> new ArrayList<>()).add(ctx);
+        }
+        for (Map.Entry<Key, List<PredictContext>> pass : forwardPasses.entrySet()) {
+            List<PredictContext> members = pass.getValue();
+            List<Object> states = new ArrayList<>(members.size());
+            for (PredictContext ctx : members) {
+                states.add(ctx.states().get(0));
+            }
+            Key key = pass.getKey();
+            List<Prediction> answered = agent.predictBatch(states, members.get(0).questions(),
+                    key.language(), batchSize, sortByLength, HookCall.none(), key.maxLen(),
+                    key.headMaxLen());
+            if (answered.size() != members.size()) {
+                throw new IllegalStateException("internal error: Agent.predictBatch returned "
+                        + answered.size() + " results for " + members.size() + " states");
+            }
+            for (int m = 0; m < members.size(); m++) {
+                members.get(m).results(List.of(answered.get(m)));
+            }
+        }
     }
 
     /**
