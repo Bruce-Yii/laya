@@ -83,7 +83,7 @@ jobs:
       - name: The suite was not vacuous
         run: >
           python3 scripts/check_test_results.py laya-java/build/test-results/test
-          --min-tests 963 --allow-aborted
+          --min-tests 965 --allow-aborted
 
       - name: Build the jars
         run: ./gradlew --no-daemon build -x test
