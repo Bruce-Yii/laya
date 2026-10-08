@@ -574,6 +574,37 @@ class EndToEndTests(unittest.TestCase):
                 self.assertTrue(torch.allclose(before[name].half().float(), after[name].float()), name)
         self.assertFalse(torch.allclose(before["scorer.1.weight"].half().float(), after["scorer.1.weight"].float()))
 
+    def test_model_is_on_the_device_before_the_base_evaluation(self):
+        # finetune scores the base checkpoint before train_model moves the model, which crashed
+        # on CUDA and MPS (inputs on the device, weights on CPU). CPU cannot show the crash, so
+        # record the order instead: the model must be moved before the first calibration_records.
+        import laya.train as lt
+
+        events = []
+        real_load, real_records = lt.load_checkpoint, lt.calibration_records
+
+        def load_checkpoint(model_dir):
+            model, tok, cfg = real_load(model_dir)
+            real_to = model.to
+
+            def to(*args, **kwargs):
+                events.append(("to", torch.device(args[0] if args else kwargs["device"])))
+                return real_to(*args, **kwargs)
+
+            model.to = to
+            return model, tok, cfg
+
+        def calibration_records(model, tok, items, device, *args, **kwargs):
+            events.append(("records", device))
+            return real_records(model, tok, items, device, *args, **kwargs)
+
+        with patch("laya.train.load_checkpoint", load_checkpoint), \
+                patch("laya.train.calibration_records", calibration_records):
+            self.run_finetune("out_device", epochs=1)
+        cpu = torch.device("cpu")
+        first_eval = events.index(("records", cpu))
+        self.assertIn(("to", cpu), events[:first_eval], events)
+
     def test_frozen_encoder_runs_without_dropout(self):
         from laya.train import load_checkpoint
 
