@@ -1128,14 +1128,16 @@ class _TournamentRecorder:
 
 
 def _asked(questions):
-    """A recorded call: each question's type, instructions, labels, and dict criteria verbatim."""
-    from laya import shortlist as mod
+    """A recorded call: each question's type, instructions, labels, and dict criteria verbatim.
 
+    Labels are read without validation, so a call the reference really made with a duplicated
+    list label is recorded as made.
+    """
     out = {}
     for qid, qdef in questions.items():
         entry = {"type": qdef.get("type"), "instructions": qdef.get("instructions")}
         if qdef.get("type") == "choice":
-            entry["labels"] = [key for key, _value in mod._criteria_items(qdef["criteria"])]
+            entry["labels"] = list(qdef["criteria"])
             if isinstance(qdef["criteria"], dict):
                 entry["criteria"] = qdef["criteria"]
         out[qid] = entry
@@ -1226,6 +1228,54 @@ def tournament():
             "caller_questions_unmutated": unchanged,
         })
 
+    # A model that answers outside the group, with a non-label, or not at all. The reference
+    # advances whatever a round answered and fails only on a missing answer (at once) or when a
+    # dict-criteria question is cut to a label it lacks.
+    class Fixed:
+        def __init__(self, mode, label=None):
+            self.mode, self.label, self.calls = mode, label, []
+
+        def predict(self, state, questions, **kwargs):
+            self.calls.append({qid: dict(qdef) for qid, qdef in questions.items()})
+            if self.mode == "missing":
+                answers = {}
+            elif self.mode == "no-choice":
+                answers = {qid: {"type": "noul", "noul": 0.5} for qid in questions}
+            else:
+                answers = {qid: {"type": "choice", "choice": self.label} for qid in questions}
+            return {"model": "fixed-%d" % len(self.calls), "answers": answers}
+
+    def forty(as_list, n=40):
+        labels = ["l%02d" % i if n <= 100 else "l%03d" % i for i in range(n)]
+        return labels if as_list else {label: "about " + label for label in labels}
+
+    irregular = []
+    for name, criteria, mode, label in [
+        ("dict-out-of-group", forty(False), "label", "l39"),
+        ("list-out-of-group", forty(True), "label", "l39"),
+        ("dict-non-label", forty(False), "label", "zzz"),
+        ("list-non-label", forty(True), "label", "zzz"),
+        ("dict-non-label-next-round", forty(False, 300), "label", "zzz"),
+        ("list-non-label-two-rounds", forty(True, 300), "label", "zzz"),
+        ("dict-missing-answer", forty(False), "missing", None),
+        ("list-missing-answer", forty(True), "missing", None),
+        ("dict-answer-without-choice", forty(False), "no-choice", None),
+    ]:
+        questions = {"q": {"type": "choice", "instructions": "pick", "criteria": criteria}}
+        model = Fixed(mode, label)
+        row = {"name": name, "group_size": 16, "mode": mode, "label": label,
+               "questions": questions}
+        try:
+            result = mod.predict_tournament(model, state, questions, group_size=16)
+            row["error"] = None
+            row["answers"] = {qid: a["choice"] for qid, a in result["answers"].items()}
+            row["tournament"] = result["tournament"]
+        except Exception as failure:
+            row["error"] = type(failure).__name__
+            row["message"] = str(failure)
+        row["calls"] = [_asked(call) for call in model.calls]
+        irregular.append(row)
+
     refusals = []
     for bad in (1, 0, -3):
         try:
@@ -1241,6 +1291,7 @@ def tournament():
         "rank_probe": {label: str(_tournament_rank(label)) for label in ["", "a", "l0001", "注文"]},
         "splits": splits,
         "cases": cases,
+        "irregular": irregular,
         "refusals": refusals,
     }
 

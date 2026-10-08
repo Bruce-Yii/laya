@@ -8,6 +8,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import org.junit.jupiter.api.DisplayName;
@@ -345,19 +346,85 @@ class TournamentTest {
         assertEquals(List.of("small"), new ArrayList<>(out.tournament().keySet()));
     }
 
+    @TestFactory
+    @DisplayName("irregular round answers advance or fail exactly where the reference does")
+    List<DynamicTest> irregularAnswers() {
+        List<DynamicTest> tests = new ArrayList<>();
+        String state = (String) fixture().get("state");
+        for (Object entry : list(fixture().get("irregular"))) {
+            Map<String, Object> row = map(entry);
+            String name = (String) row.get("name");
+            tests.add(DynamicTest.dynamicTest(name, () -> assertIrregular(name, state, row)));
+        }
+        assertTrue(tests.size() >= 9, "only " + tests.size() + " irregular cases");
+        return tests;
+    }
+
+    /**
+     * One irregular case. A Java choice always has map criteria, so a list-criteria case is held
+     * to the dict outcome: duplicates collapse in what is asked, and a non-label fails at its cut.
+     */
+    private static void assertIrregular(String name, String state, Map<String, Object> row) {
+        Map<String, Object> spec = map(map(row.get("questions")).get("q"));
+        boolean listCriteria = spec.get("criteria") instanceof List;
+        String mode = (String) row.get("mode");
+        String label = (String) row.get("label");
+        List<Map<String, Question>> calls = new ArrayList<>();
+        Predictor fixed = (s, qs) -> {
+            calls.add(new LinkedHashMap<>(qs));
+            Map<String, Answer> answers = new LinkedHashMap<>();
+            for (String id : qs.keySet()) {
+                if ("label".equals(mode)) {
+                    answers.put(id, new Answer.Choice(label, Map.of(), 1, 1, 0));
+                } else if ("no-choice".equals(mode)) {
+                    answers.put(id, new Answer.Noul(0.5, 1, 1, 0));
+                }
+            }
+            return new Prediction("fixed-" + calls.size(), answers, noUsage());
+        };
+        Map<String, Question> questions = questions(map(row.get("questions")));
+        boolean nonLabel = "label".equals(mode) && !questions.get("q").labels().contains(label);
+        Object error = row.get("error");
+        if (listCriteria && nonLabel) {
+            assertEquals(null, error, name + ": the reference accepts a non-label in a list");
+            error = "KeyError";
+        }
+        List<Object> recorded = list(row.get("calls"));
+        if (error != null) {
+            assertEquals("KeyError", error, name);
+            IllegalArgumentException failed = assertThrows(IllegalArgumentException.class,
+                    () -> Shortlist.predictTournament(fixed, state, questions, 16));
+            assertTrue(failed.getMessage() != null && !failed.getMessage().isEmpty());
+            if (!(listCriteria && nonLabel)) {
+                assertEquals(recorded.size(), calls.size(), name + ": calls before the failure");
+            }
+            return;
+        }
+        Shortlist.Tournament result = Shortlist.predictTournament(fixed, state, questions, 16);
+        assertEquals(recorded.size(), calls.size(), name + ": calls");
+        for (int c = 0; c < recorded.size(); c++) {
+            Map<String, Object> asked = map(recorded.get(c));
+            assertEquals(new ArrayList<>(asked.keySet()), new ArrayList<>(calls.get(c).keySet()));
+            for (Map.Entry<String, Object> q : asked.entrySet()) {
+                List<String> labels = new ArrayList<>(new LinkedHashSet<>(
+                        strings(map(q.getValue()).get("labels"))));
+                assertEquals(labels, calls.get(c).get(q.getKey()).labels(),
+                        name + " call " + c + "." + q.getKey());
+            }
+        }
+        Map<String, Object> want = map(map(row.get("tournament")).get("q"));
+        Shortlist.Bracket got = result.tournament().get("q");
+        assertEquals(strings(want.get("labels")), got.labels(), name + ": bracket labels");
+        assertEquals(((Number) want.get("rounds")).intValue(), got.rounds());
+        assertEquals(map(row.get("answers")).get("q"),
+                ((Answer.Choice) result.prediction().answer("q")).choice());
+    }
+
     @Test
-    @DisplayName("a round answer outside its group, or missing, is refused")
-    void badRoundAnswerIsRefused() {
-        Predictor outside = (s, qs) -> new Prediction("stub", Map.of("0",
-                new Answer.Choice("l0039", Map.of(), 1, 1, 0)), noUsage());
-        IllegalStateException wrong = assertThrows(IllegalStateException.class,
-                () -> Shortlist.predictTournament(outside, "s", oneChoice(40), 16));
-        assertTrue(wrong.getMessage().contains("round question 0 of 'q'"), wrong.getMessage());
-        Predictor silent = (s, qs) -> new Prediction("stub", Map.of(), noUsage());
-        assertThrows(IllegalStateException.class,
-                () -> Shortlist.predictTournament(silent, "s", oneChoice(40), 16));
+    @DisplayName("a null round prediction is refused like a missing answer")
+    void nullRoundPredictionIsRefused() {
         Predictor nothing = (s, qs) -> null;
-        assertThrows(IllegalStateException.class,
+        assertThrows(IllegalArgumentException.class,
                 () -> Shortlist.predictTournament(nothing, "s", oneChoice(40), 16));
         assertThrows(IllegalArgumentException.class,
                 () -> Shortlist.predictTournament(nothing, "s", oneChoice(3), 16),

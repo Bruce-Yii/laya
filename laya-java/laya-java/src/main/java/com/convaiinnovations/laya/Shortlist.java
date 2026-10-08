@@ -302,10 +302,14 @@ public final class Shortlist {
      * tournament choice's probabilities are over its finalists only. The caller's map is not
      * modified.
      *
-     * @throws IllegalArgumentException if {@code groupSize} is below two
-     * @throws IllegalStateException    if a round's prediction does not answer a group with one of
-     *                                  its labels; the reference fails on such a label at the next
-     *                                  cut instead
+     * <p>A round's answer advances as given, as in the reference: an answer from outside its group
+     * is carried forward, and duplicates collapse when the question is cut.
+     *
+     * @throws IllegalArgumentException if {@code groupSize} is below two; if a round's prediction
+     *                                  has no choice answer for a group (the reference's
+     *                                  {@code KeyError}, raised at once); or if a question is cut
+     *                                  to a label it does not have (its {@code KeyError} at that
+     *                                  cut, in the next round or the final call)
      */
     public static Tournament predictTournament(Predictor predictor, Object state,
             Map<String, Question> questions, int groupSize) {
@@ -352,10 +356,10 @@ public final class Shortlist {
             for (int i = 0; i < groups.size(); i++) {
                 String id = Integer.toString(i);
                 Answer answer = answered == null ? null : answered.answer(id);
-                if (!(answer instanceof Answer.Choice choice)
-                        || !groups.get(i).contains(choice.choice())) {
-                    throw new IllegalStateException(String.format(
-                            "round question %s of %s was not answered with one of its labels: %s",
+                // Only a missing choice fails here; any label advances, as in the reference.
+                if (!(answer instanceof Answer.Choice choice) || choice.choice() == null) {
+                    throw new IllegalArgumentException(String.format(
+                            "round question %s of %s has no choice answer: %s",
                             id, PythonJson.repr(owners.get(i)), answer));
                 }
                 winners.computeIfAbsent(owners.get(i), key -> new ArrayList<>())
@@ -409,6 +413,10 @@ public final class Shortlist {
         Map<String, Object> criteria = criteriaOf(question);
         Map<String, Object> subset = new LinkedHashMap<>();
         for (String label : labels) {
+            if (!criteria.containsKey(label)) {
+                throw new IllegalArgumentException(
+                        "the choice has no label " + PythonJson.repr(label) + " to cut to");
+            }
             subset.put(label, criteria.get(label));
         }
         return Question.choice(question.instructions(), subset);
