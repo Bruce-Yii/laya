@@ -493,8 +493,9 @@ events no agent can:
 
 `Router.predict` also dispatches one `onPredictStart`/`onPredictEnd` pair for the answer. As in the
 reference, routing and loading run first, so the order is `onRoute`, any `onEvict`/`onLoad`, then
-the pair, and `elapsedMs` does not include a cold load. A routing or loading failure still reaches
-`onError` and `onPredictEnd`, with no start event. The agent's own pair still
+the pair, and on success `elapsedMs` does not include a cold load. A routing or loading failure
+reaches `onError` and `onPredictEnd`, with no start event, and its `elapsedMs` covers the routing
+and the failed load. The agent's own pair still
 fires for the forward pass, so a router-level hook and an agent-level hook see different spans.
 
 Hooks are dispatched outside the router's lock, so a hook may call back into the router —

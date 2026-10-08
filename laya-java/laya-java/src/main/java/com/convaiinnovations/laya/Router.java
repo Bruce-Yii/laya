@@ -962,12 +962,19 @@ public final class Router implements AutoCloseable, Predictor {
         }
     }
 
+    /** {@code addSuppressed}, unless the hook rethrew {@code failure} itself, which cannot suppress itself. */
+    private static void attachHookFailure(Throwable failure, Throwable hookFailure) {
+        if (hookFailure != failure) {
+            failure.addSuppressed(hookFailure);
+        }
+    }
+
     /** {@link #dispatchOutcome} on a failing path: a hook failure is attached, not substituted. */
     private void dispatchOwed(Checkpoint checkpoint, Outcome outcome, Throwable failure) {
         try {
             dispatchOutcome(checkpoint, outcome);
         } catch (RuntimeException | Error hookFailure) {
-            failure.addSuppressed(hookFailure);
+            attachHookFailure(failure, hookFailure);
         }
     }
 
@@ -1364,7 +1371,7 @@ public final class Router implements AutoCloseable, Predictor {
                         try {
                             dispatchLifecycle(Hooks.Event.EVICT, evicted);
                         } catch (RuntimeException | Error hookFailure) {
-                            failure.addSuppressed(hookFailure);
+                            attachHookFailure(failure, hookFailure);
                         }
                     }
                     throw failure;
@@ -1408,7 +1415,7 @@ public final class Router implements AutoCloseable, Predictor {
                         try {
                             dispatchLifecycle(Hooks.Event.EVICT, evicted);
                         } catch (RuntimeException | Error hookFailure) {
-                            failure.addSuppressed(hookFailure);
+                            attachHookFailure(failure, hookFailure);
                         }
                     }
                     throw failure;
@@ -1484,6 +1491,14 @@ public final class Router implements AutoCloseable, Predictor {
      */
     private Prediction predictRouted(Supplier<RouteDecision> decide, Object state,
             Map<String, Question> questions, String lang) {
+        // Before routing, as the reference does: a malformed call must not cold-load a
+        // checkpoint, fire on_load or evict a resident one before it is refused.
+        if (state == null) {
+            throw new IllegalArgumentException("state must not be null");
+        }
+        if (questions == null) {
+            throw new IllegalArgumentException("questions must not be null");
+        }
         List<Hook> composed = hooks.composeFor(HookCall.none());
         if (composed.isEmpty()) {
             RouteDecision decision = decide.get();
@@ -1492,6 +1507,7 @@ public final class Router implements AutoCloseable, Predictor {
             }
         }
         Hooks.Policy policy = hooks.policyFor(HookCall.none());
+        long startedAt = System.nanoTime();           // a failure's elapsedMs covers route + load
         RouteDecision decision = null;
         Lease lease;
         try {
@@ -1500,7 +1516,7 @@ public final class Router implements AutoCloseable, Predictor {
         } catch (RuntimeException | Error failure) {
             PredictContext failed = new PredictContext(Collections.singletonList(state), questions,
                     decision == null ? null : decision.model().wireName(), this);
-            Hooks.failedBeforeStart(composed, failed, policy, failure);
+            Hooks.failedBeforeStart(composed, failed, policy, failure, startedAt);
             throw failure;
         }
         // `Hooks.around` so ctx.skip, the error-before-end order, failure suppression and

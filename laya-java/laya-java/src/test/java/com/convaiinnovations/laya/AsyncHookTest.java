@@ -237,6 +237,86 @@ class AsyncHookTest {
     }
 
     @Test
+    @DisplayName("an interrupted wait cuts the callback off, as a deadline does")
+    void anInterruptedWaitAbandonsTheCallback() throws Exception {
+        ExecutorService pool = Executors.newSingleThreadExecutor();
+        try {
+            CountDownLatch started = new CountDownLatch(1);
+            CountDownLatch done = new CountDownLatch(1);
+            Hook async = AsyncHook.of(new Hook() {
+                @Override
+                public void onPredictStart(PredictContext c) {
+                    started.countDown();
+                    try {
+                        Thread.sleep(300);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                    try {
+                        c.states(List.of("late"));
+                    } catch (RuntimeException refused) {
+                        // refused, which is the point
+                    } finally {
+                        done.countDown();
+                    }
+                }
+            }, pool, Duration.ofSeconds(5));       // timed: an untimed join() ignores interrupts
+            assertLateWriteRefusedAfterInterrupt(ctx -> async.onPredictStart(ctx), started, done);
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
+    @Test
+    @DisplayName("an interrupted wait on a Hooks timeout thread cuts that hook off too")
+    void anInterruptedHooksWaitAbandonsTheHook() throws Exception {
+        CountDownLatch started = new CountDownLatch(1);
+        CountDownLatch done = new CountDownLatch(1);
+        Hook slow = new Hook() {
+            @Override
+            public void onPredictStart(PredictContext c) {
+                started.countDown();
+                try {
+                    Thread.sleep(300);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+                try {
+                    c.states(List.of("late"));
+                } catch (RuntimeException refused) {
+                    // refused, which is the point
+                } finally {
+                    done.countDown();
+                }
+            }
+        };
+        assertLateWriteRefusedAfterInterrupt(ctx -> Hooks.dispatch(List.of(slow),
+                Hooks.Event.PREDICT_START, ctx, Hooks.Policy.raising().timeout(Duration.ofSeconds(5))),
+                started, done);
+    }
+
+    private static void assertLateWriteRefusedAfterInterrupt(
+            java.util.function.Consumer<PredictContext> waitOn, CountDownLatch started,
+            CountDownLatch done) throws Exception {
+        PredictContext ctx = ctx();
+        AtomicReference<Throwable> caught = new AtomicReference<>();
+        Thread caller = new Thread(() -> {
+            try {
+                waitOn.accept(ctx);
+            } catch (RuntimeException e) {
+                caught.set(e);
+            }
+        });
+        caller.start();
+        assertTrue(started.await(3, TimeUnit.SECONDS));
+        caller.interrupt();
+        caller.join(3_000);
+        assertTrue(caught.get() instanceof IllegalStateException, String.valueOf(caught.get()));
+        assertTrue(done.await(3, TimeUnit.SECONDS));
+        assertEquals(List.of("state"), ctx.states(), "a write after the caller moved on landed");
+    }
+
+    @Test
     @DisplayName("a non-positive timeout is refused rather than meaning 'never wait'")
     void refusesANonPositiveTimeout() {
         ExecutorService pool = Executors.newSingleThreadExecutor();

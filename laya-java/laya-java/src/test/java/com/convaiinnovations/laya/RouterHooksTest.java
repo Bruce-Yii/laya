@@ -2,6 +2,7 @@ package com.convaiinnovations.laya;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -300,8 +301,10 @@ class RouterHooksTest {
             IllegalStateException thrown = assertThrows(IllegalStateException.class,
                     () -> router.predict("hello", questions()));
             assertEquals("no weights here", thrown.getMessage());
-            List<String> kinds = trace.events.stream().map(e -> e.split(":")[0]).toList();
-            assertEquals(List.of("route", "error", "end"), kinds, trace.events.toString());
+            // The load was attempted on a decided checkpoint, so error and end name it, as the
+            // reference's ctx.model does once route() has returned.
+            String model = trace.events.get(0).split(":")[1];
+            assertEquals(List.of("route:" + model, "error:" + model, "end:" + model), trace.events);
         }
     }
 
@@ -377,6 +380,143 @@ class RouterHooksTest {
             router.hooks().addHook(trace);
             router.load("english");
             assertEquals(List.of("load:english"), trace.events);
+        }
+    }
+
+    /** A factory that keeps every session it hands out, so a test can see which were closed. */
+    private static Router.AgentFactory recording(Path root, List<TinyCheckpoint.RecordingSession> out) {
+        return checkpoint -> {
+            TinyCheckpoint.RecordingSession session = new TinyCheckpoint.RecordingSession();
+            out.add(session);
+            return TinyCheckpoint.agent(root, session);
+        };
+    }
+
+    @Test
+    @DisplayName("a hooked predict releases its lease, so unloading closes the agent")
+    void hookedPredictReleasesItsLease(@TempDir Path root) throws IOException {
+        TinyCheckpoint.write(root, 64, 32);
+        List<TinyCheckpoint.RecordingSession> sessions = new ArrayList<>();
+        try (Router router = Router.builder().agents(recording(root, sessions)).build()) {
+            router.hooks().addHook(new Trace());
+            router.predict("hello", questions());
+            router.unloadAll();
+            assertEquals(1, sessions.size());
+            assertTrue(sessions.get(0).closed, "a held lease keeps a retired agent open forever");
+        }
+    }
+
+    @Test
+    @DisplayName("a hooked predict whose start hook throws still releases its lease")
+    void hookedPredictReleasesItsLeaseOnFailure(@TempDir Path root) throws IOException {
+        TinyCheckpoint.write(root, 64, 32);
+        List<TinyCheckpoint.RecordingSession> sessions = new ArrayList<>();
+        try (Router router = Router.builder().agents(recording(root, sessions)).build()) {
+            router.hooks().addHook(new Hook() {
+                @Override
+                public void onPredictStart(PredictContext ctx) {
+                    throw new IllegalStateException("start refused");
+                }
+            });
+            assertThrows(IllegalStateException.class, () -> router.predict("hello", questions()));
+            router.unloadAll();
+            assertTrue(sessions.get(0).closed, "a held lease keeps a retired agent open forever");
+        }
+    }
+
+    @Test
+    @DisplayName("unloadAll: every eviction is dispatched and a hook failure is attached, not swapped")
+    void unloadAllDoesNotMaskTheCloseFailure(@TempDir Path root) throws IOException {
+        TinyCheckpoint.write(root, 64, 32);
+        Trace trace = new Trace();
+        try (Router router = Router.builder().agents(angryEnglish(root)).maxLoaded(2).build()) {
+            router.load("english");
+            router.load("multilingual");
+            router.hooks().addHook(trace);            // first, so it sees the event that throws
+            router.hooks().addHook(throwsOnceOnEvict(new IllegalArgumentException("the sink refused it")));
+            IllegalStateException thrown =
+                    assertThrows(IllegalStateException.class, router::unloadAll);
+            assertEquals("a native close can fail", thrown.getMessage());
+            assertEquals(1, thrown.getSuppressed().length);
+            assertEquals(List.of("evict:english", "evict:multilingual"), trace.events,
+                    "a hook failure on the first eviction must not skip the second");
+        }
+    }
+
+    @Test
+    @DisplayName("null questions are refused before routing: nothing is built, loaded or evicted")
+    void nullQuestionsAreRefusedBeforeAnyLoad(@TempDir Path root) throws IOException {
+        TinyCheckpoint.write(root, 64, 32);
+        StubAgents agents = new StubAgents(root);
+        Trace trace = new Trace();
+        try (Router router = Router.builder().agents(agents).build()) {
+            router.hooks().addHook(trace);
+            assertThrows(IllegalArgumentException.class, () -> router.predict("hello", null));
+            assertEquals(0, agents.builds);
+            assertEquals(List.of(), trace.events);
+        }
+    }
+
+    @Test
+    @DisplayName("a failure before start: elapsedMs covers the load, ctx.error is the failure")
+    void aFailureBeforeStartIsTimedAndCarriesTheError(@TempDir Path root) throws IOException {
+        IllegalStateException failure = new IllegalStateException("no weights here");
+        Router.AgentFactory slow = checkpoint -> {
+            try {
+                Thread.sleep(60);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            throw failure;
+        };
+        AtomicReference<Double> elapsed = new AtomicReference<>();
+        AtomicReference<Throwable> seen = new AtomicReference<>();
+        try (Router router = Router.builder().agents(slow).build()) {
+            router.hooks().addHook(new Hook() {
+                @Override
+                public void onPredictEnd(PredictContext ctx) {
+                    elapsed.set(ctx.elapsedMs());
+                    seen.set(ctx.error());
+                }
+            });
+            assertSame(failure, assertThrows(IllegalStateException.class,
+                    () -> router.predict("hello", questions())));
+            assertTrue(elapsed.get() >= 50.0, "elapsedMs " + elapsed.get() + " missed the load");
+            assertSame(failure, seen.get());
+        }
+    }
+
+    @Test
+    @DisplayName("an on_error hook that rethrows ctx.error() leaves the caller the real failure")
+    void aRethrowingErrorHookDoesNotReplaceTheFailure(@TempDir Path root) throws IOException {
+        Router.AgentFactory broken = checkpoint -> {
+            throw new IllegalStateException("no weights here");
+        };
+        try (Router router = Router.builder().agents(broken).build()) {
+            router.hooks().addHook(new Hook() {
+                @Override
+                public void onError(PredictContext ctx) {
+                    throw (RuntimeException) ctx.error();     // log-and-rethrow
+                }
+            });
+            IllegalStateException thrown = assertThrows(IllegalStateException.class,
+                    () -> router.predict("hello", questions()));
+            assertEquals("no weights here", thrown.getMessage());
+        }
+    }
+
+    @Test
+    @DisplayName("an Error while loading still reaches on_error and on_predict_end")
+    void anErrorBeforeStartIsReported(@TempDir Path root) throws IOException {
+        Trace trace = new Trace();
+        Router.AgentFactory native_ = checkpoint -> {
+            throw new UnsatisfiedLinkError("no onnxruntime here");
+        };
+        try (Router router = Router.builder().agents(native_).build()) {
+            router.hooks().addHook(trace);
+            assertThrows(UnsatisfiedLinkError.class, () -> router.predict("hello", questions()));
+            List<String> kinds = trace.events.stream().map(e -> e.split(":")[0]).toList();
+            assertEquals(List.of("route", "error", "end"), kinds, trace.events.toString());
         }
     }
 

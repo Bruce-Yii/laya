@@ -1,5 +1,7 @@
 package com.convaiinnovations.laya.hooks;
 
+import static java.util.Objects.requireNonNull;
+
 import com.convaiinnovations.laya.Prediction;
 import com.convaiinnovations.laya.Question;
 import java.time.Duration;
@@ -567,6 +569,8 @@ public final class Hooks {
             // flag: a caller up the stack that polls `Thread.interrupted()` to decide whether to
             // shut down would otherwise be told it was never asked to.
             Thread.currentThread().interrupt();
+            // The call stops waiting here, so the hook is cut off exactly as on a deadline.
+            ctx.abandon(runner);
             throw new IllegalStateException("interrupted while waiting for hook "
                     + hookName(hook) + "." + event.wireName(), interrupted);
         }
@@ -741,7 +745,7 @@ public final class Hooks {
             } catch (RuntimeException | Error hookFailure) {
                 // Attached, never substituted: the thing that broke the request is what the
                 // caller has to catch, and a failing observer must not be able to hide it.
-                problem.addSuppressed(hookFailure);
+                attach(problem, hookFailure);
             }
         }
 
@@ -755,7 +759,7 @@ public final class Hooks {
             if (raised == null) {
                 throw hookFailure;
             }
-            raised.addSuppressed(hookFailure);
+            attach(raised, hookFailure);
         }
 
         if (raised instanceof RuntimeException problem) {
@@ -770,20 +774,41 @@ public final class Hooks {
     /**
      * Reports a failure that happened before {@code on_predict_start} could fire -- routing or
      * loading, which the reference runs inside its predict {@code try} -- as {@code on_error} and
-     * then {@code on_predict_end}. A hook failure is attached to {@code problem}, never substituted.
+     * then {@code on_predict_end}, with {@code elapsedMs} measured from {@code startedAtNanos}.
+     * A hook failure is attached to {@code problem}, never substituted.
+     *
+     * <p>For a {@link com.convaiinnovations.laya.Predictor} that must do work before its start
+     * event, as {@code Router} does. {@code ctx} must be fresh: one that already carries results
+     * or an error belongs to a call that has been reported, and is refused.
      */
     public static void failedBeforeStart(List<? extends Hook> hooks, PredictContext ctx,
-                                         Policy policy, Throwable problem) {
+                                         Policy policy, Throwable problem, long startedAtNanos) {
+        requireNonNull(problem, "problem");
+        if (ctx.results() != null || ctx.error() != null) {
+            throw new IllegalStateException(
+                    "failedBeforeStart needs a fresh context; this one already has an outcome");
+        }
         ctx.error(problem);
         try {
             dispatch(hooks, Event.ERROR, ctx, policy);
         } catch (RuntimeException | Error hookFailure) {
-            problem.addSuppressed(hookFailure);
+            attach(problem, hookFailure);
         }
-        ctx.elapsedMs((System.nanoTime() - ctx.startedAt()) / 1_000_000.0);
+        ctx.elapsedMs((System.nanoTime() - startedAtNanos) / 1_000_000.0);
         try {
             dispatch(hooks, Event.PREDICT_END, ctx, policy);
         } catch (RuntimeException | Error hookFailure) {
+            attach(problem, hookFailure);
+        }
+    }
+
+    /**
+     * {@code addSuppressed}, except when a hook rethrew the failure it was shown: a throwable
+     * cannot suppress itself, and trying replaces the real failure with an
+     * {@code IllegalArgumentException}.
+     */
+    private static void attach(Throwable problem, Throwable hookFailure) {
+        if (hookFailure != problem) {
             problem.addSuppressed(hookFailure);
         }
     }

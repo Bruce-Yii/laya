@@ -7,6 +7,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -65,9 +66,7 @@ public final class PredictContext {
      * <p>Empty for every call that does not use {@link Hooks.Policy#timeout}, and at most one
      * entry per overrun. A set rather than a flag because a chain can overrun more than once.
      */
-    // A count, not a set: a hook abandoned by Hooks can call an AsyncHook that abandons and
-    // releases the same thread, and that release must not cancel the outer abandonment.
-    private final Map<Thread, Integer> abandoned = new ConcurrentHashMap<>();
+    private final Set<Thread> abandoned = ConcurrentHashMap.newKeySet();
 
     /**
      * A context for one call.
@@ -310,20 +309,20 @@ public final class PredictContext {
      * call stops being able to wait for it. See {@link #states(List)}.
      */
     void abandon(Thread runner) {
-        abandoned.merge(runner, 1, Integer::sum);
+        abandoned.add(runner);
     }
 
     /**
      * Undoes one {@link #abandon} once the overrunning task has returned, so a pooled thread that
      * runs this call's next callback is not refused for the previous one's overrun. Only the
-     * caller that abandoned may release, and abandonments of one thread nest.
+     * caller that abandoned a thread may release it.
      */
     void release(Thread runner) {
-        abandoned.computeIfPresent(runner, (thread, count) -> count == 1 ? null : count - 1);
+        abandoned.remove(runner);
     }
 
     private void refuseIfAbandoned(String what) {
-        if (!abandoned.isEmpty() && abandoned.containsKey(Thread.currentThread())) {
+        if (!abandoned.isEmpty() && abandoned.contains(Thread.currentThread())) {
             throw new IllegalStateException(String.format(
                     "laya: hook thread %s exceeded its deadline and was abandoned; this call has "
                     + "moved on, so ctx.%s() is refused rather than applied to it",
