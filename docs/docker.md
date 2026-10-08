@@ -26,7 +26,7 @@ For ARM64 hosts, DGX Spark and Apple Silicon, see
 
 Install a compatible NVIDIA driver and configure Docker with the
 [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html).
-The GPU image uses PyTorch CUDA 12.8 wheels. Check your GPU's compute capability
+The GPU image uses PyTorch CUDA 13.0 wheels. Check your GPU's compute capability
 and driver against [PyTorch's supported builds](https://pytorch.org/get-started/locally/);
 older cards may require a different build. Allow additional disk space for CUDA
 layers. VRAM needs depend on the checkpoint, batch size and input length.
