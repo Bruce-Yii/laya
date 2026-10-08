@@ -335,22 +335,28 @@ function reportHookFailure(hook: Hook, event: HookEvent, err: unknown): void {
  */
 
 /** Run a promise with a timeout, returning void if it completes or throwing on timeout. */
-async function runWithTimeout<T>(
-  promise: Promise<T>,
+async function runWithTimeout(
+  promise: unknown,
   timeoutMs: number | null,
   operationName: string,
-): Promise<T> {
-  if (timeoutMs === null || timeoutMs === undefined) return promise;
+): Promise<void> {
+  if (timeoutMs === null || timeoutMs === undefined) {
+    await promise;
+    return;
+  }
   
   const abortController = new AbortController();
   const timeoutId = setTimeout(() => abortController.abort(), timeoutMs);
   
   try {
-    return await Promise.race([promise, new Promise<never>((_, reject) => {
-      abortController.signal.addEventListener("abort", () => {
-        reject(new Error(`hook ${operationName} timed out after ${timeoutMs}ms")));
-      });
-    })]);
+    await Promise.race([
+      Promise.resolve(promise),
+      new Promise<never>((_, reject) => {
+        abortController.signal.addEventListener("abort", () => {
+          reject(new Error(`hook ${operationName} timed out after ${timeoutMs}ms`));
+        });
+      }),
+    ]);
   } finally {
     clearTimeout(timeoutId);
   }
@@ -360,10 +366,10 @@ export function dispatch(
   hooks: Hook[],
   event: HookEvent,
   ctx: PredictContext,
-  opts: { raiseErrors?: boolean; timeoutMs?: number | null } = {},
+  opts: { raiseErrors?: boolean; timeoutMs?: number | null; hook?: Hook } = {},
 ): void {
   const timeoutMs = opts.timeoutMs ?? null;
-  const operationName = `${(opts.hook?.constructor?.name ?? "hook")}.`;
+  const operationName = `${((opts.hook as object | undefined)?.constructor?.name ?? "hook")}.`;
   const raiseErrors = opts.raiseErrors ?? true;
   for (const hook of hooks) {
     const method = hook?.[event];
@@ -389,7 +395,7 @@ export async function dispatchAsync(
   opts: { raiseErrors?: boolean; timeoutMs?: number | null; hook?: Hook } = {},
 ): Promise<void> {
   const timeoutMs = opts.timeoutMs ?? null;
-  const operationName = `${(opts.hook?.constructor?.name ?? "hook")}.`;
+  const operationName = `${((opts.hook as object | undefined)?.constructor?.name ?? "hook")}.`;
   const raiseErrors = opts.raiseErrors ?? true;
   for (const hook of hooks) {
     const method = hook?.[event];
