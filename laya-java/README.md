@@ -247,6 +247,17 @@ passthrough: the labels come back in order and **the embedder is never called**.
 Both `Agent` and `Router` implement `Predictor`, so shortlisting works identically against a fixed
 checkpoint or a routed one.
 
+Without an embedder, `Shortlist.predictTournament` lets the model narrow the set itself: labels are
+answered in near-equal groups of at most 16 (one prediction per round covers every group of every
+question), and the winners meet in one final prediction.
+
+```java
+Shortlist.Tournament out = Shortlist.predictTournament(agent, state, questions);
+
+out.prediction();                    // the final call's answers and usage, over the finalists
+out.tournament().get("intent");      // the finalists, the label count and the rounds played
+```
+
 ## Cleaning an email
 
 `laya.email`'s cleaner and state builder. The markers cover English, Portuguese, Spanish and

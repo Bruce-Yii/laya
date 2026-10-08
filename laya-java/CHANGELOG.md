@@ -110,6 +110,8 @@ see [Installing](README.md#installing).
 - `Router`: checkpoint selection with its reason strings, plus a load-and-evict lifecycle with
   leases, so a checkpoint in use is never closed under a caller.
 - `Shortlist`: cosine ranking over a caller's embedder, with an LRU cache and numpy's tie order.
+- `Shortlist.predictTournament`: elimination rounds over a large choice, a port of
+  `predict_tournament`, with no embedder.
 - `LayaEmail`: `cleanEmailBody` and `emailState`, with the English, Portuguese, Spanish and French
   marker sets, and `emailQuestions` re-exported from `Presets`.
 - `Decisions`: schema-driven decisions — `decide` and `decideBatch` over a JSON schema. An
