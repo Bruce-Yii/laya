@@ -943,6 +943,7 @@ def create_app(router: Optional[Any] = None):
     # predictions can share a checkpoint -- a GPU-shaped choice this endpoint does not
     # rely on). `loop.run_in_executor` is the API the issue asked for.
     pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="laya-infer")
+    pool_closed = False
     # Created on first request, not here: an `asyncio.Lock` binds to the loop that is
     # running when it is first awaited, and `create_app` may be called before that loop
     # exists (module scope, TestClient startup, a preload script).
@@ -992,6 +993,15 @@ def create_app(router: Optional[Any] = None):
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
+        nonlocal pool, pool_closed, gate, admission
+        # A host can run one app's lifespan more than once (a TestClient per test, an embedding
+        # server that restarts it). The previous shutdown closed the pool, and the gate and the
+        # admission semaphore bind to the loop they first waited on, which a restart replaces.
+        if pool_closed:
+            pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="laya-infer")
+            pool_closed = False
+        gate = None
+        admission = None
         reaper = asyncio.create_task(_idle_reaper()) if idle_unload_seconds else None
         try:
             yield
@@ -1005,6 +1015,7 @@ def create_app(router: Optional[Any] = None):
             # TestClient, embedded ASGI apps, and process supervisors all need
             # the executor to drain when the app stops.
             pool.shutdown(wait=True, cancel_futures=True)
+            pool_closed = True
 
     app = FastAPI(
         title="laya-serve",
