@@ -178,22 +178,25 @@ one ships every other low-confidence answer unannotated.
 
 ### Routing override
 
-`on_route` may replace `ctx.decision` to pin a checkpoint for a class of traffic.
+`on_route` may replace `ctx.decision` to pin a checkpoint for a class of traffic. It has to be a
+hook object: the convenience callables cover `on_predict_start` / `on_predict_end` only, so a bare
+function in `hooks=` is refused (see [plain callables in `hooks=`](#plain-callables-in-hooks)).
 
 ```python
 from laya.router import RouteDecision
 
-def pin(ctx):
-    if "refund" in str(ctx.states[0]).lower():
-        ctx.decision = RouteDecision(
-            model="typed-decisions",
-            repo="convaiinnovations/laya/typed-decisions",
-            reason="refund workflow",
-            detection=None,
-            workflow=None,
-        )
+class Pin:
+    def on_route(self, ctx):
+        if "refund" in str(ctx.states[0]).lower():
+            ctx.decision = RouteDecision(
+                model="typed-decisions",
+                repo="convaiinnovations/laya/typed-decisions",
+                reason="refund workflow",
+                detection=None,
+                workflow=None,
+            )
 
-Router(hooks=[pin])
+Router(hooks=[Pin()])
 ```
 
 ### Model lifecycle
@@ -248,7 +251,8 @@ earlier one.
 ### Scoped instrumentation
 
 Attach a tracer or debug hook only for the code that needs it, instead of reconstructing the
-agent. `hooks_installed` restores the previous list on exit, even if the block raises.
+agent. On exit -- even if the block raises -- `hooks_installed` removes one occurrence of each
+hook it installed, and nothing else: a hook added inside the block with `add_hook` outlives it.
 
 ```python
 with agent.hooks_installed(DebugDump()):
