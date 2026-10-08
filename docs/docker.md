@@ -345,6 +345,8 @@ These apply to the `laya-serve` service only.
 | `LAYA_API_KEY` | (none) | when set, requires `Authorization: Bearer <key>` |
 | `LAYA_ROOT_PATH` | (empty) | public URL prefix for FastAPI when behind a reverse proxy; the proxy should strip it before forwarding |
 | `LAYA_MAX_TOKEN_BUDGET` | `8192` | cap on per-request `max_len` and `head_max_len` overrides |
+| `LAYA_MAX_BATCH_TOKENS` | `131072` | tokens one `/v1/systemone/batch` forward pass may collate (`states` × questions × row width); a larger batch is split into several passes, not refused |
+| `LAYA_JEV_STRICT` | `0` | `1` serves the strict Jev wire contract (no root `routing`, no per-answer `action` / `answer_confidence`, reduced `usage`) for strict Jev clients |
 | `LAYA_SHA256_DIGESTS` | (none) | JSON digests checked before a checkpoint is parsed: `{artifact: digest}` for every checkpoint, or `{model: {artifact: digest}}` per checkpoint. See [Security](security.md) |
 
 For example, set `LAYA_ROOT_PATH=/laya` when publishing the API under `/laya`. The proxy must

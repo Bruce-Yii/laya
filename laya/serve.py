@@ -41,6 +41,7 @@ env var                    meaning                                        defaul
                            a ``["repo", "subfolder"]`` pair. Served under
                            explicit ``model=`` like a built-in.
 ``LAYA_MAX_TOKEN_BUDGET``  cap on per-request max_len / head_max_len       8192
+``LAYA_MAX_BATCH_TOKENS``  cap on batch forward tokens (states x q x len)  131072
 ``LAYA_JEV_STRICT``        if set, serve the strict Jev wire contract: no   0
                            root `routing`, no per-answer `action` /
                            `answer_confidence`, no `confidence` on noul
