@@ -37,6 +37,7 @@ Everything is environment variables, so one image serves a laptop dev run and a 
 | `LAYA_MAX_LOADED` | checkpoints kept resident at once; a cap below what routing chooses rebuilds one per switch, and `preload()` raises it to hold whatever it builds | `2` |
 | `LAYA_MAX_TOKEN_BUDGET` | server-side ceiling on the per-request `max_len` and `head_max_len` overrides; a larger value is a `422`. Unparseable or non-positive input logs a warning and falls back | `8192` |
 | `LAYA_DEFAULT_MODEL` | checkpoint a state with no language evidence falls back to; aliases such as `ml` resolve the way core resolves them, and an unresolvable name stops the server at startup | `english` |
+| `LAYA_EXTRA_MODELS` | JSON object `{name: source}` registering extra checkpoints beside the bundled ones: a Hub repo id or local checkpoint directory as a string, or a `["repo", "subfolder"]` pair. Names get the same `model=` pin a built-in does; a malformed value or bad name stops the server at startup | none |
 | `LAYA_API_KEY` | if set, require `Authorization: Bearer <key>` | none |
 | `LAYA_LOG_LEVEL` | uvicorn log level | `info` |
 | `LAYA_MAX_CONCURRENT` | requests admitted past auth at once; excess gets `503` | `16` |
@@ -143,7 +144,9 @@ now get the same answer.
 
 `model` is accepted so a Jev client can keep sending one. The public Hugging Face ids
 (`convaiinnovations/laya-multilingual`, `convaiinnovations/laya-typed-decisions`), the checkpoint
-names (`english`, `multilingual`, `typed-decisions`) and their aliases select a checkpoint.
+names (`english`, `multilingual`, `typed-decisions`) and their aliases select a checkpoint, and so
+does every name `LAYA_EXTRA_MODELS` registered on this server's Router -- including a name that
+re-points a built-in, which is how a fine-tune is served under `english` without a code change.
 `convaiinnovations/laya`, and any other value that is not a path or a Hub repo id -- including a
 Jev id like `jev-1` -- means "let the router choose", and the response's `routing` block records
 what was chosen and why. A value that looks like a filesystem path or an unpublished Hub id
