@@ -3344,6 +3344,74 @@ def test_idle_unload_retries_failure_and_stops_at_shutdown(monkeypatch):
     assert not router.unloaded.wait(0.15)
 
 
+# -------------------------------- an app can be started again after its lifespan stops
+# The lifespan shuts the inference pool down (#319), and a host can run one app's lifespan more
+# than once: a TestClient per test module, an embedding server that restarts it. The pool was made
+# once in create_app, so after a second startup every request was a 500 "inference failed" from
+# "cannot schedule new futures after shutdown", and the idle reaper logged the same each tick.
+@pytest.mark.parametrize("batch", [False, True])
+def test_an_app_serves_again_after_its_lifespan_restarts(monkeypatch, batch):
+    monkeypatch.delenv("LAYA_API_KEY", raising=False)
+    monkeypatch.delenv("LAYA_IDLE_UNLOAD_SECONDS", raising=False)
+    app = create_app(FakeRouter())
+    path = "/v1/systemone/batch" if batch else "/v1/systemone"
+    body = {"states": [REQ["state"]], "questions": REQ["questions"]} if batch else REQ
+    statuses = []
+    for _ in range(2):
+        with TestClient(app) as client:
+            statuses.append(client.post(path, json=body).status_code)
+    assert statuses == [200, 200]
+
+
+def test_idle_unload_runs_again_after_a_restart(monkeypatch):
+    monkeypatch.setenv("LAYA_IDLE_UNLOAD_SECONDS", "0.05")
+    monkeypatch.delenv("LAYA_API_KEY", raising=False)
+    router = IdleRouter()
+    app = create_app(router)
+    with TestClient(app):
+        assert router.unloaded.wait(2.0)
+    router.loaded = ["english"]
+    router.unloaded.clear()
+    with TestClient(app):
+        assert router.unloaded.wait(2.0)
+
+
+def test_a_restarted_app_still_queues_concurrent_requests(monkeypatch):
+    # The inference gate binds to the event loop the first time a request has to wait on it, and
+    # a restarted lifespan runs on a new loop. A gate carried over from the first run made the
+    # second run's queued request fail with "is bound to a different event loop".
+    import threading
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    monkeypatch.delenv("LAYA_API_KEY", raising=False)
+    monkeypatch.delenv("LAYA_IDLE_UNLOAD_SECONDS", raising=False)
+
+    class SlowRouter(FakeRouter):
+        def __init__(self):
+            super().__init__()
+            self.entered = threading.Event()
+            self.release = threading.Event()
+
+        def predict(self, *args, **kwargs):
+            self.entered.set()
+            assert self.release.wait(3.0)
+            return super().predict(*args, **kwargs)
+
+    router = SlowRouter()
+    app = create_app(router)
+    for _ in range(2):
+        router.entered.clear()
+        router.release.clear()
+        with TestClient(app) as client, ThreadPoolExecutor(max_workers=2) as callers:
+            first = callers.submit(client.post, "/v1/systemone", json=REQ)
+            assert router.entered.wait(2.0)
+            second = callers.submit(client.post, "/v1/systemone", json=REQ)
+            time.sleep(0.2)  # the second request is now waiting on the gate
+            router.release.set()
+            assert [first.result(timeout=5).status_code, second.result(timeout=5).status_code] == [200, 200]
+
+
 # -------------------------------- docs/typescript-sdk.md must list the keys the /health handler returns
 # The SDK page's contract sentence used to say "public `/health` returns `status`, `loaded`,
 # and `device`" while `laya/serve.py`'s authorized branch returns seven keys -- `status`,
