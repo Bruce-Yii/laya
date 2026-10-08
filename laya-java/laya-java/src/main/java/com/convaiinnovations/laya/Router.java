@@ -1,5 +1,10 @@
 package com.convaiinnovations.laya;
 
+import com.convaiinnovations.laya.hooks.Hook;
+import com.convaiinnovations.laya.hooks.HookCall;
+import com.convaiinnovations.laya.hooks.HookRegistry;
+import com.convaiinnovations.laya.hooks.Hooks;
+import com.convaiinnovations.laya.hooks.PredictContext;
 import com.convaiinnovations.laya.json.PythonJson;
 import com.convaiinnovations.laya.lang.LanguageDetection;
 import com.convaiinnovations.laya.lang.UnicodeTables;
@@ -367,10 +372,21 @@ public final class Router implements AutoCloseable, Predictor {
     private final LanguageHint langGuess;
     private final AgentFactory agents;
 
+    /**
+     * This router's hooks, separate from any agent's: these see {@code on_route}, {@code on_load}
+     * and {@code on_evict}, and one predict pair for the whole route-and-answer call.
+     */
+    private final HookRegistry hooks = new HookRegistry();
+
     private final ReentrantLock lock = new ReentrantLock();
     /** Serialises builds, so two cold loads do not hold two checkpoints in flight at once. */
     private final ReentrantLock buildLock = new ReentrantLock();
     private final Map<Checkpoint, Slot> slots = new LinkedHashMap<>();
+    /** This router's hooks: install, remove, and set the error, timeout and concurrency policy. */
+    public HookRegistry hooks() {
+        return hooks;
+    }
+
     /** Least recently used first, which is the end eviction takes from. */
     private final List<Checkpoint> order = new ArrayList<>();
     private final Map<Checkpoint, InFlight> loading = new LinkedHashMap<>();
@@ -403,7 +419,9 @@ public final class Router implements AutoCloseable, Predictor {
     public static final class Builder {
 
         private final Map<Checkpoint, ModelSpec> overrides = new LinkedHashMap<>();
-        private Checkpoint defaultCheckpoint = Checkpoint.ENGLISH;
+        // Follows the reference, which moved this to multilingual: undecided Latin text is no
+        // evidence of English, and multilingual leads on 50 of the 51 languages swept.
+        private Checkpoint defaultCheckpoint = Checkpoint.MULTILINGUAL;
         private boolean autoTaskDetection;
         private boolean standaloneRepos;
         private LanguageHint langGuess;
@@ -723,6 +741,16 @@ public final class Router implements AutoCloseable, Predictor {
      */
     public RouteDecision route(Object state, Map<String, Question> questions,
             RouteOptions options) {
+        RouteDecision decision = decide(state, questions, options);
+        // One dispatch point: `decide` returns from six branches, and a hook that fired from five
+        // of them would be worse than none.
+        dispatchLifecycle(Hooks.Event.ROUTE, decision.model());
+        return decision;
+    }
+
+    /** The routing itself, with no hooks, so {@link #route} has a single place to dispatch from. */
+    private RouteDecision decide(Object state, Map<String, Question> questions,
+            RouteOptions options) {
         RouteOptions settings = options == null ? RouteOptions.none() : options;
 
         if (settings.model() != null) {
@@ -849,7 +877,17 @@ public final class Router implements AutoCloseable, Predictor {
     /** Borrow the agent for a checkpoint. */
     public Lease lease(Checkpoint checkpoint) {
         requireNonNull(checkpoint, "checkpoint");
-        Slot slot = acquire(checkpoint);
+        Outcome outcome = new Outcome();
+        Slot slot = acquire(checkpoint, outcome);
+        // Before the Lease is handed over, so on_load precedes any use of the agent -- but the
+        // lease is this method's until the Lease exists, so a throwing hook must not strand it.
+        // `build` guards the same shape at the `release(built); throw` below.
+        try {
+            dispatchOutcome(checkpoint, outcome);
+        } catch (RuntimeException | Error failure) {
+            release(slot);
+            throw failure;
+        }
         return new Lease(checkpoint, slot);
     }
 
@@ -865,13 +903,60 @@ public final class Router implements AutoCloseable, Predictor {
      */
     public Agent load(String name) {
         Checkpoint checkpoint = normaliseName(name);
-        Slot slot = acquire(checkpoint);
-        release(slot);
-        return slot.agent;
+        Outcome outcome = new Outcome();
+        try {
+            Slot slot = acquire(checkpoint, outcome);
+            release(slot);
+            return slot.agent;
+        } finally {
+            // `finally`: a build that published and then threw while closing the evicted agent
+            // still loaded and still evicted, so both events are owed. After `release`, so a hook
+            // calling back in does not find this call holding a lease.
+            dispatchOutcome(checkpoint, outcome);
+        }
+    }
+
+    /**
+     * What one {@link #acquire} did, so its hooks fire after the lock is released. Dispatching
+     * under {@code lock} would let a blocking hook park every other caller.
+     */
+    private static final class Outcome {
+
+        private boolean built;
+        private final List<Checkpoint> evicted = new ArrayList<>();
+    }
+
+    /**
+     * Dispatch one router lifecycle event. MUST be called with no router lock held -- see
+     * {@link Outcome}.
+     */
+    private void dispatchLifecycle(Hooks.Event event, Checkpoint checkpoint) {
+        List<Hook> composed = hooks.composeFor(HookCall.none());
+        if (composed.isEmpty()) {
+            return;                        // no hooks: build no context, resolve no policy
+        }
+        PredictContext ctx = new PredictContext(List.of(), Map.of(),
+                checkpoint == null ? null : checkpoint.wireName(), this);
+        Hooks.dispatch(composed, event, ctx, hooks.policyFor(HookCall.none()));
+    }
+
+    /** The load and evict events one acquire owes, in that order. */
+    private void dispatchOutcome(Checkpoint checkpoint, Outcome outcome) {
+        if (outcome.built) {
+            dispatchLifecycle(Hooks.Event.LOAD, checkpoint);
+        }
+        for (Checkpoint evicted : outcome.evicted) {
+            dispatchLifecycle(Hooks.Event.EVICT, evicted);
+        }
     }
 
     /** The slot for a checkpoint, with one lease taken. */
     private Slot acquire(Checkpoint checkpoint) {
+        return acquire(checkpoint, null);
+    }
+
+    /** The slot for a checkpoint, recording into {@code outcome} what it had to do to get it. */
+    private Slot acquire(Checkpoint checkpoint, Outcome outcome) {
         while (true) {
             InFlight waitFor = null;
             InFlight mine = null;
@@ -901,7 +986,7 @@ public final class Router implements AutoCloseable, Predictor {
                 // This caller owns the build, and `mine` is the handle the others are waiting on.
                 // It has to be the one registered above: creating a second one here would leave
                 // every waiter blocked on a latch nobody ever counts down.
-                return build(checkpoint, mine);
+                return build(checkpoint, mine, outcome);
             }
             // Someone else is building this one. Wait for them rather than build a second copy.
             await(waitFor);
@@ -917,13 +1002,19 @@ public final class Router implements AutoCloseable, Predictor {
         }
     }
 
-    private Slot build(Checkpoint checkpoint, InFlight inflight) {
+    private Slot build(Checkpoint checkpoint, InFlight inflight, Outcome outcome) {
         List<Agent> toClose = new ArrayList<>();
         Slot built;
         try {
             // The build itself runs outside `lock`, so routing and eviction are not stalled for
             // the seconds a cold checkpoint takes, and serialised by `buildLock` so two cold
             // loads do not hold two checkpoints in flight at once.
+            //
+            // Acquired INSIDE the outer try deliberately, which reads like the anti-pattern and
+            // is not: the handler below is what records the failure on `inflight` and counts its
+            // latch down, so a throw from the acquisition itself must still reach it or every
+            // waiter on this checkpoint parks forever. `buildLock` is not held on that path, so
+            // the finally that releases it is never reached with nothing to release.
             buildLock.lock();
             try {
                 lock.lock();
@@ -956,15 +1047,31 @@ public final class Router implements AutoCloseable, Predictor {
                         built.leases++;
                         slots.put(checkpoint, built);
                         order.add(checkpoint);
-                        evictLocked(toClose);
+                        List<Checkpoint> evicted = evictLocked(toClose);
+                        if (outcome != null) {
+                            outcome.built = true;
+                            outcome.evicted.addAll(evicted);
+                        }
                     }
                 } finally {
-                    // ALWAYS, even if eviction threw. Skipping it left the new slot published
-                    // with a lease that nothing could release -- so the agent could never be
-                    // retired or closed -- and left every waiter parked on a latch for a
-                    // checkpoint that had in fact loaded.
-                    finish(checkpoint, inflight);
-                    lock.unlock();
+                    // `finish` ALWAYS, even if eviction threw. Skipping it left the new slot
+                    // published with a lease that nothing could release -- so the agent could
+                    // never be retired or closed -- and left every waiter parked on a latch for
+                    // a checkpoint that had in fact loaded.
+                    //
+                    // And `lock.unlock()` in a finally OF ITS OWN, because the two statements in
+                    // sequence did not deliver what that paragraph claims: `finish` dereferences
+                    // `inflight` and counts down its latch, so a throw from it skipped the unlock
+                    // and left `lock` held with no owner able to release it. Every later
+                    // `lock.lock()` would then block forever -- including the handler below that
+                    // exists to record the failure, so the router would wedge rather than report.
+                    // Found by CodeQL's unreleased-lock query, which sees the control flow a
+                    // pattern scanner cannot.
+                    try {
+                        finish(checkpoint, inflight);
+                    } finally {
+                        lock.unlock();
+                    }
                 }
                 if (duplicate) {
                     toClose.add(agent);
@@ -1170,15 +1277,17 @@ public final class Router implements AutoCloseable, Predictor {
             lock.unlock();
         }
         for (Checkpoint checkpoint : wanted) {
-            lock.lock();
             boolean already;
+            lock.lock();
             try {
                 already = slots.containsKey(checkpoint);
             } finally {
                 lock.unlock();
             }
             if (!already) {
-                release(acquire(checkpoint));
+                Outcome preloaded = new Outcome();
+                release(acquire(checkpoint, preloaded));
+                dispatchOutcome(checkpoint, preloaded);
             }
         }
         return this;
@@ -1215,7 +1324,15 @@ public final class Router implements AutoCloseable, Predictor {
                 lock.unlock();
             }
             if (inflight == null) {
-                closeAll(toClose);
+                // `finally`: the eviction happened whether or not closing the agent threw, so the
+                // event is owed either way. `closeAll` rethrows the first failure.
+                try {
+                    closeAll(toClose);
+                } finally {
+                    for (Checkpoint evicted : freed) {
+                        dispatchLifecycle(Hooks.Event.EVICT, evicted);
+                    }
+                }
                 return freed;
             }
             await(inflight);
@@ -1243,7 +1360,13 @@ public final class Router implements AutoCloseable, Predictor {
                 lock.unlock();
             }
             if (inflights.isEmpty()) {
-                closeAll(toClose);
+                try {
+                    closeAll(toClose);
+                } finally {
+                    for (Checkpoint evicted : freed) {
+                        dispatchLifecycle(Hooks.Event.EVICT, evicted);
+                    }
+                }
                 return freed;
             }
             for (InFlight inflight : inflights) {
@@ -1280,6 +1403,7 @@ public final class Router implements AutoCloseable, Predictor {
     }
 
     /** Route this state and answer its questions on whichever checkpoint wins. */
+    @Override
     public Prediction predict(Object state, Map<String, Question> questions) {
         return predict(state, questions, RouteOptions.none());
     }
@@ -1312,9 +1436,36 @@ public final class Router implements AutoCloseable, Predictor {
         if (language == null && decision.detection() != null) {
             language = decision.detection().language();
         }
-        try (Lease lease = lease(decision.model())) {
-            return lease.agent().predict(state, questions, language);
+        List<Hook> composed = hooks.composeFor(HookCall.none());
+        if (composed.isEmpty()) {
+            try (Lease lease = lease(decision.model())) {
+                return lease.agent().predict(state, questions, language);   // unchanged fast path
+            }
         }
+        // `Hooks.around` so ctx.skip, the error-before-end order, failure suppression and
+        // elapsed/usage all behave as they do on an Agent. The lease is taken inside it, so
+        // on_load and on_evict land between this call's start and end events.
+        //
+        // ctx.maxLen/headMaxLen are NOT forwarded: Agent.predict takes no budget arguments, so a
+        // Router-level start hook that sets one is ignored here.
+        PredictContext ctx = new PredictContext(Collections.singletonList(state), questions,
+                decision.model().wireName(), this);
+        String resolved = language;
+        Checkpoint target = decision.model();
+        List<Prediction> answered = Hooks.around(composed, ctx,
+                hooks.policyFor(HookCall.none()),
+                (states, asked, maxLen, headMaxLen) -> {
+                    try (Lease lease = lease(target)) {
+                        return List.of(lease.agent().predict(states.get(0), asked, resolved));
+                    }
+                });
+        if (answered == null || answered.isEmpty()) {
+            // Only a hook can cause this, by skipping with no result. Inventing one would report
+            // a decision the model never made.
+            throw new IllegalStateException(
+                    "a hook left no prediction for this call; ctx.skip(...) needs one result");
+        }
+        return answered.get(0);
     }
 
     /**
