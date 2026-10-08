@@ -148,6 +148,38 @@ class AsyncHookTest {
     }
 
     @Test
+    @DisplayName("after an overrun, the same call's next callback on that pooled thread is accepted")
+    void aPooledThreadIsReleasedWhenTheOverrunEnds() {
+        // One thread, so the later callback necessarily runs on the thread that overran. Before
+        // the release, that thread stayed abandoned for this context and the write was refused.
+        ExecutorService pool = Executors.newSingleThreadExecutor();
+        try {
+            Hook slow = AsyncHook.of(new Hook() {
+                @Override
+                public void onPredictStart(PredictContext c) {
+                    try {
+                        Thread.sleep(300);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                }
+            }, pool, Duration.ofMillis(50));
+            Hook later = AsyncHook.of(new Hook() {
+                @Override
+                public void onPredictEnd(PredictContext c) {
+                    c.states(List.of("written by the next callback"));
+                }
+            }, pool);
+            PredictContext ctx = ctx();
+            assertThrows(IllegalStateException.class, () -> slow.onPredictStart(ctx));
+            later.onPredictEnd(ctx);                // queued behind the overrun, then runs
+            assertEquals(List.of("written by the next callback"), ctx.states());
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
+    @Test
     @DisplayName("a non-positive timeout is refused rather than meaning 'never wait'")
     void refusesANonPositiveTimeout() {
         ExecutorService pool = Executors.newSingleThreadExecutor();

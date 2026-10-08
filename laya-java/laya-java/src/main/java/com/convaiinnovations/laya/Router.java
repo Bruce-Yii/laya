@@ -878,7 +878,15 @@ public final class Router implements AutoCloseable, Predictor {
     public Lease lease(Checkpoint checkpoint) {
         requireNonNull(checkpoint, "checkpoint");
         Outcome outcome = new Outcome();
-        Slot slot = acquire(checkpoint, outcome);
+        Slot slot;
+        try {
+            slot = acquire(checkpoint, outcome);
+        } catch (RuntimeException | Error failure) {
+            // A build that published and then failed to close the evicted agent still loaded and
+            // evicted, so both events are owed even though no lease is handed back.
+            dispatchOwed(checkpoint, outcome, failure);
+            throw failure;
+        }
         // Before the Lease is handed over, so on_load precedes any use of the agent -- but the
         // lease is this method's until the Lease exists, so a throwing hook must not strand it.
         // `build` guards the same shape at the `release(built); throw` below.
@@ -940,13 +948,22 @@ public final class Router implements AutoCloseable, Predictor {
         Hooks.dispatch(composed, event, ctx, hooks.policyFor(HookCall.none()));
     }
 
-    /** The load and evict events one acquire owes, in that order. */
+    /** The evict and load events one acquire owes, evictions first, as the reference fires them. */
     private void dispatchOutcome(Checkpoint checkpoint, Outcome outcome) {
+        for (Checkpoint evicted : outcome.evicted) {
+            dispatchLifecycle(Hooks.Event.EVICT, evicted);
+        }
         if (outcome.built) {
             dispatchLifecycle(Hooks.Event.LOAD, checkpoint);
         }
-        for (Checkpoint evicted : outcome.evicted) {
-            dispatchLifecycle(Hooks.Event.EVICT, evicted);
+    }
+
+    /** {@link #dispatchOutcome} on a failing path: a hook failure is attached, not substituted. */
+    private void dispatchOwed(Checkpoint checkpoint, Outcome outcome, Throwable failure) {
+        try {
+            dispatchOutcome(checkpoint, outcome);
+        } catch (RuntimeException | Error hookFailure) {
+            failure.addSuppressed(hookFailure);
         }
     }
 
@@ -1286,7 +1303,13 @@ public final class Router implements AutoCloseable, Predictor {
             }
             if (!already) {
                 Outcome preloaded = new Outcome();
-                release(acquire(checkpoint, preloaded));
+                try {
+                    release(acquire(checkpoint, preloaded));
+                } catch (RuntimeException | Error failure) {
+                    // maxLoaded was raised above, so only a concurrent load can make this evict.
+                    dispatchOwed(checkpoint, preloaded, failure);
+                    throw failure;
+                }
                 dispatchOutcome(checkpoint, preloaded);
             }
         }

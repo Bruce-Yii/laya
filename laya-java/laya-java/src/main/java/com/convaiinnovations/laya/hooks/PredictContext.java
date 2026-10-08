@@ -25,16 +25,17 @@ import java.util.concurrent.ConcurrentHashMap;
  * sit in a set keyed by the call rather than by its contents, which is what a Java object does
  * by default — so there is no {@code equals} or {@code hashCode} here, on purpose.
  *
- * <p>Not thread-safe, and not meant to be: hooks run on the calling thread, in order. The one
- * exception is the thread a {@link Hooks.Policy#timeout} runs a hook on, which keeps running
+ * <p>Not thread-safe, and not meant to be: hooks run in order, on the calling thread or, for an
+ * {@link AsyncHook}, on its executor while the caller waits. The exception is a hook that
+ * overruns a {@link Hooks.Policy#timeout} or an {@code AsyncHook} deadline, which keeps running
  * after its deadline expires while the call moves on without it — see {@link #states(List)} for
  * what this class does about that and what it cannot do.
  *
  * <p>Two of the reference's fields are absent. {@code router} and {@code decision} carry a
- * {@code RouteDecision} to an {@code on_route} hook, and nothing in this port dispatches that
- * event yet — {@link com.convaiinnovations.laya.Router} does its own selection without hooks. A
- * field that is always null is not a port of a field, it is a promise the caller cannot tell
- * from a bug. What the reference splits across {@code agent} and {@code router} is one field
+ * {@code RouteDecision} to an {@code on_route} hook. {@link com.convaiinnovations.laya.Router}
+ * dispatches {@code on_route} with the chosen checkpoint in {@link #model()} and no states,
+ * questions or decision, so a hook here observes the route but cannot replace it, which the
+ * reference allows. What the reference splits across {@code agent} and {@code router} is one field
  * here, {@link #predictor}, because both are a {@link Predictor}.
  */
 public final class PredictContext {
@@ -309,6 +310,14 @@ public final class PredictContext {
      */
     void abandon(Thread runner) {
         abandoned.add(runner);
+    }
+
+    /**
+     * Undoes {@link #abandon} once the overrunning task has returned, so a pooled thread that
+     * runs this call's next callback is not refused for the previous one's overrun.
+     */
+    void release(Thread runner) {
+        abandoned.remove(runner);
     }
 
     private void refuseIfAbandoned(String what) {

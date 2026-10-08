@@ -27,14 +27,9 @@ package com.convaiinnovations.laya.hooks;
  * <p>{@link AsyncHook} runs a hook on an {@link java.util.concurrent.Executor} and waits for it,
  * for a callback that must run on a particular thread. It is not a way to make a slow hook
  * free: the prediction still waits, as the reference's does.
- * <p>Porting {@code AsyncHook} would mean choosing a future type for every caller and owning a
- * thread pool to await it on, to wrap a {@code join} the caller can write in one line and bound
- * however their own runtime wants. Half-porting it — accepting a {@code CompletionStage} and
- * blocking on it with no deadline — would be worse: {@link Hooks.Policy#timeout()} already
- * bounds a slow hook, and a second, invisible wait inside one would make a hook that never
- * returns look like a hook that never started.
  *
- * <p>A hook runs on the calling thread, so it is as thread-safe as the call around it. Install
+ * <p>A hook runs on the calling thread, or an {@code AsyncHook}'s executor while the caller
+ * waits, so it is as thread-safe as the call around it. Install
  * one that is not, and set {@link HookRegistry#concurrent(boolean)} to false to have dispatch
  * serialise it.
  */

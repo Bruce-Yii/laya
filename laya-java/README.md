@@ -488,15 +488,18 @@ events no agent can:
 | event | when |
 |---|---|
 | `onRoute` | after a checkpoint is chosen, from every branch of `route` |
-| `onLoad` | after a checkpoint is built — not on a cache hit |
-| `onEvict` | after one is dropped, by `maxLoaded`, `unload` or `unloadAll` |
+| `onLoad` | after a checkpoint is built by `load`, `lease`, `predict` or `preload` — not on a cache hit |
+| `onEvict` | after one is dropped, by `maxLoaded`, `unload` or `unloadAll` — before the `onLoad` that caused it, as in the reference |
 
 `Router.predict` also dispatches one `onPredictStart`/`onPredictEnd` pair for the whole
 route-and-answer call, with `onLoad` and `onEvict` landing inside it. The agent's own pair still
 fires for the forward pass, so a router-level hook and an agent-level hook see different spans.
 
 Hooks are dispatched outside the router's lock, so a hook may call back into the router —
-including `loaded()` or another `predict` — without deadlocking.
+`loaded()`, `load`, `unload` — without deadlocking. Two consequences of that are yours to handle:
+`load()` can hand back an agent a hook unloaded while its `on_load` was being dispatched, and a
+router-level `on_predict_start` that calls `router.predict` recurses until the stack runs out,
+because that inner call dispatches the same hook again.
 
 `ctx.maxLen` / `ctx.headMaxLen` set by a router-level start hook are not honoured:
 `Agent.predict` takes no budget arguments. An agent-level hook can still set them.
@@ -515,11 +518,13 @@ router.hooks().addHook(new Hook() {
 | a process-wide default hook sees **two** predict pairs per `Router.predict` | the router's and the agent's. A metric that sums `usage()` on `on_predict_end` double-counts. Install on `router.hooks()` or `agent.hooks()`, not `Hooks.setDefaultHooks`, unless you want both |
 | a throwing `on_evict` hook fails `Router.close()` | and the remaining evictions are not dispatched. In try-with-resources that masks the body's own failure |
 | calling back into the router from `on_evict` **during `close()`** | throws `this Router is closed`: `close()` marks the router closed before unloading |
-| `concurrent(false)` with an `AsyncHook` | deadlocks. Serial dispatch holds a lock across the callback, and the callback is on another thread, so re-entrancy cannot save it. Use one or the other |
+| `concurrent(false)` with an `AsyncHook` whose callback calls back into the router or agent | deadlocks. Serial dispatch holds a lock across the callback, and the callback is on another thread, so the inner dispatch cannot re-enter that lock. A callback that does not call back in is fine |
 | `ctx.maxLen` / `ctx.headMaxLen`, and states past the first | ignored on the router path. `Agent.predict` takes no budget arguments, and the router answers one state |
 
 `on_route` carries its own context, not the predict pair's, so `runId` differs between them. Correlate
-on the model name or `ctx.decision`, not on `runId`.
+on the model name, not on `runId`. That context holds the chosen checkpoint in `ctx.model()` and no
+states, questions or decision: unlike the reference, a hook here observes the route but cannot
+replace it.
 
 `AsyncHook.of(hook, executor)` runs a hook on a particular thread — a framework request scope, an
 actor, a UI loop. It waits for the callback, so an exception still reaches the hook policy and the

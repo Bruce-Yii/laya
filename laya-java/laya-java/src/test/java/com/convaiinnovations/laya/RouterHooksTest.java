@@ -118,7 +118,8 @@ class RouterHooksTest {
             router.load("english");
             router.load("multilingual");               // maxLoaded 1, so english must go
             assertTrue(trace.events.contains("evict:english"), trace.events.toString());
-            assertEquals(List.of("load:english", "load:multilingual", "evict:english"),
+            // The reference's order: the victim's on_evict, then the build's on_load.
+            assertEquals(List.of("load:english", "evict:english", "load:multilingual"),
                     trace.events);
         }
     }
@@ -229,6 +230,55 @@ class RouterHooksTest {
             // A stranded lease leaves the slot retired-but-never-closed: unload would report it
             // freed while the session stayed open.
             assertEquals(List.of(Checkpoint.ENGLISH), router.unload("english"));
+        }
+    }
+
+    /** English's session throws on close, so evicting it fails after multilingual has published. */
+    private static Router.AgentFactory angryEnglish(Path root) {
+        return checkpoint -> TinyCheckpoint.agent(root, checkpoint == Checkpoint.ENGLISH
+                ? new TinyCheckpoint.RecordingSession() {
+                    @Override
+                    public void close() {
+                        super.close();
+                        throw new IllegalStateException("a native close can fail");
+                    }
+                }
+                : new TinyCheckpoint.RecordingSession());
+    }
+
+    @Test
+    @DisplayName("lease still dispatches on_evict and on_load when closing the victim throws")
+    void leaseDispatchesWhenTheEvictedCloseThrows(@TempDir Path root) throws IOException {
+        TinyCheckpoint.write(root, 64, 32);
+        Trace trace = new Trace();
+        try (Router router = Router.builder().agents(angryEnglish(root)).maxLoaded(1).build()) {
+            router.load("english");
+            router.hooks().addHook(trace);
+            assertThrows(IllegalStateException.class, () -> router.lease("multilingual"));
+            assertEquals(List.of("evict:english", "load:multilingual"), trace.events);
+        }
+    }
+
+    @Test
+    @DisplayName("a hook failing on that owed dispatch is attached to the close failure, not swapped")
+    void anOwedHookFailureDoesNotMaskTheCloseFailure(@TempDir Path root) throws IOException {
+        TinyCheckpoint.write(root, 64, 32);
+        try (Router router = Router.builder().agents(angryEnglish(root)).maxLoaded(1).build()) {
+            router.load("english");
+            AtomicBoolean once = new AtomicBoolean();   // only once: close() evicts again
+            router.hooks().addHook(new Hook() {
+                @Override
+                public void onEvict(PredictContext ctx) {
+                    if (once.compareAndSet(false, true)) {
+                        throw new IllegalArgumentException("the sink refused it");
+                    }
+                }
+            });
+            IllegalStateException thrown =
+                    assertThrows(IllegalStateException.class, () -> router.lease("multilingual"));
+            assertEquals("a native close can fail", thrown.getMessage());
+            assertEquals(1, thrown.getSuppressed().length);
+            assertEquals("the sink refused it", thrown.getSuppressed()[0].getMessage());
         }
     }
 
