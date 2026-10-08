@@ -32,7 +32,7 @@ The raw-temperature column reproduces the committed file, so the only variable l
 | macro ECE | 0.3869 | **0.3911** |
 | languages clearing 3× random | 45 / 51 | **48 / 51** |
 
-The direction is consistent rather than noise: of the 16 languages that move by 0.05 or more, **every one moves up** (`bn` 0.29 → 0.45, `kn` 0.15 → 0.30, `hy` 0.15 → 0.25), and none move down by that much. `laya`'s columns are unchanged by the refresh — they reproduce the committed file to the last stored digit — so the accuracy spread between the two checkpoints is wider than the committed table suggested, and `en` remains the one language where `laya` wins (0.820 against 0.710).
+The direction is consistent rather than noise: of the 16 languages that move by 0.05 or more, **15 move up** (`bn` 0.29 → 0.45, `kn` 0.15 → 0.30, `hy` 0.15 → 0.25) and `sv` is the one that moves down (0.57 → 0.49). `laya`'s columns are unchanged by the refresh — they reproduce the committed file to the last stored digit — so the accuracy spread between the two checkpoints is wider than the committed table suggested, and `en` remains the one language where `laya` wins (0.820 against 0.710).
 
 ---
 
