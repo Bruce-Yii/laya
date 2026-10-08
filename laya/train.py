@@ -999,6 +999,9 @@ def finetune(data: str, model_dir: str, output_dir: str, config: Optional[TrainC
     config.validate()
     dev = resolve_device(device)
     model, tok, cfg = load_checkpoint(model_dir)
+    # The base checkpoint is scored on eval_items before train_model runs, and calibration_records
+    # sends its inputs to `dev`, so the weights have to be there first (CUDA and MPS crash otherwise).
+    model.to(dev)
     max_len = config.max_len or cfg.get("max_len", 512)
     head_max_len = config.head_max_len or cfg.get("head_max_len", 192)
     if config.option_layout is not None:
