@@ -405,7 +405,7 @@ public final class Router implements AutoCloseable, Predictor {
         this.maxLoaded = builder.maxLoaded;
     }
 
-    /** A router with the reference's defaults: the bundle, English as default, no auto-detection. */
+    /** A router with the reference's defaults: the bundle, multilingual as default, no auto-detection. */
     public static Router withDefaults() {
         return builder().build();
     }

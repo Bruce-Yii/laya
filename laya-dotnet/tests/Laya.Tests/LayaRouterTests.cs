@@ -157,11 +157,15 @@ public sealed class LayaRouterTests
         Assert.Equal(LayaCheckpoint.Multilingual, d.Model);
     }
 
-    [Fact]
-    public void CustomDefaultOverride()
+    [Theory]
+    [InlineData(LayaCheckpoint.English)]
+    [InlineData(LayaCheckpoint.Multilingual)]
+    public void CustomDefaultOverride(LayaCheckpoint checkpoint)
     {
-        using var router = NewFakeRouter(new LayaRouterOptions { Default = LayaCheckpoint.Multilingual });
-        Assert.Equal(LayaCheckpoint.Multilingual, router.Route("12345", GenericQuestions).Model);
+        using var router = NewFakeRouter(new LayaRouterOptions { Default = checkpoint });
+        Assert.Equal(checkpoint, router.Route("12345", GenericQuestions).Model);
+        Assert.Equal(checkpoint, router.Route("Quero cancelar", GenericQuestions).Model);
+        Assert.Equal(LayaCheckpoint.English, router.Route("I was charged twice", GenericQuestions).Model);
     }
 
     [Theory]
