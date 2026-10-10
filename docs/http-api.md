@@ -164,12 +164,12 @@ hide that. The detail is the same `unknown model` text core raises, plus the rem
     "queue": {"type": "choice", "choice": "billing",
               "probabilities": {"billing": 0.9519, "tech": 0.0327, "other": 0.0154},
               "confidence": 0.797, "answer_confidence": 0.9519,
-              "action": {"act_probability": 1.0}},
+              "action": {"act_probability": 1.0}, "x_jev_confidence": 0.9278},
     "urgency": {"type": "score", "score": 1.6994,
                 "legend": {"0": "calm", "1": "firm", "2": "angry", "3": "furious"},
                 "probabilities": {"0": 0.0249, "1": 0.4136, "2": 0.3985, "3": 0.1629},
                 "confidence": 0.1925, "answer_confidence": 0.4136,
-                "action": {"act_probability": 1.0}}
+                "action": {"act_probability": 1.0}, "x_jev_confidence": 0.2507}
   },
   "usage": {"input_tokens": 83, "output_tokens": 0, "state_tokens": 12,
             "state_tokens_dropped": 0, "truncated": false, "truncated_questions": []},
@@ -187,8 +187,8 @@ name of the decision head, and the checkpoint that answered is in `routing`.
 
 | answer type | keys |
 |---|---|
-| `choice` | `choice` (the argmax option), `probabilities` per option |
-| `score` | `score` (expected level index, may fall between levels), `probabilities` keyed `"0".. "k-1"`, `legend` mapping index to the level text |
+| `choice` | `choice` (the argmax option), `probabilities` per option, `x_jev_confidence` |
+| `score` | `score` (expected level index, may fall between levels), `probabilities` keyed `"0".. "k-1"`, `legend` mapping index to the level text, `x_jev_confidence` |
 | `noul` | `noul`, the probability of the yes option |
 | all | `type` (the discriminator, echoing the question's own type), `confidence`, `answer_confidence`, and `action.act_probability` |
 | gate | `abstention`, `abstention_threshold` and `low_confidence`, written by the abstention gate -- see below |
@@ -240,7 +240,7 @@ the question ids. A `lang_guess` leaves no key of its own -- the hint it acted o
 `reason`. The `model` and `task` branches report `workflow` as `null` too, because they answer
 before the question ids are read.
 
-### Confidence: two numbers, not interchangeable
+### Confidence: three numbers, not interchangeable
 
 - `answer_confidence` is the probability mass on the reported answer (`max(p)`). It is the
   quantity temperature scaling fits and the one this repo's ECE figures are computed on, so it
@@ -248,10 +248,14 @@ before the question ids are read.
   but only for a checkpoint whose temperature fit has been validated on your traffic.
 - `confidence` means something different per type: normalized entropy `1 - H(p)/log(k)` on
   `choice` and `score`, and `max(p_yes, p_no)` on `noul` (where it equals `answer_confidence`).
+- `x_jev_confidence` is the `confidence` Jev would report for the same probabilities, on `choice`
+  and `score` answers only (a Jev `noul` answer has no confidence). It uses TypeSafe's own
+  formulas: `(p_max - 1/n)/(1 - 1/n)` for `choice`, and for `score` one minus the probability-weighted
+  distance from the most likely level, scaled by the same distance for a uniform distribution.
 
-Never compare the two against one threshold. Also note the difference when porting from Jev:
-TypeSafe defines confidence as `(n*p_max - 1)/(n - 1)`, so a threshold carried over from a Jev
-deployment gates differently on Laya's entropy value.
+Never compare them against one threshold. When porting from Jev, a threshold carried over from a
+Jev deployment gates differently on Laya's entropy `confidence` (#302); read it against
+`x_jev_confidence` instead. The `x_` prefix keeps the field clear of any name Jev adds later.
 
 ### Strict Jev contract: `LAYA_JEV_STRICT`
 
@@ -267,7 +271,8 @@ answering, on both `/v1/systemone` and `/v1/systemone/batch`:
 - a `score` answer keeps `type`, `score`, `probabilities`, `confidence` and `legend`;
 - a `noul` answer keeps `type` and `noul`;
 - `usage` keeps `input_tokens` and `output_tokens`; the truncation facts and the collapsed-
-  options ceiling are not sent.
+  options ceiling are not sent;
+- `x_jev_confidence` is not sent, like the other additions.
 
 The projection keeps only the contracted keys and recomputes nothing: every value is the one the
 result already carries, so the probabilities and scores a strict client reads are identical to
