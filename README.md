@@ -746,7 +746,7 @@ Configuration is by environment variable: `LAYA_HOST`, `LAYA_PORT`,
 `LAYA_THREADS` (cap torch intra-op threads for CPU inference — keep at or below
 physical cores), `LAYA_AUTO_TASK`, `LAYA_DEFAULT_MODEL` (the checkpoint a state with no
 language evidence falls back to, `multilingual` by default; set it to `english` when most of
-your traffic is not English), `LAYA_MAX_LOADED` (checkpoints resident at
+your traffic is English), `LAYA_MAX_LOADED` (checkpoints resident at
 once, 2 by default; raise it to 3 when `LAYA_AUTO_TASK` makes a third one
 reachable on demand, or the server rebuilds one every time routing switches),
 `LAYA_IDLE_UNLOAD_SECONDS` (unload idle checkpoints; `0` disables it, `300` frees device memory
