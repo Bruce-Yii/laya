@@ -812,4 +812,88 @@ public final class Hooks {
             problem.addSuppressed(hookFailure);
         }
     }
+
+    /**
+     * {@link #around} for many requests that share forward passes: each keeps its own context and
+     * its own start and end, while {@code inference} answers the ones still pending in one go.
+     *
+     * <p>The reference's {@code Router.predict_batch} sequence. Every context starts, in order,
+     * before any inference; {@code inference} must assign {@code results} on each context it is
+     * handed. Contexts then end in <b>reverse</b> of the order they started, so a hook that sets
+     * something in start and resets it in end unwinds the last one first. On a failure every
+     * started context fails with it, a skipped one included, and gets the error event before its
+     * end; a hook throwing on a failed context is attached to the failure. Every context gets its
+     * end even when another's end hook throws; the first such throw is raised afterwards.
+     *
+     * @param inference answers the contexts no start hook answered; not called when there are none
+     */
+    public static void aroundGroup(List<? extends Hook> hooks, List<PredictContext> contexts,
+                                   Policy policy, Consumer<List<PredictContext>> inference) {
+        List<PredictContext> started = new ArrayList<>(contexts.size());
+        Throwable raised = null;
+        try {
+            for (PredictContext ctx : contexts) {
+                started.add(ctx);
+                dispatch(hooks, Event.PREDICT_START, ctx, policy);
+            }
+            List<PredictContext> pending = new ArrayList<>();
+            for (PredictContext ctx : started) {
+                if (ctx.results() != null) {
+                    continue;
+                }
+                if (ctx.states().isEmpty()) {
+                    ctx.results(List.of());
+                } else {
+                    pending.add(ctx);
+                }
+            }
+            if (!pending.isEmpty()) {
+                inference.accept(List.copyOf(pending));
+            }
+            // Totalled before any end, so a malformed result fails the whole group rather than
+            // escaping after some of its requests have already ended.
+            List<Totals> totals = new ArrayList<>(started.size());
+            for (PredictContext ctx : started) {
+                totals.add(ctx.results() == null ? null : aggregateUsage(ctx.results()));
+            }
+            for (int i = 0; i < started.size(); i++) {
+                started.get(i).usage(totals.get(i));
+            }
+        } catch (RuntimeException | Error problem) {
+            raised = problem;
+        }
+
+        double now = System.nanoTime();
+        for (PredictContext ctx : started) {
+            ctx.elapsedMs((now - ctx.startedAt()) / 1_000_000.0);
+            if (raised != null) {
+                ctx.error(raised);
+            }
+        }
+        Throwable firstEndFailure = null;
+        for (int i = started.size() - 1; i >= 0; i--) {
+            PredictContext ctx = started.get(i);
+            List<Event> events = raised == null ? List.of(Event.PREDICT_END)
+                    : List.of(Event.ERROR, Event.PREDICT_END);
+            for (Event event : events) {
+                try {
+                    dispatch(hooks, event, ctx, policy);
+                } catch (RuntimeException | Error hookFailure) {
+                    if (raised != null) {
+                        attach(raised, hookFailure);
+                    } else if (firstEndFailure == null) {
+                        firstEndFailure = hookFailure;
+                    }
+                }
+            }
+        }
+
+        Throwable failure = raised != null ? raised : firstEndFailure;
+        if (failure instanceof RuntimeException problem) {
+            throw problem;
+        }
+        if (failure instanceof Error problem) {
+            throw problem;
+        }
+    }
 }
