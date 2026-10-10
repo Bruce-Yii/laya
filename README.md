@@ -94,18 +94,20 @@ The shipped checkpoints work zero-shot, but fine-tuning on decisions from your o
 
 **[nandhakishorm.github.io/laya](https://nandhakishorm.github.io/laya/)**: guides for [prediction hooks](https://nandhakishorm.github.io/laya/hooks/), [schema-driven decisions](https://nandhakishorm.github.io/laya/structured/), [Docker](https://nandhakishorm.github.io/laya/docker/) and [LangChain and LangGraph](https://nandhakishorm.github.io/laya/langchain/), plus a full [API reference](https://nandhakishorm.github.io/laya/reference/).
 
-## What's new in 0.4.1
+## What's new in 0.4.2
 
-* **Serve your own checkpoints.** `LAYA_EXTRA_MODELS` registers extra checkpoints on
-  `laya-serve` as a JSON name-to-source map, and a registered name pins its checkpoint over
-  HTTP like a built-in (#1047, #919). Malformed values stop the server at startup.
-* **Fine-tuning tells you its budget.** A run now prints its optimizer-update count before it
-  starts: 5,600 items gives 352 updates where 1,100 gives 72 at the same settings, which is why
-  small datasets collapsed silently (#1014, #963).
-* **Fixes.** `laya-evals` writes redirected output as utf-8 (#1045); the server serves again
-  after a lifespan restart (#1049); `Router.decide_batch` takes a checkpoint pin (#1050); the
-  ONNX path answers single-option questions instead of failing (#1051).
-* **Docs.** Twenty-four corrections where a page contradicted the code, each verified against it.
+* **The TypeScript tree parses again.** An unterminated template literal in `hooks.ts` shipped
+  in 0.4.1 and stopped 22 of 34 test files from loading (#1056).
+* **Jev confidence alongside ours.** `/v1/systemone` adds `x_jev_confidence`, computed locally
+  from the same probabilities, so a threshold carried over from Jev can be compared directly
+  (#1066, #302). `confidence` is unchanged and the field is absent under `LAYA_JEV_STRICT`.
+* **Shortlisting keeps working with an `option_order`.** A narrowed choice drops the order with
+  a warning instead of failing the agent's permutation check (#1063).
+* **A near-miss checkpoint name warns.** Registering `englsh` tells you it is one edit from
+  `english`, and registers it anyway (#1055, #919).
+* **Compose forwards four more knobs** that the runtime already read (#1053, #1054), and the
+  Java and .NET docs now name the multilingual default 0.4.0 moved them to (#1069).
+* **Java** gains `Router.predictBatch` and `Shortlist.predictTournament` (#1060, #1061).
 
 Earlier releases are in the [GitHub releases](https://github.com/NandhaKishorM/laya/releases).
 
