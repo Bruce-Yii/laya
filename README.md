@@ -584,7 +584,7 @@ router = Router(default="english")
 ```
 
 Running one of the shipped servers rather than your own `Router`, the same setting is
-`LAYA_DEFAULT_MODEL=multilingual` — in the environment of `laya-serve`, the MCP server or the
+`LAYA_DEFAULT_MODEL=english` — in the environment of `laya-serve`, the MCP server or the
 `laya-serve` container ([docs/docker.md](https://github.com/NandhaKishorM/laya/blob/main/docs/docker.md)). It is the routing fallback only: text
 the detector can place is routed on what it detects, whatever this is set to.
 
