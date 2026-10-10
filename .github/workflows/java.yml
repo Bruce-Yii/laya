@@ -175,6 +175,11 @@ jobs:
       #
       # This floor and the jdk-matrix one differ by one ON PURPOSE -- see that lane for why a
       # shared number let a whole five-test class be deleted there.
+      # 1007/1008 is the pre-#1061 measurement, kept on purpose. #1057, #1059, #1060 and
+      # #1061 were each branched off main independently, so every one measured its own
+      # count and none measured the merged tree, which carries all four. The real figure
+      # is higher. The lower verified number keeps the floor binding and the lane green;
+      # an unmeasured figure in a gate is how a gate goes red for the wrong reason.
       - name: Model-free suite was not vacuous
         if: ${{ !cancelled() }}
         run: >
@@ -459,10 +464,15 @@ jobs:
           - name: predict
             checkpoints: multilingual
             graph-model: multilingual
-            families: --only predict.json
+            families: --only predict.json --only tournament_golden.json
             tests: >-
               --tests com.convaiinnovations.laya.PredictParityTest
               --tests com.convaiinnovations.laya.OneOptionGraphTest
+              --tests com.convaiinnovations.laya.TournamentParityTest
+            # 12 is a verified LOWER bound, not the union: #1059 and #1061 were branched
+            # off main independently and each measured 12 for its own pair, so neither
+            # measured all three classes together. Two of them use @TestFactory, so the
+            # executed count is not derivable statically. Re-measure on main and raise it.
             min-tests: 12
             timeout: 75
           # Weight-bearing, and a SEPARATE cell rather than a second family in the one above.
@@ -575,7 +585,7 @@ jobs:
       # Re-recorded from the Python code at THIS commit. `--strict` makes a family this cell could
       # not regenerate an error rather than a skip: here a skip means the download or the export
       # failed, not that the machine has no model. It is scoped by `--only` to the families this
-      # cell owns, and between the two cells all four checkpoint-backed families are covered.
+      # cell owns, and between the cells every checkpoint-backed family is covered.
       - name: Regenerate this cell's fixtures from Python
         env:
           LAYA_FIXTURE_CHECKPOINTS: ${{ github.workspace }}/laya-java/.work/checkpoints
