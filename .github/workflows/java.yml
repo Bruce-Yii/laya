@@ -460,8 +460,10 @@ jobs:
             checkpoints: multilingual
             graph-model: multilingual
             families: --only predict.json
-            tests: --tests com.convaiinnovations.laya.PredictParityTest
-            min-tests: 9
+            tests: >-
+              --tests com.convaiinnovations.laya.PredictParityTest
+              --tests com.convaiinnovations.laya.OneOptionGraphTest
+            min-tests: 12
             timeout: 75
           # Weight-bearing, and a SEPARATE cell rather than a second family in the one above.
           # Three reasons, in order of how much they cost:
