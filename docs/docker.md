@@ -339,6 +339,8 @@ These apply to the `laya-serve` service only.
 | `LAYA_THREADS` | `OMP_NUM_THREADS` | caps torch intra-op threads; keep at or below physical cores |
 | `LAYA_AUTO_TASK` | `0` | `1` lets the router reach `typed-decisions` automatically |
 | `LAYA_DEFAULT_MODEL` | `multilingual` | Checkpoint a state with no language evidence falls back to (no letters, or Latin text too short to identify). Set `english` for mostly English traffic; an unresolvable name stops the container at startup instead of serving a configuration nobody asked for |
+| `LAYA_EXTRA_MODELS` | (none) | JSON object `{name: source}` registering extra checkpoints beside the bundled ones: a Hub repo id or local checkpoint directory as a string, or a `["repo", "subfolder"]` pair |
+| `LAYA_IDLE_UNLOAD_SECONDS` | `0` | unload resident checkpoints after this many idle seconds; the next request loads its checkpoint again. Zero disables unloading |
 | `LAYA_MAX_LOADED` | `2` | Checkpoints kept resident; `LAYA_AUTO_TASK` makes a third reachable on demand, and a cap below what routing chooses rebuilds one per switch |
 | `LAYA_MAX_CONCURRENT` | `16` | requests admitted at once; later ones get `503` (a value that does not parse, or is not positive, falls back to `16`) |
 | `LAYA_LOG_LEVEL` | `info` | uvicorn log level |

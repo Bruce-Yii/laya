@@ -537,7 +537,8 @@ if server_doc:
         _env = env_blocks(read("compose.http.yaml")).get(_service, {})
         check_true("compose/compose.http.yaml defines the %s service" % _service,
                    _service in env_blocks(read("compose.http.yaml")), sorted(_env))
-        for _name in ("LAYA_MAX_CONCURRENT", "LAYA_MAX_TOKEN_BUDGET", "LAYA_REVISION"):
+        for _name in ("LAYA_MAX_CONCURRENT", "LAYA_MAX_TOKEN_BUDGET", "LAYA_REVISION",
+                      "LAYA_EXTRA_MODELS", "LAYA_IDLE_UNLOAD_SECONDS"):
             check_true("compose/compose.http.yaml/%s forwards the %s this change adds"
                        % (_service, _name), _name in _env,
                        "it is documented and read by the runtime, and the service that needs it "
@@ -610,8 +611,10 @@ if shutil.which("docker"):
     # container is the failure the textual checks above are reasoning about. Both arms: set, and
     # left alone. The unset arm is the one an operator actually boots, and it must show the empty
     # default arriving as empty rather than as the literal `${LAYA_MAX_CONCURRENT:-}`.
-    _KN = ("LAYA_MAX_CONCURRENT", "LAYA_MAX_TOKEN_BUDGET", "LAYA_REVISION")
-    _arms = [(dict(zip(_KN, ("4", "16384", "reviewed"))), dict(zip(_KN, ("4", "16384", "reviewed")))),
+    _KN = ("LAYA_MAX_CONCURRENT", "LAYA_MAX_TOKEN_BUDGET", "LAYA_REVISION",
+           "LAYA_EXTRA_MODELS", "LAYA_IDLE_UNLOAD_SECONDS")
+    _arms = [(dict(zip(_KN, ("4", "16384", "reviewed", '{"custom":"./model"}', "30"))),
+              dict(zip(_KN, ("4", "16384", "reviewed", '{"custom":"./model"}', "30")))),
              ({}, dict.fromkeys(_KN, ""))]
     for _set, _expect in _arms:
         proc = subprocess.run(["docker", "compose", "-f", "compose.yaml", "-f", "compose.http.yaml",
